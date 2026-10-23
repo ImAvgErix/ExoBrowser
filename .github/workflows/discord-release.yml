@@ -98,7 +98,7 @@ jobs:
             | {
                 username: "\($product) Releases",
                 avatar_url: $icon,
-                content: (if $role != "" then "<@&\($role)>" else "" end),
+                content: (if $role != "" then "||<@&\($role)>||" else "" end),
                 allowed_mentions: (if $role != "" then { parse: [], roles: [$role] } else { parse: [] } end),
                 flags: 4096,
                 embeds: [
