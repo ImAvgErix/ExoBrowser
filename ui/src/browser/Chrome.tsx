@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { Button } from '../components/ui/Button'
+import { useLens } from '../lib/glass'
 import { useGlide } from '../lib/glide'
 import { onHost, send, setSetting, setting, useBrowser, useBrowserValue, type Settings, type Tab } from './host'
 import { engineOf, hostOf, isNewTab } from './search'
@@ -48,28 +49,67 @@ function slideOf(el: Element): [number, number] {
   return [parseFloat(x) || 0, parseFloat(y) || 0]
 }
 
+// Each piece's own key while it's on the page: the window keeps its frost by it and moves it in place.
+const keys = new WeakMap<Element, number>()
+let lastKey = 0
+const keyOf = (el: Element) => {
+  let key = keys.get(el)
+  if (!key) { key = ++lastKey; keys.set(el, key) }
+  return key
+}
+
+// Where a piece rests: one growing in (a menu from 0.96, Search from 0.98) is measured at its full size around
+// its transform origin, so the window frosts it once, where it ends, instead of following every frame.
+function restingRect(el: HTMLElement, style: CSSStyleDeclaration) {
+  const r = el.getBoundingClientRect()
+  const w = el.offsetWidth, h = el.offsetHeight
+  if (!w || !h || (Math.abs(r.width - w) < 0.5 && Math.abs(r.height - h) < 0.5)) return { left: r.left, top: r.top, width: r.width, height: r.height }
+  const [ox = 0, oy = 0] = style.transformOrigin.split(' ').map(parseFloat)
+  return { left: r.left - ox * (1 - r.width / w), top: r.top - oy * (1 - r.height / h), width: w, height: h }
+}
+
+// How a piece comes and goes on the page, so the window's frost fades with it: Exo's menus, Search and the sign-in menu
+// grow in over the base time and toasts over the move time; a menu of Exo's own (Settings' choices) fades away over
+// the quick time, while the browser's menus and Search go at once. The rest (the Bar, sheets) are just there.
+const FADES_IN: [string, number][] = [['.exb-vault-prompt', 160], ['.exo-toast', 220], ['.exo-shelf-sort-menu, .exb-search, .exb-vault-fill', 160]]
+const fadeIn = (el: Element) => FADES_IN.find(([selector]) => el.matches(selector))?.[1] ?? 0
+const fadeOut = (el: Element) => (el.matches('.exo-shelf-sort-menu:not(.exb-menu, .exb-vault-fill)') ? 120 : 0)
+
 function glassSpec() {
   const items: string[] = []
   for (const el of document.querySelectorAll<HTMLElement>(GLASS)) {
     const style = getComputedStyle(el)
     if (!el.getClientRects().length || style.visibility === 'hidden') continue
-    const r = el.getBoundingClientRect()
+    const r = restingRect(el, style)
     if (r.width < 1 || r.height < 1) continue
     const [dx, dy] = slideOf(el)
     const radius = Math.min(parseFloat(style.borderTopLeftRadius) || 0, r.height / 2)
     items.push([el.matches('.exo-glass.is-panel') ? 'p' : el.matches(LARGE) ? 'l' : 's', (r.left - dx).toFixed(1), (r.top - dy).toFixed(1), r.width.toFixed(1), r.height.toFixed(1),
-      radius.toFixed(1), el.closest('#exb-side') ? 'd' : 't'].join(','))
+      radius.toFixed(1), el.closest('#exb-side') ? 'd' : 't', keyOf(el), fadeIn(el), fadeOut(el)].join(','))
   }
   return items.join(';')
 }
 let glassFrame = 0
+let glassHeld = 0
 let glassSent: string | null = null
-/** Measured on the next frame and sent only when it changed (rebuilding the window's glass costs a frame). */
+let glassNext = ''
+const keysIn = (spec: string) => new Set(spec ? spec.split(';').map(item => item.split(',')[7]) : [])
+const sendGlass = () => {
+  glassHeld = 0
+  if (glassNext !== glassSent) { glassSent = glassNext; send('glass', glassNext) }
+}
+/** Measured on the next frame (before it paints) and sent only when it changed. A spec with a new piece is held one
+ *  frame more: the window shows its own layer a frame before this page's, so a menu's frost came in a frame ahead
+ *  of the menu, a gray box where it was about to be. While it's held, newer measures replace it, never delay it
+ *  (Settings changes on every frame while it loads, and its frost waited for it to settle). */
 export const queueGlass = () => {
   cancelAnimationFrame(glassFrame)
   glassFrame = requestAnimationFrame(() => {
-    const spec = glassSpec()
-    if (spec !== glassSent) { glassSent = spec; send('glass', spec) }
+    glassNext = glassSpec()
+    if (glassHeld || glassNext === glassSent) return
+    const sent = keysIn(glassSent ?? '')
+    if ([...keysIn(glassNext)].some(key => !sent.has(key))) glassHeld = requestAnimationFrame(sendGlass)
+    else sendGlass()
   })
 }
 // Glass comes and goes with what the page shows: a panel opening, a menu (a popover: its toggle), an animation
@@ -281,6 +321,7 @@ function useWindowWidth() {
 function TopTabs() {
   const { tabs, active } = useBrowser()
   const glide = useGlide<HTMLElement>()
+  useLens(glide)
   const drag = useTabDrag('x')
   useActiveInView(glide, active)
   const width = useWindowWidth()
@@ -351,11 +392,14 @@ export function Chrome({ settingsOpen, onSettings }: { settingsOpen: boolean; on
   const search = useSearch()
   const [finding, setFinding] = useState(false)
   const v = isVertical(b.settings)
-  // Exo's Bar: each group its own capsule of small Liquid Glass. (No lens at the rim: the window draws their glass,
-  // and in this page there's nothing behind them to bend.)
+  // Exo's Bar: each group its own capsule of small Liquid Glass, its lens at the rim and its light where it's
+  // pressed (lib/glass.ts), as in Exo Launcher.
   const nav = useRef<HTMLDivElement>(null)
   const address = useRef<HTMLDivElement>(null)
   const tools = useRef<HTMLDivElement>(null)
+  useLens(nav)
+  useLens(address)
+  useLens(tools)
   useEffect(() => onHost('find', () => setFinding(true)), [])
   // Find belongs to the page it was opened on: another tab puts it away.
   useEffect(() => setFinding(false), [b.active])

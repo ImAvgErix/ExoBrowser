@@ -22,6 +22,7 @@
     "src/lib/discordPrefs.ts",
     "src/lib/entitlementActions.ts",
     "src/lib/exoTheme.ts",
+    "src/lib/glass.ts",
     "src/lib/glide.ts",
     "src/lib/host.ts",
     "src/lib/hostContract.ts",

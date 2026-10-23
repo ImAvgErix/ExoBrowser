@@ -1652,49 +1652,108 @@ static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const wuc
     return brush;
 }
 
-// The page lists its glass: "kind,x,y,w,h,radius;..." in CSS pixels (kind s: small, l: large, p: a sheet).
-// A backdrop brush cannot see a tab (its pixels come from the browser's own process), so each
-// capsule's backdrop is a live surface of the tab layer itself, cut to the capsule plus a margin for
-// the blur to draw from, then blurred and toned.
+// The page lists its glass: "kind,x,y,w,h,radius,place,key,in,out;..." in CSS pixels (kind s: small, l: large, p: a
+// sheet; place d: the sidebar, else the Bar; key: the piece's own, while it's on the page; in and out: how long, in ms,
+// the piece itself fades in and out on the page, so its frost fades with it). A backdrop brush cannot see a tab
+// (its pixels come from the browser's own process), so each piece's backdrop is a live surface of the tab layer
+// itself, cut to the piece plus a margin for the blur to draw from, then blurred and toned.
+//
+// Each piece keeps its sprite while it's on the page: when it moves or resizes, its sprite is changed in place.
+// (Rebuilding every sprite on each change left all the glass unfrosted for a frame: a menu opening over Settings
+// blinked the whole sheet.) A new piece's frost fades in as the piece does (a menu grows in from nothing over 160 ms:
+// frost at full strength from the first frame showed as a gray box before the menu), and one that fades away takes
+// its frost with it. A new theme or scale rebuilds them all, since their filters differ.
 static std::wstring g_glassSpec;
+struct GlassPiece {
+    wuc::SpriteVisual sprite{nullptr};
+    wuc::CompositionVisualSurface surface{nullptr};
+    wuc::CompositionRoundedRectangleGeometry shape{nullptr};
+    wuc::ContainerVisual parent{nullptr};
+    int fadeOut = 0;
+    bool seen = false;
+};
+
+static wuc::CompositionEasingFunction EaseOut();
+
+static void FadeGlass(const wuc::SpriteVisual& sprite, float to, int ms) {
+    auto fade = g.compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(1.f, to, EaseOut());
+    fade.Duration(std::chrono::milliseconds(ms));
+    sprite.StartAnimation(L"Opacity", fade);
+}
+static std::unordered_map<std::wstring, GlassPiece> g_glassPieces;
+static std::wstring g_glassLook;  // the theme and scale the pieces' filters were made for
 
 static void SetGlass(const std::wstring& spec) {
     g_glassSpec = spec;
     if (!g.glassTop) return;
-    g.glassTop.Children().RemoveAll();
-    g.glassSide.Children().RemoveAll();
-    if (Setting(L"material", L"glass") == L"solid") return;
     float k = Scale();
-    for (auto& item : Split(spec, L';')) {
+    bool solid = Setting(L"material", L"glass") == L"solid";
+    std::wstring look = g.theme + L"@" + std::to_wstring((int)(k * 100));
+    if (look != g_glassLook || solid) {
+        for (auto& [_, piece] : g_glassPieces) piece.parent.Children().Remove(piece.sprite);
+        g_glassPieces.clear();
+        g_glassLook = look;
+    }
+    for (auto& [_, piece] : g_glassPieces) piece.seen = false;
+    int n = 0;
+    for (auto& item : solid ? std::vector<std::wstring>{} : Split(spec, L';')) {
         auto f = Split(item, L',');
         if (f.size() < 6) continue;
+        n++;
         float x = (float)_wtof(f[1].c_str()) * k, y = (float)_wtof(f[2].c_str()) * k;
         float w = (float)_wtof(f[3].c_str()) * k, h = (float)_wtof(f[4].c_str()) * k, r = (float)_wtof(f[5].c_str()) * k;
         if (w < 1 || h < 1) continue;
-        wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
-        float pad = GlassBlur(kind) * 3 * k;
+        // A piece that doesn't sit over the page has nothing to frost (the Bar's own band is solid).
         if (x + w <= g.contentRect.left || y + h <= g.contentRect.top || x >= g.contentRect.right || y >= g.contentRect.bottom)
             continue;
-        auto surface = g.compositor.CreateVisualSurface();
-        surface.SourceVisual(g.content);
-        surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
-        surface.SourceSize({w + 2 * pad, h + 2 * pad});
-        auto backdrop = g.compositor.CreateSurfaceBrush(surface);
-        backdrop.Stretch(wuc::CompositionStretch::None);
-        backdrop.HorizontalAlignmentRatio(0);
-        backdrop.VerticalAlignmentRatio(0);
-        backdrop.Offset({-pad, -pad});
-        auto sprite = g.compositor.CreateSpriteVisual();
-        float dim = f.size() > 7 ? std::clamp((float)_wtof(f[7].c_str()), 0.f, 1.f) : 0.f;
-        sprite.Brush(GlassBrush(kind, dim, backdrop));
-        sprite.Offset({x, y, 0});
-        sprite.Size({w, h});
-        auto shape = g.compositor.CreateRoundedRectangleGeometry();
-        shape.Size({w, h});
-        shape.CornerRadius({std::min(r, h / 2), std::min(r, h / 2)});
-        sprite.Clip(g.compositor.CreateGeometricClip(shape));
-        // A seventh field says where it lives: d is the sidebar, anything else the Bar.
-        (f.size() > 6 && f[6] == L"d" ? g.glassSide : g.glassTop).Children().InsertAtTop(sprite);
+        wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
+        float pad = GlassBlur(kind) * 3 * k;
+        auto parent = f.size() > 6 && f[6] == L"d" ? g.glassSide : g.glassTop;
+        std::wstring key = (f.size() > 7 && !f[7].empty() ? f[7] : L"#" + std::to_wstring(n)) + kind + (f.size() > 6 ? f[6] : L"");
+        GlassPiece& piece = g_glassPieces[key];
+        int fadeIn = f.size() > 8 ? _wtoi(f[8].c_str()) : 0;
+        piece.fadeOut = f.size() > 9 ? _wtoi(f[9].c_str()) : 0;
+        if (!piece.sprite) {
+            piece.surface = g.compositor.CreateVisualSurface();
+            piece.surface.SourceVisual(g.content);
+            auto backdrop = g.compositor.CreateSurfaceBrush(piece.surface);
+            backdrop.Stretch(wuc::CompositionStretch::None);
+            backdrop.HorizontalAlignmentRatio(0);
+            backdrop.VerticalAlignmentRatio(0);
+            backdrop.Offset({-pad, -pad});
+            piece.sprite = g.compositor.CreateSpriteVisual();
+            piece.sprite.Brush(GlassBrush(kind, 0.f, backdrop));
+            piece.shape = g.compositor.CreateRoundedRectangleGeometry();
+            piece.sprite.Clip(g.compositor.CreateGeometricClip(piece.shape));
+            piece.parent = parent;
+            parent.Children().InsertAtTop(piece.sprite);  // the newest piece lies on top (a menu over a sheet)
+            if (fadeIn > 0) {
+                piece.sprite.Opacity(0.f);
+                FadeGlass(piece.sprite, 1.f, fadeIn);
+            }
+        }
+        piece.seen = true;
+        piece.surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
+        piece.surface.SourceSize({w + 2 * pad, h + 2 * pad});
+        piece.sprite.Offset({x, y, 0});
+        piece.sprite.Size({w, h});
+        piece.shape.Size({w, h});
+        piece.shape.CornerRadius({std::min(r, h / 2), std::min(r, h / 2)});
+    }
+    for (auto it = g_glassPieces.begin(); it != g_glassPieces.end();) {
+        GlassPiece& piece = it->second;
+        if (piece.seen) { ++it; continue; }
+        if (piece.fadeOut > 0) {
+            // It fades away on the page: its frost goes with it, then the sprite.
+            auto batch = g.compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+            FadeGlass(piece.sprite, 0.f, piece.fadeOut);
+            batch.End();
+            batch.Completed([parent = piece.parent, sprite = piece.sprite](auto&&, auto&&) { parent.Children().Remove(sprite); });
+        } else {
+            piece.parent.Children().Remove(piece.sprite);
+        }
+        it = g_glassPieces.erase(it);
     }
 }
 

@@ -247,10 +247,6 @@ body,
 .is-autohide .exb-side { opacity: 0; translate: -14px 0; transition: opacity 140ms var(--ease-out), translate 140ms var(--ease-out); }
 .is-autohide.reveal-side .exb-side { opacity: 1; translate: none; transition: opacity 180ms var(--ease-out), translate 260ms var(--ease-out); }
 
-/* The Bar's and the sidebar's glass is drawn by the window from the page under it; in this page there's nothing behind
-   them to frost, so their own backdrop filter (a GPU pass every frame something in the Bar animates) is off. */
-:is(#exb-bar, #exb-side) .exo-glass, #exb-side.exo-glass { backdrop-filter: none; }
-
 /* ---------------------------------------------------------------- Search, opened in the address */
 
 .exb-search-layer { position: fixed; inset: 0; z-index: 60; }
@@ -268,7 +264,8 @@ body,
   transform-origin: top center;
   animation: exb-search-in var(--dur-base) var(--ease-out);
 }
-@keyframes exb-search-in { from { scale: 0.98; } }
+/* It grows in as Exo's large glass does (opacity with it), so the window's frost under it fades in alongside. */
+@keyframes exb-search-in { from { scale: 0.98; opacity: 0; } }
 /* Laid out like the address it opens over (icon and text centered together), so nothing moves when it opens. */
 .exb-search-field { height: 36px; flex: none; display: flex; align-items: center; justify-content: center; gap: 9px; padding: 0 13px; }
 .exb-search-icon { flex: none; color: var(--color-muted); }
@@ -286,11 +283,6 @@ body,
 
 /* ---------------------------------------------------------------- Menus at a point or under a button */
 
-/* Over a web page the window's blur can't see every layer of it (a site's sticky header or banner shows through
-   sharp), so the Bar's floating surfaces carry a denser tint than Exo's: their words stay readable over any page. */
-:is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(0 0 0 / 0.66); }
-:root[data-exo-theme="dark"] :is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(36 36 38 / 0.8); }
-:root[data-exo-theme="light"] :is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(255 255 255 / 0.9); }
 
 .exb-menu-scrim { position: fixed; inset: 0; z-index: 70; }
 .exb-menu.exo-shelf-sort-menu { position: fixed; inset: auto; margin: 0; min-width: 220px; max-width: 360px; }

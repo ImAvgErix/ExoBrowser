@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.3 — October 23, 2026
+
+Menus, Search and Settings come in as one piece of Exo Launcher's newest Liquid Glass, without a flash.
+
+- **No gray box before a menu.** The window draws the frost under the Bar's glass a frame ahead of the page, so a menu's frost showed as a gray box a frame before the menu itself. It now waits that frame, and fades in and out with the menu, Search, Exo Vault's sign-in menu and prompt, and notices. _Verified: on screen, frame by frame._
+- **Settings opens frosted.** The page behind Settings stayed sharp for about a quarter of a second while it loaded, then the frost snapped in. It's frosted from the first frame. _Verified: on screen, frame by frame._
+- **No blink when something opens over Settings.** A menu opening over Settings rebuilt all the glass, which blinked the whole sheet for a frame; the glass already on screen now stays as it is. _Verified: on screen, frame by frame._
+- **Exo Launcher's clear glass.** Menus, Search and the sign-in menu use Exo Launcher's clear tint again instead of 1.0.1's denser one, and the Bar and the tabs have its lens at the rim and its light where you press. _Verified: on screen._
+
 ## 1.0.2 — October 23, 2026
 
 Exo Browser now updates itself, and leaves password managers to Exo Vault.
