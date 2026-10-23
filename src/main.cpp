@@ -1,0 +1,4149 @@
+// Exo Browser: a native Win32 host around one WebView2 environment (Edge's official,
+// PGO-built Chromium). The window is one DirectComposition tree: the active tab's content,
+// clipped to a rounded card and blurred under overlays, with Exo's chrome page composited
+// on top. The host routes mouse input itself and owns tab lifetime (sleep, discard, restore).
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <dwmapi.h>
+#include <d2d1effects.h>
+#include <DispatcherQueue.h>
+#include <windows.ui.composition.interop.h>
+#include <windows.graphics.effects.interop.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.Numerics.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Composition.h>
+#include <winrt/Windows.UI.Composition.Desktop.h>
+#include <winrt/Windows.Graphics.Effects.h>
+#include <array>
+#include <chrono>
+#include <shlwapi.h>
+#include <shobjidl.h>
+#include <urlmon.h>
+#include <thread>
+#include <unordered_set>
+#include <wincrypt.h>
+#include <bcrypt.h>
+#include <wrl.h>
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <wtsapi32.h>
+#include "WebView2.h"
+#include "WebView2EnvironmentOptions.h"
+#include "vault.h"
+#include "version.h"
+
+using Microsoft::WRL::Callback;
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Make;
+
+// ---------------------------------------------------------------------------------------
+// Layout, in DIPs. The Bar is Exo's: 8px above 36px capsules; the page fills everything below.
+static const int kBarDip = 52;
+static const int kResizeDip = 6;
+static const ULONGLONG kLowMemoryAfterMs = 60 * 1000;
+static const ULONGLONG kSleepAfterMs = 5 * 60 * 1000;
+static const ULONGLONG kDiscardAfterMs = 30 * 60 * 1000;
+static const size_t kHistoryLimit = 20000;
+static const size_t kHistoryToUi = 4000;
+static const UINT kTimerSleep = 1, kTimerSave = 2;
+static const UINT WM_APP_STATE = WM_APP + 1;
+static const UINT WM_APP_EXT_READY = WM_APP + 2;  // lParam: new std::wstring* (folder, or "!" + error)
+static const wchar_t kClassName[] = L"ExoBrowserWindow";
+static const int kUi = -1;  // input target id of the chrome page; tabs are 1..n
+// The new tab page is ui/newtab.html, served to tabs from this host only.
+static const wchar_t kNewTabHost[] = L"newtab.exo";
+static const wchar_t kNewTab[] = L"https://newtab.exo/newtab.html";
+
+struct Tab {
+    int id = 0;
+    ComPtr<ICoreWebView2CompositionController> comp;
+    ComPtr<ICoreWebView2Controller> ctl;
+    ComPtr<ICoreWebView2> core;
+    winrt::Windows::UI::Composition::ContainerVisual visual{nullptr};
+    ComPtr<ICoreWebView2Find> find;
+    std::wstring url, title, favicon, pendingNav;
+    std::vector<std::function<void(Tab*)>> whenReady;
+    HCURSOR cursor = nullptr;
+    ULONGLONG lastActive = 0;
+    bool creating = false, loading = false, audible = false, muted = false;
+    bool suspended = false, lowMemory = false, pinned = false;
+};
+
+struct ClosedTab { std::wstring url, title; size_t index; };
+struct Visit { std::wstring url, title; int visits = 0; long long last = 0; };
+struct Bookmark { std::wstring url, title; };
+
+struct App {
+    HWND hwnd = nullptr;
+    UINT dpi = 96;
+    std::wstring exeDir, dataDir;
+    ComPtr<ICoreWebView2Environment10> env;
+    winrt::Windows::System::DispatcherQueueController queue{nullptr};
+    winrt::Windows::UI::Composition::Compositor compositor{nullptr};
+    winrt::Windows::UI::Composition::Desktop::DesktopWindowTarget target{nullptr};
+    winrt::Windows::UI::Composition::ContainerVisual root{nullptr}, chromeLayer{nullptr}, glassLayer{nullptr}, chromeVisual{nullptr};
+    winrt::Windows::UI::Composition::ContainerVisual glassTop{nullptr}, glassSide{nullptr};
+    bool revealedTop = true, revealedSide = true;
+    winrt::Windows::UI::Composition::LayerVisual content{nullptr};
+    winrt::Windows::UI::Composition::CompositionEffectBrush blur{nullptr};
+    bool revealed = true, pinned = false;
+    ComPtr<ICoreWebView2CompositionController> uiComp;
+    ComPtr<ICoreWebView2Controller> uiCtl;
+    ComPtr<ICoreWebView2> ui;
+    HCURSOR uiCursor = nullptr;
+    bool uiReady = false, profileReady = false;
+    std::vector<std::unique_ptr<Tab>> tabs;
+    std::vector<ClosedTab> closed;
+    std::unordered_map<std::wstring, Visit> history;
+    std::unordered_map<std::wstring, std::wstring> settings;
+    std::unordered_map<std::wstring, std::wstring> favicons;  // site -> data: URL
+    std::vector<Bookmark> bookmarks;
+    bool faviconsDirty = false;
+    int sidebarDip = 0;           // vertical tabs: the sidebar's width; 0 with tabs on top
+    int chromeTopDip = 52;        // the Bar's height (with the tab row when tabs are on top)
+    bool autohide = false;        // the Bar and sidebar hide until the pointer reaches their edge
+    int revealTop = 0, revealLeft = 0;  // px of chrome shown over the page while revealed
+    COLORREF page = RGB(0, 0, 0);  // the Appearance's page color, under the Bar and sidebar
+    std::wstring theme = L"void";  // resolved: void, dark or light
+    HWND popup = nullptr;          // an extension's popup
+    ComPtr<ICoreWebView2Controller> popupCtl;
+    int activeId = 0, nextId = 1;
+    bool overlay = false, fullscreen = false, elementFullscreen = false, minimized = false;
+    bool statePending = false, sessionDirty = false, historyDirty = false, tracking = false;
+    int capture = 0, hover = 0, focus = 0;
+    RECT contentRect{};
+    WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    LONG_PTR savedStyle = 0;
+    std::vector<std::wstring> startupUrls;
+} g;
+
+// ---------------------------------------------------------------------------------------
+// Small helpers
+
+static int Px(int dip) { return MulDiv(dip, (int)g.dpi, 96); }
+
+static std::wstring Take(LPWSTR s) {
+    std::wstring r = s ? s : L"";
+    if (s) CoTaskMemFree(s);
+    return r;
+}
+
+static std::string Utf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring Wide(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+static std::wstring Json(const std::wstring& s) {
+    std::wstring o;
+    o.reserve(s.size() + 2);
+    o += L'"';
+    for (wchar_t c : s) {
+        switch (c) {
+        case L'"': o += L"\\\""; break;
+        case L'\\': o += L"\\\\"; break;
+        case L'\n': o += L"\\n"; break;
+        case L'\r': o += L"\\r"; break;
+        case L'\t': o += L"\\t"; break;
+        default:
+            if (c < 0x20) {
+                wchar_t buf[8];
+                swprintf_s(buf, L"\\u%04x", (unsigned)c);
+                o += buf;
+            } else {
+                o += c;
+            }
+        }
+    }
+    o += L'"';
+    return o;
+}
+
+static const wchar_t* Bool(bool b) { return b ? L"true" : L"false"; }
+
+static std::vector<std::wstring> Split(const std::wstring& s, wchar_t sep) {
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;) {
+        size_t at = s.find(sep, start);
+        if (at == std::wstring::npos) { parts.push_back(s.substr(start)); break; }
+        parts.push_back(s.substr(start, at - start));
+        start = at + 1;
+    }
+    return parts;
+}
+
+static std::wstring Field(std::wstring s) {
+    for (auto& c : s) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
+    return s;
+}
+
+static std::string ReadFileUtf8(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f, &size);
+    std::string data((size_t)size.QuadPart, '\0');
+    DWORD read = 0;
+    if (!data.empty()) ReadFile(f, data.data(), (DWORD)data.size(), &read, nullptr);
+    CloseHandle(f);
+    data.resize(read);
+    return data;
+}
+
+// Written beside, then swapped in, so a crash mid-write never leaves half a file.
+static void WriteFileUtf8(const std::wstring& path, const std::string& data) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, data.data(), (DWORD)data.size(), &written, nullptr);
+    CloseHandle(f);
+    MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+static std::vector<std::vector<std::wstring>> ReadTable(const wchar_t* name) {
+    std::vector<std::vector<std::wstring>> rows;
+    for (auto& line : Split(Wide(ReadFileUtf8(g.dataDir + L"\\" + name)), L'\n')) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (!line.empty()) rows.push_back(Split(line, L'\t'));
+    }
+    return rows;
+}
+
+static std::wstring Base64(const BYTE* data, DWORD size) {
+    DWORD chars = 0;
+    CryptBinaryToStringW(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &chars);
+    std::wstring out(chars, L'\0');
+    CryptBinaryToStringW(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, out.data(), &chars);
+    out.resize(chars);
+    return out;
+}
+
+static long long NowSeconds() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u{ft.dwLowDateTime, ft.dwHighDateTime};
+    return (long long)(u.QuadPart / 10000000ULL - 11644473600ULL);
+}
+
+static Tab* FindTab(int id) {
+    for (auto& t : g.tabs) if (t->id == id) return t.get();
+    return nullptr;
+}
+
+static Tab* Active() { return FindTab(g.activeId); }
+
+static size_t IndexOf(int id) {
+    for (size_t i = 0; i < g.tabs.size(); i++) if (g.tabs[i]->id == id) return i;
+    return g.tabs.size();
+}
+
+// "news.example.com" from "https://www.news.example.com/a?b": the key for icons and top sites.
+static std::wstring SiteOf(const std::wstring& url) {
+    size_t start = url.find(L"://");
+    if (start == std::wstring::npos) return L"";
+    start += 3;
+    size_t end = url.find_first_of(L"/?#:", start);
+    std::wstring site = url.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    if (site.rfind(L"www.", 0) == 0) site = site.substr(4);
+    return site;
+}
+
+static bool IsNewTab(const std::wstring& url) { return SiteOf(url) == kNewTabHost; }
+
+static std::wstring Setting(const wchar_t* key, const wchar_t* fallback) {
+    auto it = g.settings.find(key);
+    return it == g.settings.end() || it->second.empty() ? fallback : it->second;
+}
+
+// ---------------------------------------------------------------------------------------
+// Persistence: settings, session and history are tab-separated UTF-8 under %LOCALAPPDATA%.
+
+static void SaveSettings() {
+    std::string out;
+    for (auto& [k, v] : g.settings) out += Utf8(Field(k) + L"\t" + Field(v)) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\settings.tsv", out);
+}
+
+static void SaveSession() {
+    g.sessionDirty = false;
+    std::string out = Utf8(L"active\t" + std::to_wstring(IndexOf(g.activeId))) + "\n";
+    for (auto& t : g.tabs) {
+        if (t->url.empty()) continue;
+        out += Utf8(L"tab\t" + Field(t->url) + L"\t" + Field(t->title) + L"\t" + (t->pinned ? L"1" : L"0")) + "\n";
+    }
+    WriteFileUtf8(g.dataDir + L"\\session.tsv", out);
+}
+
+static void SaveHistory() {
+    g.historyDirty = false;
+    std::vector<const Visit*> all;
+    all.reserve(g.history.size());
+    for (auto& [_, v] : g.history) all.push_back(&v);
+    std::sort(all.begin(), all.end(), [](auto a, auto b) { return a->last > b->last; });
+    if (all.size() > kHistoryLimit) all.resize(kHistoryLimit);
+    std::string out;
+    for (auto v : all)
+        out += Utf8(Field(v->url) + L"\t" + Field(v->title) + L"\t" + std::to_wstring(v->visits) + L"\t" +
+                    std::to_wstring(v->last)) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\history.tsv", out);
+}
+
+static void LoadHistory() {
+    for (auto& row : ReadTable(L"history.tsv")) {
+        if (row.size() < 4) continue;
+        Visit v{row[0], row[1], _wtoi(row[2].c_str()), _wtoi64(row[3].c_str())};
+        g.history[v.url] = v;
+    }
+}
+
+static void SaveBookmarks() {
+    std::string out;
+    for (auto& b : g.bookmarks) out += Utf8(Field(b.url) + L"\t" + Field(b.title)) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\bookmarks.tsv", out);
+}
+
+static void SaveFavicons() {
+    g.faviconsDirty = false;
+    std::string out;
+    for (auto& [site, fav] : g.favicons) out += Utf8(site + L"\t" + fav) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\favicons.tsv", out);
+}
+
+static void MarkSessionDirty() {
+    g.sessionDirty = true;
+    SetTimer(g.hwnd, kTimerSave, 1500, nullptr);
+}
+
+// ---------------------------------------------------------------------------------------
+// Talking to the chrome page
+
+static void UiPost(const std::wstring& json) {
+    if (g.ui && g.uiReady) g.ui->PostWebMessageAsJson(json.c_str());
+}
+
+static std::wstring TabJson(const Tab* t) {
+    return L"{\"id\":" + std::to_wstring(t->id) + L",\"title\":" + Json(t->title) + L",\"url\":" + Json(t->url) +
+           L",\"loading\":" + Bool(t->loading) + L",\"audible\":" + Bool(t->audible) + L",\"muted\":" +
+           Bool(t->muted) + L",\"sleeping\":" + Bool(t->suspended || (!t->ctl && !t->creating)) +
+           L",\"pinned\":" + Bool(t->pinned) + L"}";
+}
+
+// Many events land at once (a navigation fires source, title, history and favicon), so the
+// page hears one state message per turn of the message loop.
+static void QueueState() {
+    if (g.statePending || !g.hwnd) return;
+    g.statePending = true;
+    PostMessageW(g.hwnd, WM_APP_STATE, 0, 0);
+}
+
+static void SendState() {
+    g.statePending = false;
+    std::wstring tabs;
+    for (auto& t : g.tabs) {
+        if (!tabs.empty()) tabs += L",";
+        tabs += TabJson(t.get());
+    }
+    BOOL back = FALSE, fwd = FALSE;
+    if (Tab* a = Active(); a && a->core) {
+        a->core->get_CanGoBack(&back);
+        a->core->get_CanGoForward(&fwd);
+    }
+    UiPost(L"{\"t\":\"state\",\"active\":" + std::to_wstring(g.activeId) + L",\"tabs\":[" + tabs + L"],\"back\":" +
+           Bool(back) + L",\"fwd\":" + Bool(fwd) + L",\"max\":" + Bool(IsZoomed(g.hwnd)) + L",\"full\":" +
+           Bool(g.fullscreen) + L"}");
+}
+
+static void SendFavicon(const Tab* t) {
+    UiPost(L"{\"t\":\"fav\",\"id\":" + std::to_wstring(t->id) + L",\"fav\":" + Json(t->favicon) + L"}");
+}
+
+static void SendSettings() {
+    std::wstring body;
+    for (auto& [k, v] : g.settings) {
+        if (!body.empty()) body += L",";
+        body += Json(k) + L":" + Json(v);
+    }
+    UiPost(L"{\"t\":\"settings\",\"theme\":" + Json(g.theme) + L",\"values\":{" + body + L"}}");
+}
+
+static void SendHistory() {
+    std::vector<const Visit*> all;
+    for (auto& [_, v] : g.history) all.push_back(&v);
+    std::sort(all.begin(), all.end(), [](auto a, auto b) { return a->last > b->last; });
+    if (all.size() > kHistoryToUi) all.resize(kHistoryToUi);
+    std::wstring items;
+    for (auto v : all) {
+        if (!items.empty()) items += L",";
+        items += L"[" + Json(v->url) + L"," + Json(v->title) + L"," + std::to_wstring(v->visits) + L"," +
+                 std::to_wstring(v->last) + L"]";
+    }
+    UiPost(L"{\"t\":\"history\",\"items\":[" + items + L"]}");
+}
+
+// Sharp icons, for the new tab page's cards: a site's largest declared icon (or the
+// apple-touch-icon most sites keep at their root), fetched once and kept in icons.tsv. The tab
+// strip's small favicons stay in g.favicons.
+static const UINT WM_APP_ICON = WM_APP + 4;  // lParam: new std::pair<site, data: URL or "">*
+static std::unordered_map<std::wstring, std::wstring> g_icons;
+static std::unordered_set<std::wstring> g_iconTried;
+
+static std::wstring IconDataUrl(const std::string& b) {
+    if (b.size() < 16 || b.size() > 512 * 1024) return L"";
+    auto u = [&](size_t i) { return (unsigned char)b[i]; };
+    const wchar_t* type = nullptr;
+    if (b.compare(0, 4, "\x89PNG") == 0 && b.size() > 24) {
+        unsigned w = (u(16) << 24) | (u(17) << 16) | (u(18) << 8) | u(19);
+        if (w >= 32) type = L"image/png";  // cards draw icons at 30px
+    } else if (u(0) == 0xFF && u(1) == 0xD8) type = L"image/jpeg";
+    else if (b.compare(0, 4, "RIFF") == 0 && b.compare(8, 4, "WEBP") == 0) type = L"image/webp";
+    else if (u(0) == 0 && u(1) == 0 && u(2) == 1 && u(3) == 0) {
+        int count = u(4) | (u(5) << 8);
+        for (int i = 0; i < count && 6 + i * 16 < (int)b.size(); i++)
+            if (u(6 + i * 16) == 0 || u(6 + i * 16) >= 32) { type = L"image/x-icon"; break; }
+    } else if (b.substr(0, 512).find("<svg") != std::string::npos) type = L"image/svg+xml";
+    return type ? std::wstring(L"data:") + type + L";base64," + Base64((const BYTE*)b.data(), (DWORD)b.size()) : L"";
+}
+
+static void FetchIcon(const std::wstring& site, const std::wstring& declared) {
+    // Tried once per session each way: from the page's own choice, and by guessing the address.
+    if (site.empty() || g_icons.count(site) || !g_iconTried.insert(site + (declared.empty() ? L"" : L"#page")).second) return;
+    std::vector<std::wstring> urls;
+    if (declared.rfind(L"https://", 0) == 0) urls.push_back(declared);
+    urls.push_back(L"https://" + site + L"/apple-touch-icon.png");
+    if (site.rfind(L"www.", 0) != 0) urls.push_back(L"https://www." + site + L"/apple-touch-icon.png");
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd, site, urls] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::wstring data;
+        for (auto& u : urls) {
+            wchar_t file[MAX_PATH];
+            if (FAILED(URLDownloadToCacheFileW(nullptr, u.c_str(), file, MAX_PATH, 0, nullptr))) continue;
+            data = IconDataUrl(ReadFileUtf8(file));
+            if (!data.empty()) break;
+        }
+        CoUninitialize();
+        PostMessageW(hwnd, WM_APP_ICON, 0, (LPARAM)new std::pair<std::wstring, std::wstring>(site, data));
+    }).detach();
+}
+
+// The page's own choice: its largest icon, an SVG one first.
+static const wchar_t kIconScript[] =
+    L"(() => { const score = (l) => /svg/.test(l.type) || /\\.svg(\\?|$)/.test(l.href) ? 1e4 :"
+    L" Math.max(/apple/.test(l.rel) ? 180 : 0, ...String(l.sizes && l.sizes.value || '').split(/\\s+/).map((x) => parseInt(x) || 0));"
+    L" const all = [...document.querySelectorAll('link[rel~=icon], link[rel~=apple-touch-icon], link[rel~=apple-touch-icon-precomposed]')]"
+    L"  .filter((l) => l.href.startsWith('https://')).sort((a, b) => score(b) - score(a));"
+    L" return all.length && score(all[0]) >= 32 ? all[0].href : ''; })()";
+
+static void SaveIcons() {
+    std::string out;
+    for (auto& [site, data] : g_icons) out += Utf8(site + L"\t" + data) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\icons.tsv", out);
+}
+
+static std::wstring FavFor(const std::wstring& url) {
+    if (auto it = g_icons.find(SiteOf(url)); it != g_icons.end()) return it->second;
+    auto it = g.favicons.find(SiteOf(url));
+    return it == g.favicons.end() ? L"" : it->second;
+}
+
+// [url, title, icon, sharp]: sharp when the icon is a large one.
+static std::wstring BookmarksJson() {
+    std::wstring items;
+    for (auto& b : g.bookmarks) {
+        if (!items.empty()) items += L",";
+        bool sharp = g_icons.count(SiteOf(b.url)) > 0;
+        if (!sharp) FetchIcon(SiteOf(b.url), L"");
+        items += L"[" + Json(b.url) + L"," + Json(b.title) + L"," + Json(FavFor(b.url)) + L"," + (sharp ? L"true" : L"false") + L"]";
+    }
+    return L"[" + items + L"]";
+}
+
+// The most visited sites, one address each, by visits weighted for how recent they are.
+static std::wstring TopSitesJson() {
+    long long now = NowSeconds();
+    struct Site { double score = 0; const Visit* best = nullptr; };
+    std::unordered_map<std::wstring, Site> sites;
+    for (auto& [_, v] : g.history) {
+        double days = (double)(now - v.last) / 86400.0;
+        double recency = days < 1 ? 100 : days < 4 ? 70 : days < 14 ? 50 : days < 31 ? 30 : days < 90 ? 10 : 2;
+        Site& s = sites[SiteOf(v.url)];
+        s.score += v.visits * recency;
+        if (!s.best || v.visits > s.best->visits) s.best = &v;
+    }
+    std::vector<std::pair<double, const Visit*>> ranked;
+    for (auto& [site, s] : sites) if (!site.empty() && s.best) ranked.push_back({s.score, s.best});
+    std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::wstring items;
+    for (size_t i = 0; i < ranked.size() && i < 8; i++) {
+        const Visit* v = ranked[i].second;
+        if (!items.empty()) items += L",";
+        // [url, title, icon, sharp], as bookmarks are: a site's large icon once it is found.
+        bool sharp = g_icons.count(SiteOf(v->url)) > 0;
+        if (!sharp) FetchIcon(SiteOf(v->url), L"");
+        items += L"[" + Json(v->url) + L"," + Json(v->title) + L"," + Json(FavFor(v->url)) + L"," + (sharp ? L"true" : L"false") + L"]";
+    }
+    return L"[" + items + L"]";
+}
+
+// New tab pages read their data from https://api.newtab.exo/ntp.json, which only their own
+// origin may read (CORS), and hear "refresh" when it changes.
+static void RefreshNewTabs() {
+    UiPost(L"{\"t\":\"refresh\"}");
+    for (auto& t : g.tabs)
+        if (t->core && IsNewTab(t->url)) t->core->PostWebMessageAsString(L"refresh");
+}
+
+static void SendBookmarks() {
+    UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
+    RefreshNewTabs();
+}
+
+static void ToggleBookmark(const std::wstring& url, const std::wstring& title) {
+    if (url.empty() || IsNewTab(url)) return;
+    auto it = std::find_if(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& b) { return b.url == url; });
+    if (it != g.bookmarks.end()) g.bookmarks.erase(it);
+    else g.bookmarks.push_back({url, title.empty() ? SiteOf(url) : title});
+    SaveBookmarks();
+    SendBookmarks();
+}
+
+// ---------------------------------------------------------------------------------------
+// Appearance: Exo's Light, Dark and Void (Match Windows picks Light or Dark), Glass or Solid.
+
+static bool WindowsUsesLight() {
+    DWORD light = 0, size = sizeof light;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    return light != 0;
+}
+
+static void ApplyTheme() {
+    std::wstring a = Setting(L"appearance", L"void");
+    g.theme = a == L"match" ? (WindowsUsesLight() ? L"light" : L"dark") : (a == L"light" || a == L"dark") ? a : L"void";
+    g.page = g.theme == L"light" ? RGB(245, 245, 245) : g.theme == L"dark" ? RGB(18, 18, 18) : RGB(0, 0, 0);
+    if (g.hwnd) {
+        BOOL dark = g.theme != L"light";
+        DwmSetWindowAttribute(g.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
+        COLORREF caption = g.page;
+        DwmSetWindowAttribute(g.hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof caption);
+        InvalidateRect(g.hwnd, nullptr, TRUE);
+    }
+}
+
+static std::wstring NewTabJson() {
+    return L"{\"bookmarks\":" + BookmarksJson() + L",\"top\":" + TopSitesJson() + L",\"engine\":" +
+           Json(Setting(L"engine", L"brave")) + L",\"theme\":" + Json(g.theme) + L",\"material\":" +
+           Json(Setting(L"material", L"glass")) + L",\"bookmarkStyle\":" + Json(Setting(L"bookmarkStyle", L"cards")) +
+           L",\"tiles\":" + Json(Setting(L"tiles", L"on")) +
+           // How far the Bar and side tabs push the page in, so it can center itself in the window.
+           L",\"insetTop\":" + std::to_wstring(g.autohide || g.fullscreen ? 0 : g.chromeTopDip) +
+           L",\"insetLeft\":" + std::to_wstring(g.autohide || g.fullscreen ? 0 : g.sidebarDip) + L"}";
+}
+
+// ---------------------------------------------------------------------------------------
+// Import from other browsers, as much as each allows: bookmarks (Chromium's JSON, read by the
+// page), history, site icons, sign-ins (cookies), search engine and Chrome Web Store extensions
+// from any Chromium browser on this PC; bookmarks, history and sign-ins from Firefox. Databases
+// are read through Windows' own winsqlite3.dll from a copy, since the browser may hold them.
+
+static void Toast(const std::wstring& text);
+
+struct Sql {
+    HMODULE dll = nullptr;
+    int (*open)(const char*, void**, int, const char*) = nullptr;
+    int (*prepare)(void*, const char*, int, void**, const char**) = nullptr;
+    int (*step)(void*) = nullptr;
+    const void* (*text16)(void*, int) = nullptr;
+    const void* (*blob)(void*, int) = nullptr;
+    int (*bytes)(void*, int) = nullptr;
+    long long (*int64)(void*, int) = nullptr;
+    int (*finalize)(void*) = nullptr;
+    int (*close)(void*) = nullptr;
+    Sql() {
+        dll = LoadLibraryExW(L"winsqlite3.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!dll) return;
+        open = (decltype(open))GetProcAddress(dll, "sqlite3_open_v2");
+        prepare = (decltype(prepare))GetProcAddress(dll, "sqlite3_prepare_v2");
+        step = (decltype(step))GetProcAddress(dll, "sqlite3_step");
+        text16 = (decltype(text16))GetProcAddress(dll, "sqlite3_column_text16");
+        blob = (decltype(blob))GetProcAddress(dll, "sqlite3_column_blob");
+        bytes = (decltype(bytes))GetProcAddress(dll, "sqlite3_column_bytes");
+        int64 = (decltype(int64))GetProcAddress(dll, "sqlite3_column_int64");
+        finalize = (decltype(finalize))GetProcAddress(dll, "sqlite3_finalize");
+        close = (decltype(close))GetProcAddress(dll, "sqlite3_close");
+    }
+    ~Sql() { if (dll) FreeLibrary(dll); }
+    std::wstring Text(void* st, int col) { auto t = (const wchar_t*)text16(st, col); return t ? t : L""; }
+    // Runs a query on a copy of the database; false when it could not be copied (held open).
+    bool Query(const std::wstring& file, const char* sql, const std::function<void(void*)>& row) {
+        if (!open || !prepare || !step || !finalize || !close) return false;
+        if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+        std::wstring copy = g.dataDir + L"\\import.tmp";
+        if (!CopyFileW(file.c_str(), copy.c_str(), FALSE)) return false;
+        void* db = nullptr;
+        if (open(Utf8(copy).c_str(), &db, 1, nullptr) == 0) {
+            void* st = nullptr;
+            if (prepare(db, sql, -1, &st, nullptr) == 0) {
+                while (step(st) == 100) row(st);
+                finalize(st);
+            }
+        }
+        if (db) close(db);
+        DeleteFileW(copy.c_str());
+        return true;
+    }
+};
+
+struct Browser { std::wstring key, name, dir; bool firefox = false; };
+
+static bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR p = nullptr;
+    SHGetKnownFolderPath(id, 0, nullptr, &p);
+    return Take(p);
+}
+
+static std::wstring FirefoxProfile() {
+    std::wstring base = KnownFolder(FOLDERID_RoamingAppData) + L"\\Mozilla\\Firefox\\Profiles\\";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((base + L"*").c_str(), &fd);
+    std::wstring best;
+    FILETIME newest{};
+    if (h == INVALID_HANDLE_VALUE) return best;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+        WIN32_FILE_ATTRIBUTE_DATA info;
+        std::wstring places = base + fd.cFileName + L"\\places.sqlite";
+        if (!GetFileAttributesExW(places.c_str(), GetFileExInfoStandard, &info)) continue;
+        if (CompareFileTime(&info.ftLastWriteTime, &newest) > 0) { newest = info.ftLastWriteTime; best = base + fd.cFileName; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return best;
+}
+
+// Every Chromium browser on this PC: the well-known ones by name, then any folder one or two levels
+// under %LOCALAPPDATA% holding "User Data\Default" with bookmarks or history (Aside, Arc, Comet,
+// Thorium and whatever comes next), and Firefox.
+static std::vector<Browser> DetectBrowsers() {
+    static const std::pair<const wchar_t*, const wchar_t*> known[] = {
+        {L"Google\\Chrome", L"Chrome"}, {L"Google\\Chrome Beta", L"Chrome Beta"}, {L"Google\\Chrome SxS", L"Chrome Canary"},
+        {L"Microsoft\\Edge", L"Edge"}, {L"Microsoft\\Edge Beta", L"Edge Beta"}, {L"BraveSoftware\\Brave-Browser", L"Brave"},
+        {L"imput\\Helium", L"Helium"}, {L"Vivaldi", L"Vivaldi"}, {L"Aside", L"Aside"}, {L"Chromium", L"Chromium"},
+        {L"Thorium", L"Thorium"}, {L"Perplexity\\Comet", L"Comet"}, {L"Yandex\\YandexBrowser", L"Yandex"}};
+    std::wstring local = KnownFolder(FOLDERID_LocalAppData);
+    std::vector<Browser> out;
+    auto consider = [&](const std::wstring& base, const std::wstring& name) {
+        std::wstring dir = base + L"\\User Data\\Default";
+        if (!Exists(dir + L"\\Bookmarks") && !Exists(dir + L"\\History")) return;
+        for (auto& b : out) if (_wcsicmp(b.dir.c_str(), dir.c_str()) == 0) return;
+        out.push_back({dir, name, dir});
+    };
+    for (auto& [rel, name] : known) consider(local + L"\\" + rel, name);
+    auto scan = [&](const std::wstring& base, int depth, auto&& self) -> void {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((base + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' ||
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || _wcsicmp(fd.cFileName, L"Packages") == 0 ||
+                _wcsicmp(fd.cFileName, L"ExoBrowser") == 0) continue;
+            std::wstring path = base + L"\\" + fd.cFileName;
+            consider(path, fd.cFileName);
+            if (depth > 1) self(path, depth - 1, self);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+    scan(local, 2, scan);
+    std::wstring opera = KnownFolder(FOLDERID_RoamingAppData) + L"\\Opera Software\\Opera Stable";
+    if (Exists(opera + L"\\Bookmarks") || Exists(opera + L"\\History")) out.push_back({opera, L"Opera", opera});
+    if (std::wstring ff = FirefoxProfile(); !ff.empty()) out.push_back({ff, L"Firefox", ff, true});
+    return out;
+}
+
+static bool Imported(const std::wstring& key) {
+    return (L"|" + Setting(L"imported", L"") + L"|").find(L"|" + key + L"|") != std::wstring::npos;
+}
+
+static std::wstring SourcesJson() {
+    std::wstring items;
+    for (auto& b : DetectBrowsers()) {
+        if (Imported(b.key)) continue;
+        if (!items.empty()) items += L",";
+        items += L"[" + Json(b.key) + L"," + Json(b.name) + L"," + Bool(b.firefox) + L"]";
+    }
+    return L"[" + items + L"]";
+}
+
+static void SendImportSources() { UiPost(L"{\"t\":\"importSources\",\"items\":" + SourcesJson() + L"}"); }
+
+static int ImportHistory(const std::wstring& dir) {
+    Sql sql;
+    int count = 0;
+    sql.Query(dir + L"\\History",
+              "SELECT url, title, visit_count, last_visit_time FROM urls WHERE url LIKE 'http%' ORDER BY last_visit_time DESC LIMIT 20000",
+              [&](void* st) {
+                  std::wstring u = sql.Text(st, 0), t = sql.Text(st, 1);
+                  if (u.empty()) return;
+                  Visit& v = g.history[u];
+                  long long last = sql.int64(st, 3) / 1000000 - 11644473600LL;
+                  if (v.url.empty()) { v.url = u; count++; }
+                  if (!t.empty() && (v.title.empty() || last > v.last)) v.title = t;
+                  v.visits = std::max(v.visits, (int)sql.int64(st, 2));
+                  v.last = std::max(v.last, last);
+              });
+    if (count) { g.historyDirty = true; SaveHistory(); }
+    return count;
+}
+
+static int ImportFavicons(const std::wstring& dir) {
+    Sql sql;
+    int added = 0;
+    bool sharp = false;
+    sql.Query(dir + L"\\Favicons",
+              "SELECT m.page_url, b.image_data FROM icon_mapping m JOIN favicon_bitmaps b ON b.icon_id = m.icon_id "
+              "WHERE b.width <= 256 ORDER BY b.width DESC",
+              [&](void* st) {
+                  std::wstring u = sql.Text(st, 0);
+                  int n = sql.bytes(st, 1);
+                  auto data = (const BYTE*)sql.blob(st, 1);
+                  if (u.empty() || !data || n <= 0 || n > 256 * 1024 || g.favicons.size() > 4000) return;
+                  std::wstring site = SiteOf(u);
+                  if (site.empty()) return;
+                  std::wstring icon = IconDataUrl(std::string((const char*)data, n));
+                  if (!icon.empty() && !g_icons.count(site)) { g_icons[site] = icon; sharp = true; }
+                  if (g.favicons.count(site)) return;
+                  g.favicons[site] = L"data:image/png;base64," + Base64(data, (DWORD)n);
+                  added++;
+              });
+    if (added) g.faviconsDirty = true;
+    if (sharp) SaveIcons();
+    return added;
+}
+
+// Sign-ins: cookies go into Exo's profile through WebView2's cookie manager.
+static ComPtr<ICoreWebView2CookieManager> CookieManager() {
+    for (auto& t : g.tabs) {
+        ComPtr<ICoreWebView2_2> c2;
+        ComPtr<ICoreWebView2CookieManager> cm;
+        if (t->core && SUCCEEDED(t->core.As(&c2)) && SUCCEEDED(c2->get_CookieManager(&cm))) return cm;
+    }
+    return nullptr;
+}
+
+static bool AddCookie(ICoreWebView2CookieManager* cm, const std::wstring& name, const std::wstring& value, const std::wstring& domain,
+                      const std::wstring& path, double expires, bool secure, bool httpOnly, int sameSite) {
+    ComPtr<ICoreWebView2Cookie> c;
+    if (name.empty() || domain.empty() || FAILED(cm->CreateCookie(name.c_str(), value.c_str(), domain.c_str(), path.empty() ? L"/" : path.c_str(), &c)))
+        return false;
+    if (expires > 0) c->put_Expires(expires);
+    c->put_IsSecure(secure);
+    c->put_IsHttpOnly(httpOnly);
+    c->put_SameSite(sameSite == 0 && secure ? COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE
+                    : sameSite == 2 ? COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT : COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX);
+    return SUCCEEDED(cm->AddOrUpdateCookie(c.Get()));
+}
+
+// Chromium encrypts cookies with an AES key kept in "Local State", itself encrypted for this
+// Windows user ("v10"). Chrome's newer app-bound keys ("v20") can only be opened by Chrome itself.
+static std::string ChromiumKey(const std::wstring& profileDir) {
+    std::string state = ReadFileUtf8(profileDir + L"\\..\\Local State");
+    if (state.empty()) state = ReadFileUtf8(profileDir + L"\\Local State");
+    size_t at = state.find("\"encrypted_key\"");
+    if (at == std::string::npos) return "";
+    size_t open = state.find('"', state.find(':', at) + 1), close = state.find('"', open + 1);
+    std::string b64 = state.substr(open + 1, close - open - 1);
+    DWORD n = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr) || n <= 5) return "";
+    std::string blob(n, 0);
+    CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)blob.data(), &n, nullptr, nullptr);
+    if (blob.compare(0, 5, "DPAPI") != 0) return "";
+    DATA_BLOB in{(DWORD)(n - 5), (BYTE*)blob.data() + 5}, out{};
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) return "";
+    std::string key((char*)out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return key;
+}
+
+static bool AesGcm(const std::string& key, const BYTE* nonce, const BYTE* data, size_t size, std::string& plain) {
+    if (key.size() != 32 || size < 16) return false;
+    BCRYPT_KEY_HANDLE k = nullptr;
+    if (BCryptGenerateSymmetricKey(BCRYPT_AES_GCM_ALG_HANDLE, &k, nullptr, 0, (PUCHAR)key.data(), 32, 0) != 0) return false;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = (PUCHAR)nonce;
+    info.cbNonce = 12;
+    info.pbTag = (PUCHAR)(data + size - 16);
+    info.cbTag = 16;
+    plain.assign(size - 16, 0);
+    ULONG got = 0;
+    NTSTATUS st = BCryptDecrypt(k, (PUCHAR)data, (ULONG)(size - 16), &info, nullptr, 0, (PUCHAR)plain.data(), (ULONG)plain.size(), &got, 0);
+    BCryptDestroyKey(k);
+    plain.resize(got);
+    return st == 0;
+}
+
+struct CookieResult { int added = 0, locked = 0, appBound = 0; };
+
+static CookieResult ImportChromiumCookies(const std::wstring& dir) {
+    CookieResult r;
+    ComPtr<ICoreWebView2CookieManager> cm = CookieManager();
+    if (!cm) return r;
+    std::string key = ChromiumKey(dir);
+    std::wstring db = Exists(dir + L"\\Network\\Cookies") ? dir + L"\\Network\\Cookies" : dir + L"\\Cookies";
+    Sql sql;
+    int version = 0;
+    if (!sql.Query(db, "SELECT value FROM meta WHERE key = 'version'", [&](void* st) { version = _wtoi(sql.Text(st, 0).c_str()); })) {
+        r.locked = 1;
+        return r;
+    }
+    sql.Query(db, "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite FROM cookies",
+        [&](void* st) {
+            std::wstring host = sql.Text(st, 0), name = sql.Text(st, 1), value = sql.Text(st, 2);
+            int n = sql.bytes(st, 3);
+            auto enc = (const BYTE*)sql.blob(st, 3);
+            if (value.empty() && enc && n > 3) {
+                if (memcmp(enc, "v20", 3) == 0) { r.appBound++; return; }
+                if (memcmp(enc, "v10", 3) != 0 && memcmp(enc, "v11", 3) != 0) return;
+                std::string plain;
+                if (n < 3 + 12 + 16 || !AesGcm(key, enc + 3, enc + 15, (size_t)n - 15, plain)) return;
+                // From database version 24 the value is prefixed with the SHA-256 of its domain.
+                if (version >= 24 && plain.size() >= 32) plain = plain.substr(32);
+                value = Wide(plain);
+            }
+            long long expires = sql.int64(st, 5);
+            double unix = expires > 0 ? (double)(expires / 1000000 - 11644473600LL) : 0;
+            if (unix > 0 && unix < (double)NowSeconds()) return;
+            if (AddCookie(cm.Get(), name, value, host, sql.Text(st, 4), unix, sql.int64(st, 6) != 0, sql.int64(st, 7) != 0, (int)sql.int64(st, 8)))
+                r.added++;
+        });
+    return r;
+}
+
+static CookieResult ImportFirefoxCookies(const std::wstring& dir) {
+    CookieResult r;
+    ComPtr<ICoreWebView2CookieManager> cm = CookieManager();
+    if (!cm) return r;
+    Sql sql;
+    bool ok = sql.Query(dir + L"\\cookies.sqlite", "SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite FROM moz_cookies",
+        [&](void* st) {
+            long long expiry = sql.int64(st, 4);
+            if (expiry > 100000000000LL) expiry /= 1000;
+            if (expiry > 0 && expiry < NowSeconds()) return;
+            if (AddCookie(cm.Get(), sql.Text(st, 1), sql.Text(st, 2), sql.Text(st, 0), sql.Text(st, 3), (double)expiry,
+                          sql.int64(st, 5) != 0, sql.int64(st, 6) != 0, (int)sql.int64(st, 7)))
+                r.added++;
+        });
+    if (!ok) r.locked = 1;
+    return r;
+}
+
+static std::wstring CookieNote(const CookieResult& c, const std::wstring& name) {
+    if (c.locked) return L"Close " + name + L" and import again to bring over your sign-ins.";
+    if (c.appBound && !c.added) return name + L" locks its sign-ins to itself, so sites will ask you to sign in once.";
+    return L"";
+}
+
+static void ImportFirefox(const Browser& b) {
+    Sql sql;
+    int visits = 0, marks = 0;
+    sql.Query(b.dir + L"\\places.sqlite",
+              "SELECT url, title, visit_count, last_visit_date FROM moz_places WHERE visit_count > 0 AND url LIKE 'http%' "
+              "ORDER BY last_visit_date DESC LIMIT 20000",
+              [&](void* st) {
+                  std::wstring u = sql.Text(st, 0), t = sql.Text(st, 1);
+                  if (u.empty()) return;
+                  Visit& v = g.history[u];
+                  long long last = sql.int64(st, 3) / 1000000;
+                  if (v.url.empty()) { v.url = u; visits++; }
+                  if (!t.empty()) v.title = t;
+                  v.visits = std::max(v.visits, (int)sql.int64(st, 2));
+                  v.last = std::max(v.last, last);
+              });
+    sql.Query(b.dir + L"\\places.sqlite",
+              "SELECT p.url, b.title FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id WHERE b.type = 1 AND p.url LIKE 'http%' ORDER BY b.position",
+              [&](void* st) {
+                  std::wstring u = sql.Text(st, 0), t = sql.Text(st, 1);
+                  if (u.empty() || std::any_of(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& x) { return x.url == u; })) return;
+                  g.bookmarks.push_back({u, t.empty() ? SiteOf(u) : t});
+                  marks++;
+              });
+    CookieResult c = ImportFirefoxCookies(b.dir);
+    SaveHistory();
+    SaveBookmarks();
+    SendHistory();
+    SendBookmarks();
+    std::wstring note = CookieNote(c, L"Firefox");
+    Toast(L"Imported " + std::to_wstring(marks) + L" bookmarks, " + std::to_wstring(visits) + L" pages and " +
+          std::to_wstring(c.added) + L" sign-ins from Firefox" + (note.empty() ? L"" : L". " + note));
+}
+
+static void SaveSettings();
+
+static void Import(const std::wstring& key) {
+    for (auto& b : DetectBrowsers()) {
+        if (b.key != key) continue;
+        if (!Imported(key)) {
+            std::wstring list = Setting(L"imported", L"");
+            g.settings[L"imported"] = list.empty() ? key : list + L"|" + key;
+            SaveSettings();
+        }
+        if (b.firefox) { ImportFirefox(b); return; }
+        int visits = ImportHistory(b.dir);
+        ImportFavicons(b.dir);
+        CookieResult c = ImportChromiumCookies(b.dir);
+        // Bookmarks, settings and extensions are JSON (Bookmarks, Preferences, and Secure Preferences,
+        // where Chrome keeps its extension list); the page reads them and reports the total.
+        UiPost(L"{\"t\":\"importData\",\"name\":" + Json(b.name) + L",\"visits\":" + std::to_wstring(visits) +
+               L",\"cookies\":" + std::to_wstring(c.added) + L",\"note\":" + Json(CookieNote(c, b.name)) +
+               L",\"bookmarks\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Bookmarks"))) +
+               L",\"prefs\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Preferences"))) +
+               L",\"secure\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Secure Preferences"))) + L"}");
+        SendHistory();
+        RefreshNewTabs();
+        return;
+    }
+}
+
+// Bookmarks as a file: the HTML every browser imports and exports ("Netscape bookmark file").
+static std::wstring Unescape(std::wstring s) {
+    const std::pair<const wchar_t*, const wchar_t*> map[] = {{L"&quot;", L"\""}, {L"&#39;", L"'"}, {L"&lt;", L"<"}, {L"&gt;", L">"}, {L"&amp;", L"&"}};
+    for (auto& [from, to] : map)
+        for (size_t at; (at = s.find(from)) != std::wstring::npos;) s.replace(at, wcslen(from), to);
+    return s;
+}
+
+static std::wstring HtmlEscape(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) o += c == L'&' ? L"&amp;" : c == L'<' ? L"&lt;" : c == L'>' ? L"&gt;" : c == L'"' ? L"&quot;" : std::wstring(1, c);
+    return o;
+}
+
+static std::wstring PickFile(bool save, const wchar_t* label = L"Bookmarks (HTML)", const wchar_t* spec = L"*.html;*.htm",
+                             const wchar_t* ext = L"html", const wchar_t* name = L"Exo Browser bookmarks.html") {
+    ComPtr<IFileDialog> dlg;
+    if (FAILED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
+        return L"";
+    COMDLG_FILTERSPEC types[] = {{label, spec}};
+    dlg->SetFileTypes(1, types);
+    dlg->SetDefaultExtension(ext);
+    if (save) dlg->SetFileName(name);
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (FAILED(dlg->Show(g.hwnd)) || FAILED(dlg->GetResult(&item)) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) return L"";
+    return Take(path);
+}
+
+static void ExportBookmarks() {
+    std::wstring file = PickFile(true);
+    if (file.empty()) return;
+    std::wstring html = L"<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n"
+                        L"<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n    <DT><H3 PERSONAL_TOOLBAR_FOLDER=\"true\">Exo Browser</H3>\n    <DL><p>\n";
+    for (auto& b : g.bookmarks)
+        html += L"        <DT><A HREF=\"" + HtmlEscape(b.url) + L"\">" + HtmlEscape(b.title) + L"</A>\n";
+    html += L"    </DL><p>\n</DL><p>\n";
+    WriteFileUtf8(file, Utf8(html));
+    Toast(L"Exported " + std::to_wstring(g.bookmarks.size()) + L" bookmarks");
+}
+
+static void ImportBookmarksFile() {
+    std::wstring file = PickFile(false);
+    if (file.empty()) return;
+    std::wstring html = Wide(ReadFileUtf8(file)), lower = html;
+    for (auto& c : lower) c = towlower(c);
+    int added = 0;
+    for (size_t at = 0; (at = lower.find(L"<a ", at)) != std::wstring::npos; at++) {
+        size_t href = lower.find(L"href=\"", at), end = lower.find(L'>', at);
+        if (href == std::wstring::npos || href > end) continue;
+        size_t q = html.find(L'"', href + 6);
+        size_t close = lower.find(L"</a>", end);
+        if (q == std::wstring::npos || close == std::wstring::npos) continue;
+        std::wstring url = Unescape(html.substr(href + 6, q - href - 6));
+        std::wstring title = Unescape(html.substr(end + 1, close - end - 1));
+        if (url.rfind(L"http", 0) != 0 || std::any_of(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& b) { return b.url == url; }))
+            continue;
+        g.bookmarks.push_back({url, Field(title.empty() ? SiteOf(url) : title)});
+        added++;
+    }
+    SaveBookmarks();
+    SendBookmarks();
+    Toast(L"Imported " + std::to_wstring(added) + L" bookmarks");
+}
+
+// ---------------------------------------------------------------------------------------
+// Extensions: any Chrome Web Store extension (downloaded as a CRX from Google's update service,
+// unpacked here), or an unpacked folder. WebView2 has no toolbar for them, so the Bar lists them
+// and opens each one's popup in a small window of its own.
+
+static std::wstring ExtensionsDir() {
+    std::wstring dir = g.dataDir + L"\\Extensions";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+// The folder each installed extension came from, by the id WebView2 gave it.
+static std::unordered_map<std::wstring, std::wstring> g_extFolders;
+
+static void SaveExtFolders() {
+    std::string out;
+    for (auto& [id, folder] : g_extFolders) out += Utf8(id + L"\t" + folder) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\extensions.tsv", out);
+}
+
+static ComPtr<ICoreWebView2Profile7> TabProfile() {
+    for (auto& t : g.tabs) {
+        if (!t->core) continue;
+        ComPtr<ICoreWebView2_13> c13;
+        ComPtr<ICoreWebView2Profile> profile;
+        ComPtr<ICoreWebView2Profile7> p7;
+        if (SUCCEEDED(t->core.As(&c13)) && SUCCEEDED(c13->get_Profile(&profile)) && SUCCEEDED(profile.As(&p7))) return p7;
+    }
+    return nullptr;
+}
+
+static std::wstring FileDataUrl(const std::wstring& path) {
+    std::string bytes = ReadFileUtf8(path);
+    if (bytes.empty() || bytes.size() > 512 * 1024) return L"";
+    std::wstring ext = path.substr(path.find_last_of(L'.') + 1);
+    std::wstring mime = ext == L"svg" ? L"image/svg+xml" : ext == L"jpg" || ext == L"jpeg" ? L"image/jpeg" : L"image/png";
+    return L"data:" + mime + L";base64," + Base64((const BYTE*)bytes.data(), (DWORD)bytes.size());
+}
+
+// The shipped blockers, copied out of the app folder to a short path under the data folder:
+// Chromium writes each ruleset's index inside the extension's folder, and past Windows' 260
+// characters that write fails ("Internal error while parsing rules"). Copied again when the
+// app ships a different manifest (InitBrowser does it before the engine loads them).
+static std::wstring BuiltinFolder(const std::wstring& name) {
+    std::wstring source = g.exeDir + L"\\extensions\\" + name;
+    std::wstring dest = g.dataDir + L"\\Builtin\\" + name;
+    std::string shipped = ReadFileUtf8(source + L"\\manifest.json");
+    if (shipped.empty()) return dest;
+    if (ReadFileUtf8(dest + L"\\manifest.json") != shipped) {
+        SHCreateDirectoryExW(nullptr, (g.dataDir + L"\\Builtin").c_str(), nullptr);
+        std::wstring from = dest;
+        from.push_back(L'\0');
+        SHFILEOPSTRUCTW del{nullptr, FO_DELETE, from.c_str(), nullptr, FOF_NO_UI, FALSE, nullptr, nullptr};
+        SHFileOperationW(&del);
+        std::wstring src = source + L"\\*";
+        src.push_back(L'\0');
+        std::wstring to = dest;
+        to.push_back(L'\0');
+        SHCreateDirectoryExW(nullptr, dest.c_str(), nullptr);
+        SHFILEOPSTRUCTW copy{nullptr, FO_COPY, src.c_str(), to.c_str(), FOF_NO_UI, FALSE, nullptr, nullptr};
+        SHFileOperationW(&copy);
+    }
+    return dest;
+}
+
+static std::wstring ExtensionFolder(const std::wstring& id, const std::wstring& name) {
+    if (auto it = g_extFolders.find(id); it != g_extFolders.end()) return it->second;
+    if (name.find(L"uBlock") != std::wstring::npos) return g.dataDir + L"\\Builtin\\ublock-origin-lite";
+    if (name == L"Exo Shield") return g.dataDir + L"\\Builtin\\exo-shield";
+    return L"";
+}
+
+// Exo Shield is part of the browser, not an extension you manage: it is never listed, always on, can't be
+// removed, and its own pages don't open (it has nothing to set).
+static std::wstring g_shieldId;
+
+static bool IsShieldPage(const std::wstring& url) {
+    return !g_shieldId.empty() && url.rfind(L"chrome-extension://" + g_shieldId + L"/", 0) == 0;
+}
+
+// Every extension you manage, each with its manifest (the page reads its name, icon and popup from it), as a
+// JSON array. Exo Shield is left out, and switched back on if anything turned it off.
+static std::wstring ExtensionsJson(HRESULT hr, ICoreWebView2BrowserExtensionList* list) {
+    UINT count = 0;
+    std::wstring items;
+    if (FAILED(hr) || !list || FAILED(list->get_Count(&count))) return L"[]";
+    for (UINT i = 0; i < count; i++) {
+        ComPtr<ICoreWebView2BrowserExtension> ext;
+        if (FAILED(list->GetValueAtIndex(i, &ext))) continue;
+        LPWSTR id = nullptr, name = nullptr;
+        BOOL enabled = FALSE;
+        ext->get_Id(&id);
+        ext->get_Name(&name);
+        ext->get_IsEnabled(&enabled);
+        std::wstring sid = Take(id), sname = Take(name);
+        if (sname.rfind(L"Microsoft", 0) == 0) continue;
+        if (sname == L"Exo Shield") {
+            g_shieldId = sid;
+            if (!enabled) ext->Enable(TRUE, Callback<ICoreWebView2BrowserExtensionEnableCompletedHandler>([](HRESULT) { return S_OK; }).Get());
+            continue;
+        }
+        std::wstring folder = ExtensionFolder(sid, sname);
+        if (!folder.empty() && !g_extFolders.count(sid)) g_extFolders[sid] = folder;
+        bool builtIn = folder.rfind(g.dataDir + L"\\Builtin", 0) == 0 || folder.rfind(g.exeDir + L"\\extensions", 0) == 0;
+        std::wstring manifest = folder.empty() ? L"" : Wide(ReadFileUtf8(folder + L"\\manifest.json"));
+        if (!items.empty()) items += L",";
+        items += L"{\"id\":" + Json(sid) + L",\"name\":" + Json(sname) + L",\"enabled\":" + Bool(enabled) +
+                 L",\"builtIn\":" + Bool(builtIn) + L",\"manifest\":" + Json(manifest) + L"}";
+    }
+    return L"[" + items + L"]";
+}
+
+static void SendExtensions() {
+    ComPtr<ICoreWebView2Profile7> p7 = TabProfile();
+    if (!p7) return;
+    p7->GetBrowserExtensions(Callback<ICoreWebView2ProfileGetBrowserExtensionsCompletedHandler>(
+        [](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
+            UiPost(L"{\"t\":\"extensions\",\"items\":" + ExtensionsJson(hr, list) + L"}");
+            return S_OK;
+        }).Get());
+}
+
+static void SendExtensionIcon(const std::wstring& id, const std::wstring& rel) {
+    auto it = g_extFolders.find(id);
+    if (it == g_extFolders.end() || rel.find(L"..") != std::wstring::npos) return;
+    std::wstring path = it->second + L"\\" + rel;
+    for (auto& c : path) if (c == L'/') c = L'\\';
+    UiPost(L"{\"t\":\"extIcon\",\"id\":" + Json(id) + L",\"icon\":" + Json(FileDataUrl(path)) + L"}");
+}
+
+static void Toast(const std::wstring& text) { UiPost(L"{\"t\":\"toast\",\"text\":" + Json(text) + L"}"); }
+
+static void AddExtensionFolder(const std::wstring& folder) {
+    ComPtr<ICoreWebView2Profile7> p7 = TabProfile();
+    if (!p7) { Toast(L"Open a page first, then add the extension."); return; }
+    p7->AddBrowserExtension(folder.c_str(), Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+        [folder](HRESULT hr, ICoreWebView2BrowserExtension* ext) -> HRESULT {
+            if (FAILED(hr) || !ext) {
+                Toast(L"That extension could not be added.");
+                return S_OK;
+            }
+            LPWSTR id = nullptr, name = nullptr;
+            ext->get_Id(&id);
+            ext->get_Name(&name);
+            g_extFolders[Take(id)] = folder;
+            SaveExtFolders();
+            Toast(L"Added " + Take(name));
+            SendExtensions();
+            return S_OK;
+        }).Get());
+}
+
+// An extension's ID is the first 16 bytes of SHA-256 of its public key, as the letters a to p.
+static std::wstring IdOfKey(const std::string& key) {
+    BYTE hash[32];
+    if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, (PUCHAR)key.data(), (ULONG)key.size(), hash, 32) != 0) return L"";
+    std::wstring id;
+    for (int i = 0; i < 16; i++) { id += (wchar_t)(L'a' + (hash[i] >> 4)); id += (wchar_t)(L'a' + (hash[i] & 15)); }
+    return id;
+}
+
+// The public key in a CRX3 header (a protobuf: proofs in fields 2 and 3, each with its key in field 1)
+// whose ID is the store ID; CRX2 carries it directly.
+static std::string StoreKey(const std::string& data, uint32_t version, size_t zipAt, const std::wstring& storeId) {
+    auto u32 = [&](size_t at) { return (uint32_t)(uint8_t)data[at] | (uint32_t)(uint8_t)data[at + 1] << 8 |
+                                      (uint32_t)(uint8_t)data[at + 2] << 16 | (uint32_t)(uint8_t)data[at + 3] << 24; };
+    if (version == 2) return data.substr(16, u32(8));
+    auto fields = [](const std::string& buf, const std::function<void(uint64_t, const std::string&)>& on) {
+        size_t i = 0;
+        auto varint = [&]() { uint64_t v = 0; int s = 0; uint8_t b; do { if (i >= buf.size()) return v; b = (uint8_t)buf[i++]; v |= (uint64_t)(b & 0x7f) << s; s += 7; } while (b & 0x80); return v; };
+        while (i < buf.size()) {
+            uint64_t tag = varint(), type = tag & 7;
+            if (type == 2) { uint64_t n = varint(); if (i + n > buf.size()) return; on(tag >> 3, buf.substr(i, (size_t)n)); i += (size_t)n; }
+            else if (type == 0) varint();
+            else if (type == 5) i += 4;
+            else if (type == 1) i += 8;
+            else return;
+        }
+    };
+    std::string key;
+    fields(data.substr(12, zipAt - 12), [&](uint64_t field, const std::string& proof) {
+        if (field != 2 && field != 3) return;
+        fields(proof, [&](uint64_t f, const std::string& value) { if (f == 1 && IdOfKey(value) == storeId) key = value; });
+    });
+    return key;
+}
+
+// A CRX is a header and then a zip: CRX3 is "Cr24", 3, a header length; CRX2 has a key and a
+// signature length instead.
+static bool UnpackCrx(const std::wstring& crx, const std::wstring& folder, std::wstring& error) {
+    std::string data = ReadFileUtf8(crx);
+    if (data.size() < 16 || data.compare(0, 4, "Cr24") != 0) { error = L"The download was not an extension."; return false; }
+    auto u32 = [&](size_t at) { return (uint32_t)(uint8_t)data[at] | (uint32_t)(uint8_t)data[at + 1] << 8 |
+                                      (uint32_t)(uint8_t)data[at + 2] << 16 | (uint32_t)(uint8_t)data[at + 3] << 24; };
+    uint32_t version = u32(4);
+    size_t zipAt = version == 3 ? 12 + (size_t)u32(8) : 16 + (size_t)u32(8) + (size_t)u32(12);
+    if (zipAt >= data.size()) { error = L"The extension file is damaged."; return false; }
+    std::wstring zip = crx + L".zip";
+    WriteFileUtf8(zip, data.substr(zipAt));
+    SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+    // Windows' own tar reads zip.
+    wchar_t system[MAX_PATH];
+    GetSystemDirectoryW(system, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(system) + L"\\tar.exe\" -xf \"" + zip + L"\" -C \"" + folder + L"\"";
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    bool ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    DWORD code = 1;
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, 60000);
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    DeleteFileW(zip.c_str());
+    DeleteFileW(crx.c_str());
+    if (code != 0 || GetFileAttributesW((folder + L"\\manifest.json").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = L"The extension could not be unpacked.";
+        return false;
+    }
+    // The store's key goes into the manifest, so the extension keeps its store ID (sites such as
+    // account.proton.me talk to their extension by that ID).
+    std::wstring storeId = folder.substr(folder.find_last_of(L'\\') + 1);
+    std::string key = StoreKey(data, version, zipAt, storeId);
+    std::string manifest = ReadFileUtf8(folder + L"\\manifest.json");
+    if (!key.empty() && manifest.find("\"key\"") == std::string::npos) {
+        size_t brace = manifest.find('{');
+        if (brace != std::string::npos) {
+            std::wstring b64 = Base64((const BYTE*)key.data(), (DWORD)key.size());
+            manifest.insert(brace + 1, "\n  \"key\": \"" + Utf8(b64) + "\",");
+            WriteFileUtf8(folder + L"\\manifest.json", manifest);
+        }
+    }
+    // Chromium refuses unpacked folders holding "_metadata" (the store's signature files).
+    std::wstring meta = folder + L"\\_metadata";
+    meta.push_back(L'\0');
+    SHFILEOPSTRUCTW op{nullptr, FO_DELETE, meta.c_str(), nullptr, FOF_NO_UI, FALSE, nullptr, nullptr};
+    SHFileOperationW(&op);
+    return true;
+}
+
+static bool IsStoreId(const std::wstring& id) {
+    return id.size() == 32 && std::all_of(id.begin(), id.end(), [](wchar_t c) { return c >= L'a' && c <= L'p'; });
+}
+
+static void InstallFromStore(const std::wstring& storeId) {
+    if (!IsStoreId(storeId)) { Toast(L"That is not a Chrome Web Store extension."); return; }
+    LPWSTR version = nullptr;
+    GetAvailableCoreWebView2BrowserVersionString(nullptr, &version);
+    std::wstring v = Take(version);
+    std::wstring major = v.substr(0, v.find(L'.'));
+    if (major.empty()) major = L"150";
+    std::wstring url = L"https://clients2.google.com/service/update2/crx?response=redirect&prodversion=" + major +
+                       L".0.0.0&acceptformat=crx2,crx3&x=id%3D" + storeId + L"%26installsource%3Dondemand%26uc";
+    std::wstring folder = ExtensionsDir() + L"\\" + storeId;
+    std::wstring crx = ExtensionsDir() + L"\\" + storeId + L".crx";
+    Toast(L"Adding extension");
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd, url, folder, crx] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::wstring* result;
+        if (FAILED(URLDownloadToFileW(nullptr, url.c_str(), crx.c_str(), 0, nullptr))) {
+            result = new std::wstring(L"!The extension could not be downloaded.");
+        } else {
+            std::wstring error;
+            result = UnpackCrx(crx, folder, error) ? new std::wstring(folder) : new std::wstring(L"!" + error);
+        }
+        CoUninitialize();
+        PostMessageW(hwnd, WM_APP_EXT_READY, 0, (LPARAM)result);
+    }).detach();
+}
+
+static void InstallStoreExtension(const std::wstring& id);
+
+static void PickExtensionFolder() {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dlg->SetTitle(L"Choose an unpacked extension folder");
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (SUCCEEDED(dlg->Show(g.hwnd)) && SUCCEEDED(dlg->GetResult(&item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+        AddExtensionFolder(Take(path));
+}
+
+static void WithExtension(const std::wstring& id, std::function<void(ICoreWebView2BrowserExtension*)> f) {
+    ComPtr<ICoreWebView2Profile7> p7 = TabProfile();
+    if (!p7) return;
+    p7->GetBrowserExtensions(Callback<ICoreWebView2ProfileGetBrowserExtensionsCompletedHandler>(
+        [id, f](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
+            UINT count = 0;
+            if (FAILED(hr) || !list || FAILED(list->get_Count(&count))) return S_OK;
+            for (UINT i = 0; i < count; i++) {
+                ComPtr<ICoreWebView2BrowserExtension> ext;
+                LPWSTR eid = nullptr;
+                if (SUCCEEDED(list->GetValueAtIndex(i, &ext)) && SUCCEEDED(ext->get_Id(&eid)) && Take(eid) == id) f(ext.Get());
+            }
+            return S_OK;
+        }).Get());
+}
+
+static LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_SIZE:
+        if (g.popupCtl && g.popup == hwnd) {
+            RECT r;
+            GetClientRect(hwnd, &r);
+            g.popupCtl->put_Bounds(r);
+        }
+        return 0;
+    case WM_CLOSE:
+        if (g.popup == hwnd) {
+            if (g.popupCtl) { g.popupCtl->Close(); g.popupCtl.Reset(); }
+            g.popup = nullptr;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT r;
+        GetClientRect(hwnd, &r);
+        HBRUSH b = CreateSolidBrush(g.page);
+        FillRect((HDC)wp, &r, b);
+        DeleteObject(b);
+        return 1;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// x, y: the popup's top-right corner, in the chrome page's CSS pixels.
+static void OpenExtensionPopup(const std::wstring& id, const std::wstring& page, int x, int y) {
+    if (g.popup) SendMessageW(g.popup, WM_CLOSE, 0, 0);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof wc};
+        wc.lpfnWndProc = PopupProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"ExoBrowserPopup";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    POINT anchor{Px(x), Px(y)};
+    ClientToScreen(g.hwnd, &anchor);
+    int w = Px(25), h = Px(25);
+    g.popup = CreateWindowExW(WS_EX_TOOLWINDOW, L"ExoBrowserPopup", L"", WS_POPUP | WS_BORDER, anchor.x - w, anchor.y, w, h,
+                              g.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    BOOL dark = g.theme != L"light";
+    DwmSetWindowAttribute(g.popup, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
+    DWM_WINDOW_CORNER_PREFERENCE round = DWMWCP_ROUND;
+    DwmSetWindowAttribute(g.popup, DWMWA_WINDOW_CORNER_PREFERENCE, &round, sizeof round);
+    ShowWindow(g.popup, SW_SHOW);
+    SetForegroundWindow(g.popup);
+    HWND popup = g.popup;
+    std::wstring url = L"chrome-extension://" + id + L"/" + page;
+    ComPtr<ICoreWebView2ControllerOptions> opts;
+    g.env->CreateCoreWebView2ControllerOptions(&opts);
+    opts->put_ProfileName(L"Default");
+    g.env->CreateCoreWebView2ControllerWithOptions(popup, opts.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+            [popup, url](HRESULT hr, ICoreWebView2Controller* ctl) -> HRESULT {
+                if (FAILED(hr) || !ctl) return S_OK;
+                if (g.popup != popup) { ctl->Close(); return S_OK; }
+                g.popupCtl = ctl;
+                RECT r;
+                GetClientRect(popup, &r);
+                ctl->put_Bounds(r);
+                ComPtr<ICoreWebView2> core;
+                ctl->get_CoreWebView2(&core);
+                EventRegistrationToken tok;
+                core->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+                    [popup](ICoreWebView2*, IUnknown*) -> HRESULT { PostMessageW(popup, WM_CLOSE, 0, 0); return S_OK; }).Get(), &tok);
+                // A popup sizes to its page, as in Chrome (25 to 800 by 600): it starts small, and the
+                // page reports what it needs whenever its layout changes.
+                core->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                    [popup](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+                        LPWSTR m = nullptr;
+                        int w = 0, h = 0;
+                        if (g.popup != popup || FAILED(a->TryGetWebMessageAsString(&m))) return S_OK;
+                        if (swscanf_s(Take(m).c_str(), L"exo-size:%d,%d", &w, &h) != 2 || w <= 0 || h <= 0) return S_OK;
+                        w = std::clamp(w, 25, 800);
+                        h = std::clamp(h, 25, 600);
+                        RECT r;
+                        GetWindowRect(popup, &r);
+                        SetWindowPos(popup, nullptr, r.right - Px(w) - 2, r.top, Px(w) + 2, Px(h) + 2, SWP_NOZORDER | SWP_NOACTIVATE);
+                        return S_OK;
+                    }).Get(), &tok);
+                core->AddScriptToExecuteOnDocumentCreated(
+                    L"addEventListener('DOMContentLoaded', () => { const d = document.documentElement; let last = '';"
+                    L" const report = () => { const s = Math.ceil(d.scrollWidth) + ',' + Math.ceil(d.scrollHeight);"
+                    L"  if (s !== last) { last = s; window.chrome.webview.postMessage('exo-size:' + s); } };"
+                    L" new ResizeObserver(report).observe(document.body || d); report(); });",
+                    nullptr);
+                // In Chrome a popup belongs to the window it opened from; here it is a window of its
+                // own, so "the active tab in this window" is answered with the tab on screen.
+                Tab* a = Active();
+                std::wstring target = a ? a->url : L"";
+                std::wstring patch =
+                    L"(() => { const target = " + Json(target) + L"; const tabs = globalThis.chrome && chrome.tabs;"
+                    L" if (!tabs || !tabs.query) return; const query = tabs.query.bind(tabs);"
+                    L" const all = () => new Promise((resolve) => query({}, resolve));"
+                    L" tabs.query = function (info, callback) {"
+                    L"  const mine = info && info.active && (info.currentWindow || info.lastFocusedWindow || info.windowId !== undefined);"
+                    L"  if (!mine) return query.apply(tabs, arguments);"
+                    L"  const p = all().then((list) => { const t = list.find((x) => x.url === target || x.pendingUrl === target); return t ? [t] : []; });"
+                    L"  if (typeof callback === 'function') { p.then(callback); return; } return p; }; })();";
+                core->AddScriptToExecuteOnDocumentCreated(patch.c_str(), nullptr);
+                core->Navigate(url.c_str());
+                ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                return S_OK;
+            }).Get());
+}
+
+// ---------------------------------------------------------------------------------------
+// Composition and layout
+
+// ---------------------------------------------------------------------------------------
+// Composition. The window is one Windows.UI.Composition tree:
+//   root ── content (the active tab; a layer that blurs under Search and sheets)
+//        └─ chrome ── glass (live backdrop glass under each capsule of the Bar and sidebar)
+//                  └─ the chrome page
+// Exo's Liquid Glass blurs and tones what is behind it; in one web page CSS does that, but a tab is
+// another process, so here the compositor samples the tab itself, with Exo's own numbers.
+
+namespace wuc = winrt::Windows::UI::Composition;
+namespace wge = winrt::Windows::Graphics::Effects;
+namespace wf = winrt::Windows::Foundation;
+
+// A Direct2D effect described for the compositor (what Win2D's effect classes do).
+struct Effect : winrt::implements<Effect, wge::IGraphicsEffect, wge::IGraphicsEffectSource, ABI::Windows::Graphics::Effects::IGraphicsEffectD2D1Interop> {
+    GUID clsid{};
+    winrt::hstring name;
+    std::vector<wge::IGraphicsEffectSource> sources;
+    std::vector<wf::IPropertyValue> props;
+    std::vector<std::pair<std::wstring, UINT>> named;
+    winrt::hstring Name() { return name; }
+    void Name(winrt::hstring const& n) { name = n; }
+    HRESULT __stdcall GetEffectId(GUID* id) noexcept override { *id = clsid; return S_OK; }
+    HRESULT __stdcall GetNamedPropertyMapping(LPCWSTR n, UINT* index, ABI::Windows::Graphics::Effects::GRAPHICS_EFFECT_PROPERTY_MAPPING* mapping) noexcept override {
+        for (auto& [k, i] : named)
+            if (_wcsicmp(k.c_str(), n) == 0) { *index = i; *mapping = ABI::Windows::Graphics::Effects::GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT; return S_OK; }
+        return E_INVALIDARG;
+    }
+    HRESULT __stdcall GetPropertyCount(UINT* c) noexcept override { *c = (UINT)props.size(); return S_OK; }
+    HRESULT __stdcall GetProperty(UINT i, ABI::Windows::Foundation::IPropertyValue** v) noexcept override {
+        if (i >= props.size()) return E_INVALIDARG;
+        winrt::copy_to_abi(props[i], *reinterpret_cast<void**>(v));
+        return S_OK;
+    }
+    HRESULT __stdcall GetSource(UINT i, ABI::Windows::Graphics::Effects::IGraphicsEffectSource** s) noexcept override {
+        if (i >= sources.size()) return E_INVALIDARG;
+        winrt::copy_to_abi(sources[i], *reinterpret_cast<void**>(s));
+        return S_OK;
+    }
+    HRESULT __stdcall GetSourceCount(UINT* c) noexcept override { *c = (UINT)sources.size(); return S_OK; }
+};
+
+static wge::IGraphicsEffectSource MakeEffect(const GUID& clsid, const wchar_t* name, wge::IGraphicsEffectSource source,
+                                             std::vector<wf::IPropertyValue> props, std::vector<std::pair<std::wstring, UINT>> named = {}) {
+    auto e = winrt::make_self<Effect>();
+    e->clsid = clsid;
+    e->name = name;
+    e->sources = {source};
+    e->props = std::move(props);
+    e->named = std::move(named);
+    return e.as<wge::IGraphicsEffectSource>();
+}
+static wf::IPropertyValue Single(float v) { return wf::PropertyValue::CreateSingle(v).as<wf::IPropertyValue>(); }
+static wf::IPropertyValue UInt(uint32_t v) { return wf::PropertyValue::CreateUInt32(v).as<wf::IPropertyValue>(); }
+
+static wge::IGraphicsEffectSource Blur(wge::IGraphicsEffectSource s, float amount, const wchar_t* name = L"Blur") {
+    return MakeEffect(CLSID_D2D1GaussianBlur, name, s, {Single(amount), UInt(D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED), UInt(D2D1_BORDER_MODE_HARD)},
+                      {{L"BlurAmount", 0}});
+}
+static wge::IGraphicsEffectSource Saturate(wge::IGraphicsEffectSource s, float amount) {
+    return MakeEffect(CLSID_D2D1Saturation, L"Saturation", s, {Single(amount)});
+}
+// CSS brightness(k) then contrast(c) as one color matrix: x*k*c + 0.5*(1-c) on each channel, alpha kept.
+static wge::IGraphicsEffectSource Tone(wge::IGraphicsEffectSource s, float k, float c = 1.f) {
+    float o = 0.5f * (1.f - c);
+    std::array<float, 20> m{k * c, 0, 0, 0, 0, k * c, 0, 0, 0, 0, k * c, 0, 0, 0, 0, 1, o, o, o, 0};
+    return MakeEffect(CLSID_D2D1ColorMatrix, L"Tone", s,
+                      {wf::PropertyValue::CreateSingleArray(m).as<wf::IPropertyValue>(), UInt(D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED),
+                       wf::PropertyValue::CreateBoolean(false).as<wf::IPropertyValue>()});
+}
+
+static float Scale() { return g.dpi / 96.f; }
+
+// Exo's glass, its exact filters in its order (Exo Launcher's styles/glass.css and tokens.css, in ui/src):
+//   small: blur(8px) then --glassy-tone: Void brightness(0.46) saturate(1.8); Dark brightness(0.46) contrast(0.9)
+//          saturate(1.8); Light brightness(1.06) saturate(1.6)
+//   large (liquid): blur(12px) saturate(1.8) then --glassy-overlay-tone: Void brightness(0.66), Dark 0.64, Light 1;
+//          a sheet (.exo-glass.is-panel) frosts deeper, blur(24px)
+// `dim` is a scrim the page lays over the content under this glass (Settings' room), which in Exo the glass sees.
+static float GlassBlur(wchar_t kind) { return kind == L'p' ? 24.f : kind == L'l' ? 12.f : 8.f; }
+
+static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const wuc::CompositionBrush& backdrop) {
+    static std::unordered_map<std::wstring, wuc::CompositionEffectFactory> factories;
+    const std::wstring& theme = g.theme;
+    float k = Scale();
+    std::wstring key = std::wstring(1, kind) + theme + std::to_wstring((int)(dim * 100)) + L"@" + std::to_wstring((int)(k * 100));
+    auto it = factories.find(key);
+    if (it == factories.end()) {
+        auto source = wuc::CompositionEffectSourceParameter(L"backdrop");
+        float keep = 1.f - dim;
+        wge::IGraphicsEffectSource effect{nullptr};
+        if (kind != L's')
+            effect = Tone(Saturate(Blur(source, GlassBlur(kind) * k), 1.8f), (theme == L"light" ? 1.f : theme == L"dark" ? 0.64f : 0.66f) * keep);
+        else if (theme == L"light") effect = Saturate(Tone(Blur(source, 8.f * k), 1.06f * keep), 1.6f);
+        else effect = Saturate(Tone(Blur(source, 8.f * k), 0.46f * keep, theme == L"dark" ? 0.9f : 1.f), 1.8f);
+        it = factories.emplace(key, g.compositor.CreateEffectFactory(effect.as<wge::IGraphicsEffect>())).first;
+    }
+    auto brush = it->second.CreateBrush();
+    brush.SetSourceParameter(L"backdrop", backdrop);
+    return brush;
+}
+
+// The page lists its glass: "kind,x,y,w,h,radius;..." in CSS pixels (kind s: small, l: large, p: a sheet).
+// A backdrop brush cannot see a tab (its pixels come from the browser's own process), so each
+// capsule's backdrop is a live surface of the tab layer itself, cut to the capsule plus a margin for
+// the blur to draw from, then blurred and toned.
+static std::wstring g_glassSpec;
+
+static void SetGlass(const std::wstring& spec) {
+    g_glassSpec = spec;
+    if (!g.glassTop) return;
+    g.glassTop.Children().RemoveAll();
+    g.glassSide.Children().RemoveAll();
+    if (Setting(L"material", L"glass") == L"solid") return;
+    float k = Scale();
+    for (auto& item : Split(spec, L';')) {
+        auto f = Split(item, L',');
+        if (f.size() < 6) continue;
+        float x = (float)_wtof(f[1].c_str()) * k, y = (float)_wtof(f[2].c_str()) * k;
+        float w = (float)_wtof(f[3].c_str()) * k, h = (float)_wtof(f[4].c_str()) * k, r = (float)_wtof(f[5].c_str()) * k;
+        if (w < 1 || h < 1) continue;
+        wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
+        float pad = GlassBlur(kind) * 3 * k;
+        auto surface = g.compositor.CreateVisualSurface();
+        surface.SourceVisual(g.content);
+        surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
+        surface.SourceSize({w + 2 * pad, h + 2 * pad});
+        auto backdrop = g.compositor.CreateSurfaceBrush(surface);
+        backdrop.Stretch(wuc::CompositionStretch::None);
+        backdrop.HorizontalAlignmentRatio(0);
+        backdrop.VerticalAlignmentRatio(0);
+        backdrop.Offset({-pad, -pad});
+        auto sprite = g.compositor.CreateSpriteVisual();
+        float dim = f.size() > 7 ? std::clamp((float)_wtof(f[7].c_str()), 0.f, 1.f) : 0.f;
+        sprite.Brush(GlassBrush(kind, dim, backdrop));
+        sprite.Offset({x, y, 0});
+        sprite.Size({w, h});
+        auto shape = g.compositor.CreateRoundedRectangleGeometry();
+        shape.Size({w, h});
+        shape.CornerRadius({std::min(r, h / 2), std::min(r, h / 2)});
+        sprite.Clip(g.compositor.CreateGeometricClip(shape));
+        // A seventh field says where it lives: d is the sidebar, anything else the Bar.
+        (f.size() > 6 && f[6] == L"d" ? g.glassSide : g.glassTop).Children().InsertAtTop(sprite);
+    }
+}
+
+static void Commit() {}
+
+static wuc::CompositionEasingFunction EaseOut() {
+    return g.compositor.CreateCubicBezierEasingFunction({0.23f, 1.f}, {0.32f, 1.f});
+}
+
+static void InitComposition() {
+    DispatcherQueueOptions options{sizeof options, DQTYPE_THREAD_CURRENT, DQTAT_COM_STA};
+    CreateDispatcherQueueController(options, reinterpret_cast<ABI::Windows::System::IDispatcherQueueController**>(winrt::put_abi(g.queue)));
+    g.compositor = wuc::Compositor();
+    auto interop = g.compositor.as<ABI::Windows::UI::Composition::Desktop::ICompositorDesktopInterop>();
+    winrt::check_hresult(interop->CreateDesktopWindowTarget(g.hwnd, TRUE,
+        reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(winrt::put_abi(g.target))));
+    g.root = g.compositor.CreateContainerVisual();
+    g.root.RelativeSizeAdjustment({1, 1});
+    g.content = g.compositor.CreateLayerVisual();
+    g.chromeLayer = g.compositor.CreateContainerVisual();
+    g.chromeLayer.RelativeSizeAdjustment({1, 1});
+    g.glassLayer = g.compositor.CreateContainerVisual();
+    g.glassLayer.RelativeSizeAdjustment({1, 1});
+    g.glassTop = g.compositor.CreateContainerVisual();
+    g.glassTop.RelativeSizeAdjustment({1, 1});
+    g.glassSide = g.compositor.CreateContainerVisual();
+    g.glassSide.RelativeSizeAdjustment({1, 1});
+    g.glassLayer.Children().InsertAtTop(g.glassSide);
+    g.glassLayer.Children().InsertAtTop(g.glassTop);
+    g.chromeVisual = g.compositor.CreateContainerVisual();
+    g.chromeVisual.RelativeSizeAdjustment({1, 1});
+    g.chromeLayer.Children().InsertAtTop(g.glassLayer);
+    g.chromeLayer.Children().InsertAtTop(g.chromeVisual);
+    g.root.Children().InsertAtTop(g.content);
+    g.root.Children().InsertAtTop(g.chromeLayer);
+    g.target.Root(g.root);
+    auto blur = Blur(wuc::CompositionEffectSourceParameter(L"source"), 0.f);
+    g.blur = g.compositor.CreateEffectFactory(blur.as<wge::IGraphicsEffect>(), {L"Blur.BlurAmount"}).CreateBrush();
+}
+
+static void SetBlur(bool on) {
+    if (!g.content) return;
+    if (on) {
+        g.content.Effect(g.blur);
+        auto a = g.compositor.CreateScalarKeyFrameAnimation();
+        a.InsertKeyFrame(0.f, 0.f);
+        a.InsertKeyFrame(1.f, 22.f * Scale(), EaseOut());
+        a.Duration(std::chrono::milliseconds(160));
+        g.blur.StartAnimation(L"Blur.BlurAmount", a);
+    } else {
+        g.content.Effect(nullptr);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Auto-hide. The window owns it: it sees every pointer move, so the Bar and sidebar come in
+// when the pointer touches the top (or left, with tabs down the side) edge, stay while it is
+// anywhere on them or a little below, and leave half a second after it goes; anything open in
+// the chrome (Search, a menu, Settings, find) holds them.
+
+// The Bar and the sidebar are separate: the top edge brings the Bar, the left edge the sidebar.
+// The chrome page slides and fades each in CSS; the window moves its glass the same way, at once.
+
+static const UINT kTimerHide = 3, kTimerHideSide = 4;
+static bool g_hideTopPending = false, g_hideSidePending = false;
+
+static void AnimateGlass(const wuc::ContainerVisual& layer, bool on, bool side, bool instant = false) {
+    float k = Scale();
+    wf::Numerics::float3 away = side ? wf::Numerics::float3{-14.f * k, 0, 0} : wf::Numerics::float3{0, -10.f * k, 0};
+    if (instant) {
+        layer.Opacity(on ? 1.f : 0.f);
+        layer.Offset(on ? wf::Numerics::float3{0, 0, 0} : away);
+        return;
+    }
+    auto opacity = g.compositor.CreateScalarKeyFrameAnimation();
+    opacity.InsertKeyFrame(1.f, on ? 1.f : 0.f, EaseOut());
+    opacity.Duration(std::chrono::milliseconds(on ? 180 : 140));
+    auto offset = g.compositor.CreateVector3KeyFrameAnimation();
+    offset.InsertKeyFrame(1.f, on ? wf::Numerics::float3{0, 0, 0} : away, EaseOut());
+    offset.Duration(std::chrono::milliseconds(on ? 260 : 140));
+    layer.StartAnimation(L"Opacity", opacity);
+    layer.StartAnimation(L"Offset", offset);
+}
+
+static void SendRevealed() {
+    UiPost(std::wstring(L"{\"t\":\"revealed\",\"top\":") + Bool(g.revealedTop) + L",\"side\":" + Bool(g.revealedSide) + L"}");
+}
+
+// The new tab page always shows the Bar and the side tabs, auto-hidden or not.
+static bool OnNewTab() {
+    Tab* a = Active();
+    return a && IsNewTab(a->url.empty() ? a->pendingNav : a->url);
+}
+
+static void Reveal(bool top, bool on, bool instant = false) {
+    if (!g.glassTop) return;
+    if (!g.autohide || g.fullscreen || OnNewTab()) on = true;
+    bool& state = top ? g.revealedTop : g.revealedSide;
+    bool changed = state != on;
+    state = on;
+    g.revealTop = g.autohide && g.revealedTop ? Px(g.chromeTopDip) : 0;
+    g.revealLeft = g.autohide && g.revealedSide ? Px(g.sidebarDip) : 0;
+    if (!changed && !instant) return;
+    AnimateGlass(top ? g.glassTop : g.glassSide, on, !top, instant);
+    SendRevealed();
+}
+
+static void SetRevealed(bool on) { Reveal(true, on); }
+
+static void Hold(bool top, bool keep) {
+    bool& pending = top ? g_hideTopPending : g_hideSidePending;
+    UINT id = top ? kTimerHide : kTimerHideSide;
+    if (keep) {
+        if (pending) { KillTimer(g.hwnd, id); pending = false; }
+    } else if (!pending) {
+        pending = true;
+        SetTimer(g.hwnd, id, 500, nullptr);
+    }
+}
+
+static void AutoHideTrack(POINT pt, bool outside) {
+    if (!g.autohide || g.fullscreen) return;
+    int top = Px(g.chromeTopDip), left = Px(g.sidebarDip), slack = Px(18);
+    if (!g.revealedTop) {
+        if (!outside && pt.y <= Px(2)) Reveal(true, true);
+    } else {
+        Hold(true, (!outside && pt.y < top + slack) || g.overlay || g.pinned);
+    }
+    if (!left) return;
+    if (!g.revealedSide) {
+        if (!outside && pt.x <= Px(2)) Reveal(false, true);
+    } else {
+        Hold(false, !outside && pt.x < left + slack);
+    }
+}
+
+
+
+// After the tab on screen changes or goes somewhere: on the new tab page everything shows; anywhere else what is
+// shown hides again unless the pointer is over it.
+static void FollowNewTab() {
+    if (!g.autohide || g.fullscreen || !g.glassTop) return;
+    if (OnNewTab()) { Reveal(true, true); Reveal(false, true); return; }
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g.hwnd, &pt);
+    if (g.revealedTop) Hold(true, pt.y < Px(g.chromeTopDip) + Px(18) || g.overlay || g.pinned);
+    if (g.revealedSide && g.sidebarDip) Hold(false, pt.x < Px(g.sidebarDip) + Px(18));
+}
+
+static void Layout() {
+    if (!g.hwnd) return;
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    RECT c = client;
+    if (!g.fullscreen && !g.autohide) {
+        c.top = Px(g.chromeTopDip);
+        c.left = Px(g.sidebarDip);
+    }
+    if (c.right < c.left) c.right = c.left;
+    if (c.bottom < c.top) c.bottom = c.top;
+    g.contentRect = c;
+    if (g.content) {
+        float w = (float)(c.right - c.left), h = (float)(c.bottom - c.top);
+        g.content.Offset({(float)c.left, (float)c.top, 0});
+        g.content.Size({w, h});
+        for (auto& t : g.tabs) if (t->visual) t->visual.Size({w, h});
+    }
+    if (Tab* a = Active(); a && a->ctl) a->ctl->put_Bounds(c);
+    if (g.uiCtl) g.uiCtl->put_Bounds(client);
+    SetGlass(g_glassSpec);
+}
+
+static ICoreWebView2CompositionController* CompFor(int target) {
+    if (target == kUi) return g.uiComp.Get();
+    if (Tab* t = FindTab(target)) return t->comp.Get();
+    return nullptr;
+}
+
+static ICoreWebView2Controller* CtlFor(int target) {
+    if (target == kUi) return g.uiCtl.Get();
+    if (Tab* t = FindTab(target)) return t->ctl.Get();
+    return nullptr;
+}
+
+static void FocusTarget(int target) {
+    if (ICoreWebView2Controller* c = CtlFor(target)) {
+        c->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        g.focus = target;
+    }
+}
+
+// A part of the chrome page over the content that takes the pointer while the page keeps the keyboard
+// (Exo Vault's menu beside a sign-in field), in window pixels.
+static RECT g_uiHot{};
+
+// What the pointer is over: the Bar and every overlay belong to the chrome page, the content
+// card to the active tab.
+static int HitTarget(POINT pt) {
+    if (g.overlay || PtInRect(&g_uiHot, pt)) return kUi;
+    if ((g.revealTop && pt.y < g.revealTop) || (g.revealLeft && pt.x < g.revealLeft)) return kUi;
+    if (PtInRect(&g.contentRect, pt)) {
+        Tab* a = Active();
+        return a && a->comp ? a->id : kUi;
+    }
+    return g.fullscreen ? 0 : kUi;
+}
+
+static void SendMouse(int target, COREWEBVIEW2_MOUSE_EVENT_KIND kind, WPARAM wp, POINT pt) {
+    ICoreWebView2CompositionController* comp = CompFor(target);
+    if (!comp) return;
+    UINT32 data = 0;
+    if (kind == COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL || kind == COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL)
+        data = (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp);
+    else if (kind == COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN || kind == COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP ||
+             kind == COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOUBLE_CLICK)
+        data = GET_XBUTTON_WPARAM(wp);
+    if (target != kUi) {
+        pt.x -= g.contentRect.left;
+        pt.y -= g.contentRect.top;
+    }
+    comp->SendMouseInput(kind, (COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS)GET_KEYSTATE_WPARAM(wp), data, pt);
+}
+
+static void SendLeave(int target) {
+    if (ICoreWebView2CompositionController* comp = CompFor(target))
+        comp->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, {0, 0});
+}
+
+// ---------------------------------------------------------------------------------------
+// Tabs
+
+static void ShowActive();
+static void CreateView(Tab* t);
+static void OpenOverlay(const wchar_t* mode, const std::wstring& text = L"");
+static void OnNewTabMessage(int id, const std::wstring& msg);
+static void OnVaultPage(Tab* t, const std::wstring& from, const std::wstring& raw);
+static bool HandleKey(UINT vk, bool repeat, bool fromUi);
+static void SetFullscreen(bool on);
+
+static void EnsureView(Tab* t, std::function<void(Tab*)> then) {
+    if (t->ctl) { if (then) then(t); return; }
+    if (then) t->whenReady.push_back(std::move(then));
+    if (!t->creating) CreateView(t);
+}
+
+static void RecordVisit(Tab* t) {
+    const std::wstring& u = t->url;
+    if ((u.rfind(L"http://", 0) != 0 && u.rfind(L"https://", 0) != 0) || IsNewTab(u)) return;
+    Visit& v = g.history[u];
+    v.url = u;
+    if (!t->title.empty()) v.title = t->title;
+    v.visits++;
+    v.last = NowSeconds();
+    g.historyDirty = true;
+    UiPost(L"{\"t\":\"visit\",\"item\":[" + Json(v.url) + L"," + Json(v.title) + L"," + std::to_wstring(v.visits) +
+           L"," + std::to_wstring(v.last) + L"]}");
+}
+
+static void RefreshFavicon(int id) {
+    Tab* t = FindTab(id);
+    if (!t || !t->core) return;
+    ComPtr<ICoreWebView2_15> c15;
+    if (FAILED(t->core.As(&c15))) return;
+    c15->GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+        Callback<ICoreWebView2GetFaviconCompletedHandler>([id](HRESULT hr, IStream* stream) -> HRESULT {
+            Tab* t = FindTab(id);
+            if (!t) return S_OK;
+            std::wstring fav;
+            if (SUCCEEDED(hr) && stream) {
+                std::vector<BYTE> bytes;
+                BYTE buf[8192];
+                ULONG read = 0;
+                while (SUCCEEDED(stream->Read(buf, sizeof buf, &read)) && read > 0) bytes.insert(bytes.end(), buf, buf + read);
+                if (!bytes.empty()) fav = L"data:image/png;base64," + Base64(bytes.data(), (DWORD)bytes.size());
+            }
+            if (fav != t->favicon) {
+                t->favicon = fav;
+                SendFavicon(t);
+            }
+            if (!fav.empty() && !IsNewTab(t->url) && g.favicons[SiteOf(t->url)] != fav) {
+                g.favicons[SiteOf(t->url)] = fav;
+                g.faviconsDirty = true;
+            }
+            return S_OK;
+        }).Get());
+}
+
+
+// The ID an extension folder loads under when its manifest carries the store's key; empty without one.
+static std::wstring ExpectedId(const std::wstring& folder) {
+    std::string m = ReadFileUtf8(folder + L"\\manifest.json");
+    size_t at = m.find("\"key\"");
+    if (at == std::string::npos) return L"";
+    size_t open = m.find('"', m.find(':', at) + 1), close = m.find('"', open + 1);
+    if (open == std::string::npos || close == std::string::npos) return L"";
+    std::string b64 = m.substr(open + 1, close - open - 1);
+    DWORD n = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr)) return L"";
+    std::string key(n, 0);
+    CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)key.data(), &n, nullptr, nullptr);
+    return IdOfKey(key);
+}
+
+static void ConfigureProfile(ICoreWebView2* core) {
+    if (g.profileReady) return;
+    g.profileReady = true;
+    ComPtr<ICoreWebView2_13> c13;
+    ComPtr<ICoreWebView2Profile> profile;
+    if (FAILED(core->QueryInterface(IID_PPV_ARGS(&c13))) || FAILED(c13->get_Profile(&profile))) return;
+    // Edge's own tracker lists on top of Exo Shield's, always at Balanced: trackers from sites you haven't
+    // visited are blocked and nothing breaks (Strict breaks some sign-ins); Shield's lists block the rest.
+    if (ComPtr<ICoreWebView2Profile3> p3; SUCCEEDED(profile.As(&p3)))
+        p3->put_PreferredTrackingPreventionLevel(COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_BALANCED);
+    profile->put_PreferredColorScheme(g.theme == L"light" ? COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT
+                                                           : COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
+    // Off: passwords belong to Exo Vault, and Edge's own would only compete with it.
+    if (ComPtr<ICoreWebView2Profile6> p6; SUCCEEDED(profile.As(&p6))) {
+        p6->put_IsPasswordAutosaveEnabled(FALSE);
+        p6->put_IsGeneralAutofillEnabled(FALSE);
+    }
+    ComPtr<ICoreWebView2Profile7> p7;
+    if (FAILED(profile.As(&p7))) return;
+    // Exo's built-in extensions, loaded from short copies in the data folder. One loaded from anywhere
+    // else (an older build's path), and the uBlock Origin Lite that Exo Shield replaced, are removed
+    // first; then whatever is missing is added, one at a time (indexing two large rulesets at once
+    // failed with "Internal error while parsing rules").
+    struct Shipped { const wchar_t* folder; const wchar_t* name; };
+    static const Shipped shipped[] = {{L"exo-shield", L"Exo Shield"}};
+    p7->GetBrowserExtensions(Callback<ICoreWebView2ProfileGetBrowserExtensionsCompletedHandler>(
+        [p7](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
+            auto stale = std::make_shared<std::vector<ComPtr<ICoreWebView2BrowserExtension>>>();
+            auto missing = std::make_shared<std::vector<std::wstring>>();
+            std::vector<std::wstring> present;
+            UINT count = 0;
+            if (SUCCEEDED(hr) && list && SUCCEEDED(list->get_Count(&count))) {
+                for (UINT i = 0; i < count; i++) {
+                    ComPtr<ICoreWebView2BrowserExtension> ext;
+                    LPWSTR id = nullptr, name = nullptr;
+                    if (FAILED(list->GetValueAtIndex(i, &ext)) || FAILED(ext->get_Id(&id)) || FAILED(ext->get_Name(&name))) continue;
+                    std::wstring sid = Take(id), sname = Take(name);
+                    // What Exo Shield replaced (uBlock Origin Lite, TTV LOL PRO) and the dark mode it dropped.
+                    if (sname == L"uBlock Origin Lite" || sname == L"TTV LOL PRO" || sname == L"Dark Reader") {
+                        stale->push_back(ext);
+                        continue;
+                    }
+                    for (auto& s : shipped) {
+                        if (sname.rfind(s.name, 0) != 0) continue;
+                        auto it = g_extFolders.find(sid);
+                        std::wstring expected = ExpectedId(BuiltinFolder(s.folder));
+                        if (it != g_extFolders.end() && it->second == g.dataDir + L"\\Builtin\\" + s.folder &&
+                            (expected.empty() || expected == sid))
+                            present.push_back(s.folder);
+                        else stale->push_back(ext);
+                    }
+                }
+            }
+            for (auto& s : shipped) {
+                std::wstring folder = BuiltinFolder(s.folder);
+                if (std::find(present.begin(), present.end(), s.folder) == present.end() &&
+                    GetFileAttributesW((folder + L"\\manifest.json").c_str()) != INVALID_FILE_ATTRIBUTES)
+                    missing->push_back(folder);
+            }
+            auto next = std::make_shared<std::function<void()>>();
+            *next = [p7, stale, missing, next] {
+                if (!stale->empty()) {
+                    auto ext = stale->back();
+                    stale->pop_back();
+                    ext->Remove(Callback<ICoreWebView2BrowserExtensionRemoveCompletedHandler>(
+                        [next](HRESULT) -> HRESULT { (*next)(); return S_OK; }).Get());
+                    return;
+                }
+                if (missing->empty()) {
+                    SendExtensions();
+                    return;
+                }
+                std::wstring folder = missing->front();
+                missing->erase(missing->begin());
+                p7->AddBrowserExtension(folder.c_str(), Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+                    [folder, next](HRESULT hr, ICoreWebView2BrowserExtension* ext) -> HRESULT {
+                        if (SUCCEEDED(hr) && ext) {
+                            LPWSTR id = nullptr;
+                            ext->get_Id(&id);
+                            g_extFolders[Take(id)] = folder;
+                            SaveExtFolders();
+                        } else {
+                            wchar_t code[16];
+                            swprintf_s(code, L"0x%08X", (unsigned)hr);
+                            Toast(folder.substr(folder.find_last_of(L'\\') + 1) + L" could not load (" + code + L")");
+                        }
+                        (*next)();
+                        return S_OK;
+                    }).Get());
+            };
+            (*next)();
+            return S_OK;
+        }).Get());
+}
+
+static void ApplyFind(Tab* t);
+static void ServeApi(ICoreWebView2WebResourceRequestedEventArgs* a);
+static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId);
+static void OnUiMessage(const std::wstring& msg);
+static void InstallStoreExtension(const std::wstring& id);
+extern const wchar_t kStoreScriptRef[];
+
+static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
+    int id = t->id;
+    t->comp = comp;
+    comp->QueryInterface(IID_PPV_ARGS(&t->ctl));
+    t->ctl->get_CoreWebView2(&t->core);
+    t->visual = g.compositor.CreateContainerVisual();
+    t->visual.Size({(float)(g.contentRect.right - g.contentRect.left), (float)(g.contentRect.bottom - g.contentRect.top)});
+    comp->put_RootVisualTarget(static_cast<::IUnknown*>(winrt::get_unknown(t->visual)));
+
+    if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
+        c2->put_DefaultBackgroundColor(t->pendingNav.empty() || IsNewTab(t->pendingNav) ? COREWEBVIEW2_COLOR{255, 0, 0, 0}
+                                                                                        : COREWEBVIEW2_COLOR{255, 255, 255, 255});
+    ComPtr<ICoreWebView2Settings> s;
+    t->core->get_Settings(&s);
+    s->put_IsStatusBarEnabled(TRUE);
+    s->put_IsZoomControlEnabled(TRUE);
+    if (ComPtr<ICoreWebView2Settings8> s8; SUCCEEDED(s.As(&s8))) s8->put_IsReputationCheckingRequired(FALSE);
+    if (ComPtr<ICoreWebView2_9> c9; SUCCEEDED(t->core.As(&c9))) {
+        c9->put_DefaultDownloadDialogCornerAlignment(COREWEBVIEW2_DEFAULT_DOWNLOAD_DIALOG_CORNER_ALIGNMENT_TOP_RIGHT);
+        c9->put_DefaultDownloadDialogMargin({Px(8), Px(8)});
+    }
+    ConfigureProfile(t->core.Get());
+
+    EventRegistrationToken tok;
+    // The new tab page: ui/ served at newtab.exo to top-level navigations only, its data at
+    // api.newtab.exo (readable by that origin alone), its requests accepted from that origin alone.
+    if (ComPtr<ICoreWebView2_3> c3; SUCCEEDED(t->core.As(&c3)))
+        c3->SetVirtualHostNameToFolderMapping(kNewTabHost, (g.exeDir + L"\\ui").c_str(),
+                                              COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY);
+    t->core->AddWebResourceRequestedFilter(L"https://api.newtab.exo/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    t->core->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+        [](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* a) -> HRESULT { ServeApi(a); return S_OK; }).Get(), &tok);
+    t->core->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+        [id](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+            LPWSTR source = nullptr, m = nullptr;
+            a->get_Source(&source);
+            std::wstring from = Take(source);
+            if (FAILED(a->TryGetWebMessageAsString(&m))) return S_OK;
+            std::wstring msg = Take(m);
+            if (IsNewTab(from)) OnNewTabMessage(id, msg);
+            else if (from.rfind(L"https://chromewebstore.google.com/", 0) == 0 && msg.rfind(L"exo-install\t", 0) == 0)
+                InstallStoreExtension(msg.substr(12));
+            else if (msg.rfind(L"exo-vault\t", 0) == 0 && (from.rfind(L"https://", 0) == 0 || from.rfind(L"http://", 0) == 0))
+                OnVaultPage(FindTab(id), from, msg.substr(10));
+            return S_OK;
+        }).Get(), &tok);
+    t->core->AddScriptToExecuteOnDocumentCreated(kStoreScriptRef, nullptr);
+    // Exo Vault's eyes on sign-in forms (ui/vault-page.js).
+    static const std::wstring vaultScript = Wide(ReadFileUtf8(g.exeDir + L"\\ui\\vault-page.js"));
+    if (!vaultScript.empty()) t->core->AddScriptToExecuteOnDocumentCreated(vaultScript.c_str(), nullptr);
+    if (ComPtr<ICoreWebView2_4> c4; SUCCEEDED(t->core.As(&c4)))
+        c4->add_DownloadStarting(Callback<ICoreWebView2DownloadStartingEventHandler>(
+            [id](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* a) -> HRESULT { TrackDownload(a, id); return S_OK; }).Get(), &tok);
+    t->core->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
+        [id](ICoreWebView2* core, ICoreWebView2SourceChangedEventArgs*) -> HRESULT {
+            if (Tab* t = FindTab(id)) {
+                LPWSTR u = nullptr;
+                core->get_Source(&u);
+                t->url = Take(u);
+                if (t->url.rfind(L"chrome-search://", 0) == 0 || t->url.rfind(L"edge://newtab", 0) == 0) {
+                    core->Navigate(kNewTab);
+                    return S_OK;
+                }
+                MarkSessionDirty();
+                QueueState();
+                if (id == g.activeId) FollowNewTab();
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_DocumentTitleChanged(Callback<ICoreWebView2DocumentTitleChangedEventHandler>(
+        [id](ICoreWebView2* core, IUnknown*) -> HRESULT {
+            if (Tab* t = FindTab(id)) {
+                LPWSTR title = nullptr;
+                core->get_DocumentTitle(&title);
+                t->title = Take(title);
+                if (auto it = g.history.find(t->url); it != g.history.end() && !t->title.empty()) {
+                    it->second.title = t->title;
+                    g.historyDirty = true;
+                }
+                MarkSessionDirty();
+                QueueState();
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+        [id](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* a) -> HRESULT {
+            if (Tab* t = FindTab(id)) {
+                LPWSTR u = nullptr;
+                a->get_Uri(&u);
+                std::wstring url = Take(u);
+                if (IsShieldPage(url)) {
+                    a->put_Cancel(TRUE);
+                    return S_OK;
+                }
+                t->loading = true;
+                bool black = IsNewTab(url);
+                if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
+                    c2->put_DefaultBackgroundColor(black ? COREWEBVIEW2_COLOR{255, 0, 0, 0} : COREWEBVIEW2_COLOR{255, 255, 255, 255});
+                QueueState();
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+        [id](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* a) -> HRESULT {
+            if (Tab* t = FindTab(id)) {
+                t->loading = false;
+                BOOL ok = FALSE;
+                a->get_IsSuccess(&ok);
+                if (ok) RecordVisit(t);
+                std::wstring site = SiteOf(t->url);
+                if (ok && t->url.rfind(L"https://", 0) == 0 && !IsNewTab(t->url) && !g_icons.count(site) && !g_iconTried.count(site + L"#page"))
+                    t->core->ExecuteScript(kIconScript, Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                        [site](HRESULT hr, LPCWSTR result) -> HRESULT {
+                            std::wstring href = SUCCEEDED(hr) && result ? result : L"";
+                            if (href.size() >= 2 && href.front() == L'"') href = href.substr(1, href.size() - 2);
+                            if (href.find(L'\\') != std::wstring::npos) href.clear();
+                            FetchIcon(site, href);
+                            return S_OK;
+                        }).Get());
+                QueueState();
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_HistoryChanged(Callback<ICoreWebView2HistoryChangedEventHandler>(
+        [](ICoreWebView2*, IUnknown*) -> HRESULT { QueueState(); return S_OK; }).Get(), &tok);
+    if (ComPtr<ICoreWebView2_15> c15; SUCCEEDED(t->core.As(&c15)))
+        c15->add_FaviconChanged(Callback<ICoreWebView2FaviconChangedEventHandler>(
+            [id](ICoreWebView2*, IUnknown*) -> HRESULT { RefreshFavicon(id); return S_OK; }).Get(), &tok);
+    if (ComPtr<ICoreWebView2_8> c8; SUCCEEDED(t->core.As(&c8)))
+        c8->add_IsDocumentPlayingAudioChanged(Callback<ICoreWebView2IsDocumentPlayingAudioChangedEventHandler>(
+            [id](ICoreWebView2* core, IUnknown*) -> HRESULT {
+                Tab* t = FindTab(id);
+                ComPtr<ICoreWebView2_8> c8;
+                if (t && SUCCEEDED(core->QueryInterface(IID_PPV_ARGS(&c8)))) {
+                    BOOL playing = FALSE;
+                    c8->get_IsDocumentPlayingAudio(&playing);
+                    t->audible = playing;
+                    QueueState();
+                }
+                return S_OK;
+            }).Get(), &tok);
+    t->core->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+        [id](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a) -> HRESULT {
+            ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args = a;
+            ComPtr<ICoreWebView2Deferral> deferral;
+            a->GetDeferral(&deferral);
+            LPWSTR u = nullptr;
+            a->get_Uri(&u);
+            // Ctrl+click and middle click open behind, as every browser does.
+            bool background = GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MBUTTON) < 0;
+            auto t = std::make_unique<Tab>();
+            t->id = g.nextId++;
+            t->url = Take(u);
+            t->lastActive = GetTickCount64();
+            Tab* raw = t.get();
+            g.tabs.insert(g.tabs.begin() + std::min(IndexOf(id) + 1, g.tabs.size()), std::move(t));
+            EnsureView(raw, [args, deferral, background](Tab* nt) {
+                args->put_NewWindow(nt->core.Get());
+                args->put_Handled(TRUE);
+                deferral->Complete();
+                if (!background) {
+                    g.activeId = nt->id;
+                    ShowActive();
+                }
+            });
+            QueueState();
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+        [id](ICoreWebView2*, IUnknown*) -> HRESULT {
+            PostMessageW(g.hwnd, WM_COMMAND, MAKEWPARAM(1, 0), (LPARAM)id);
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_ContainsFullScreenElementChanged(Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
+        [id](ICoreWebView2* core, IUnknown*) -> HRESULT {
+            BOOL full = FALSE;
+            core->get_ContainsFullScreenElement(&full);
+            if (id == g.activeId) {
+                g.elementFullscreen = full;
+                SetFullscreen(full);
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->core->add_ProcessFailed(Callback<ICoreWebView2ProcessFailedEventHandler>(
+        [id](ICoreWebView2* core, ICoreWebView2ProcessFailedEventArgs* a) -> HRESULT {
+            COREWEBVIEW2_PROCESS_FAILED_KIND kind;
+            a->get_ProcessFailedKind(&kind);
+            if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ||
+                kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE)
+                core->Reload();
+            return S_OK;
+        }).Get(), &tok);
+    comp->add_CursorChanged(Callback<ICoreWebView2CursorChangedEventHandler>(
+        [id](ICoreWebView2CompositionController* c, IUnknown*) -> HRESULT {
+            if (Tab* t = FindTab(id)) {
+                c->get_Cursor(&t->cursor);
+                if (g.hover == id) SetCursor(t->cursor);
+            }
+            return S_OK;
+        }).Get(), &tok);
+    t->ctl->add_AcceleratorKeyPressed(Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+        [](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* a) -> HRESULT {
+            COREWEBVIEW2_KEY_EVENT_KIND kind;
+            a->get_KeyEventKind(&kind);
+            if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                return S_OK;
+            UINT vk = 0;
+            a->get_VirtualKey(&vk);
+            COREWEBVIEW2_PHYSICAL_KEY_STATUS st;
+            a->get_PhysicalKeyStatus(&st);
+            if (HandleKey(vk, st.WasKeyDown, false)) a->put_Handled(TRUE);
+            return S_OK;
+        }).Get(), &tok);
+
+    t->ctl->put_Bounds(g.contentRect);
+    t->ctl->put_IsVisible(id == g.activeId && !g.minimized);
+    if (!t->pendingNav.empty()) {
+        t->core->Navigate(t->pendingNav.c_str());
+        t->pendingNav.clear();
+    }
+    auto ready = std::move(t->whenReady);
+    t->whenReady.clear();
+    for (auto& f : ready) f(t);
+    QueueState();
+}
+
+static void CreateView(Tab* t) {
+    if (!g.env) return;
+    t->creating = true;
+    ComPtr<ICoreWebView2ControllerOptions> opts;
+    g.env->CreateCoreWebView2ControllerOptions(&opts);
+    opts->put_ProfileName(L"Default");
+    int id = t->id;
+    g.env->CreateCoreWebView2CompositionControllerWithOptions(g.hwnd, opts.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
+            [id](HRESULT hr, ICoreWebView2CompositionController* comp) -> HRESULT {
+                Tab* t = FindTab(id);
+                if (!t) {
+                    ComPtr<ICoreWebView2Controller> c;
+                    if (comp && SUCCEEDED(comp->QueryInterface(IID_PPV_ARGS(&c)))) c->Close();
+                    return S_OK;
+                }
+                t->creating = false;
+                if (SUCCEEDED(hr) && comp) SetupTab(t, comp);
+                return S_OK;
+            }).Get());
+}
+
+static void ShowActive() {
+    Tab* a = Active();
+    for (auto& t : g.tabs)
+        if (t->ctl && t.get() != a) t->ctl->put_IsVisible(FALSE);
+    g.content.Children().RemoveAll();
+    if (a) {
+        a->lastActive = GetTickCount64();
+        if (a->ctl) {
+            if (a->suspended || a->lowMemory) {
+                if (ComPtr<ICoreWebView2_19> c19; SUCCEEDED(a->core.As(&c19)))
+                    c19->put_MemoryUsageTargetLevel(COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL);
+                a->suspended = a->lowMemory = false;
+            }
+            g.content.Children().InsertAtTop(a->visual);
+            a->ctl->put_Bounds(g.contentRect);
+            a->ctl->put_IsVisible(!g.minimized);
+            if (!g.overlay) FocusTarget(a->id);
+        } else {
+            EnsureView(a, [](Tab* t) { if (t->id == g.activeId) ShowActive(); });
+        }
+    }
+    Commit();
+    FollowNewTab();
+    MarkSessionDirty();
+    QueueState();
+}
+
+static void Activate(int id) {
+    if (!FindTab(id)) return;
+    if (Tab* prev = Active()) prev->lastActive = GetTickCount64();
+    g.activeId = id;
+    ShowActive();
+}
+
+static Tab* AddTab(const std::wstring& url, bool activate, size_t index) {
+    auto t = std::make_unique<Tab>();
+    t->id = g.nextId++;
+    t->url = url;
+    t->pendingNav = url;
+    t->lastActive = GetTickCount64();
+    Tab* raw = t.get();
+    g.tabs.insert(g.tabs.begin() + std::min(index, g.tabs.size()), std::move(t));
+    if (activate) Activate(raw->id);
+    else QueueState();
+    return raw;
+}
+
+static void NewTabPage() {
+    Tab* a = Active();
+    AddTab(kNewTab, true, a ? IndexOf(a->id) + 1 : g.tabs.size());
+}
+
+static void Discard(Tab* t) {
+    if (t->ctl) t->ctl->Close();
+    t->comp.Reset();
+    t->ctl.Reset();
+    t->core.Reset();
+    t->visual = nullptr;
+    t->find.Reset();
+    t->suspended = t->lowMemory = t->loading = t->audible = false;
+    t->cursor = nullptr;
+    // Opening it again loads where it was.
+    t->pendingNav = t->url;
+}
+
+static void CloseTab(int id) {
+    size_t i = IndexOf(id);
+    if (i >= g.tabs.size()) return;
+    Tab* t = g.tabs[i].get();
+    if (!t->url.empty()) {
+        g.closed.push_back({t->url, t->title, i});
+        if (g.closed.size() > 50) g.closed.erase(g.closed.begin());
+    }
+    if (g.capture == id) g.capture = 0;
+    if (g.hover == id) g.hover = 0;
+    if (g.focus == id) g.focus = 0;
+    Discard(t);
+    g.tabs.erase(g.tabs.begin() + i);
+    if (g.activeId == id) {
+        if (g.tabs.empty()) {
+            g.activeId = 0;
+            NewTabPage();
+        } else {
+            g.activeId = g.tabs[std::min(i, g.tabs.size() - 1)]->id;
+            ShowActive();
+        }
+    } else {
+        QueueState();
+    }
+    MarkSessionDirty();
+}
+
+static void ReopenClosed() {
+    if (g.closed.empty()) return;
+    ClosedTab c = g.closed.back();
+    g.closed.pop_back();
+    Tab* t = AddTab(c.url, true, c.index);
+    t->title = c.title;
+}
+
+static void CycleTab(int step) {
+    if (g.tabs.empty()) return;
+    size_t i = IndexOf(g.activeId);
+    if (i >= g.tabs.size()) i = 0;
+    i = (i + g.tabs.size() + step) % g.tabs.size();
+    Activate(g.tabs[i]->id);
+}
+
+// Background tabs step down: lower memory priority after a minute, frozen after five,
+// closed (title, icon and address kept) after thirty. Playing tabs are never touched.
+static void SleepTick() {
+    ULONGLONG now = GetTickCount64();
+    for (auto& up : g.tabs) {
+        Tab* t = up.get();
+        if (t->id == g.activeId || !t->ctl || t->audible || t->creating) continue;
+        ULONGLONG idle = now - t->lastActive;
+        if (idle > kDiscardAfterMs) {
+            Discard(t);
+            QueueState();
+            continue;
+        }
+        if (idle > kLowMemoryAfterMs && !t->lowMemory) {
+            if (ComPtr<ICoreWebView2_19> c19; SUCCEEDED(t->core.As(&c19)))
+                c19->put_MemoryUsageTargetLevel(COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW);
+            t->lowMemory = true;
+        }
+        if (idle > kSleepAfterMs && !t->suspended) {
+            int id = t->id;
+            if (ComPtr<ICoreWebView2_3> c3; SUCCEEDED(t->core.As(&c3)))
+                c3->TrySuspend(Callback<ICoreWebView2TrySuspendCompletedHandler>([id](HRESULT hr, BOOL ok) -> HRESULT {
+                    if (Tab* t = FindTab(id); t && SUCCEEDED(hr) && ok && id != g.activeId) {
+                        t->suspended = true;
+                        QueueState();
+                    }
+                    return S_OK;
+                }).Get());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Find in page (Ctrl+F): the page draws the field, the engine finds.
+
+static std::wstring g_findTerm;
+
+static void ApplyFind(Tab* t) {
+    if (!t || !t->core || !g.env) return;
+    if (!t->find) {
+        ComPtr<ICoreWebView2_28> c28;
+        if (FAILED(t->core.As(&c28)) || FAILED(c28->get_Find(&t->find))) return;
+        auto report = [](ICoreWebView2Find* f) {
+            INT32 count = 0, index = 0;
+            f->get_MatchCount(&count);
+            f->get_ActiveMatchIndex(&index);
+            UiPost(L"{\"t\":\"findResult\",\"count\":" + std::to_wstring(count) + L",\"index\":" +
+                   std::to_wstring(index) + L"}");
+        };
+        EventRegistrationToken tok;
+        t->find->add_MatchCountChanged(Callback<ICoreWebView2FindMatchCountChangedEventHandler>(
+            [report](ICoreWebView2Find* f, IUnknown*) -> HRESULT { report(f); return S_OK; }).Get(), &tok);
+        t->find->add_ActiveMatchIndexChanged(Callback<ICoreWebView2FindActiveMatchIndexChangedEventHandler>(
+            [report](ICoreWebView2Find* f, IUnknown*) -> HRESULT { report(f); return S_OK; }).Get(), &tok);
+    }
+    if (g_findTerm.empty()) {
+        t->find->Stop();
+        UiPost(L"{\"t\":\"findResult\",\"count\":0,\"index\":0}");
+        return;
+    }
+    ComPtr<ICoreWebView2Environment15> e15;
+    ComPtr<ICoreWebView2FindOptions> opts;
+    if (FAILED(g.env.As(&e15)) || FAILED(e15->CreateFindOptions(&opts))) return;
+    opts->put_FindTerm(g_findTerm.c_str());
+    opts->put_SuppressDefaultFindDialog(TRUE);
+    opts->put_ShouldHighlightAllMatches(TRUE);
+    t->find->Start(opts.Get(), Callback<ICoreWebView2FindStartCompletedHandler>([](HRESULT) -> HRESULT { return S_OK; }).Get());
+}
+
+// ---------------------------------------------------------------------------------------
+// Downloads: Exo's own list (Edge's download popup stays hidden), kept across restarts.
+
+struct Download {
+    int id = 0;
+    std::wstring url, path, state;  // state: progress, paused, done, failed, cancelled
+    long long received = 0, total = 0, started = 0;
+    ComPtr<ICoreWebView2DownloadOperation> op;
+    int closeTab = 0;  // the tab that only fetched this file: closed once the file is finished
+};
+static std::vector<Download> g_downloads;
+static int g_nextDownload = 1;
+static bool g_downloadsPending = false;
+static const UINT WM_APP_DOWNLOADS = WM_APP + 3;
+
+static Download* FindDownload(int id) {
+    for (auto& d : g_downloads) if (d.id == id) return &d;
+    return nullptr;
+}
+
+static void SaveDownloads() {
+    std::string out;
+    for (auto& d : g_downloads) {
+        if (d.state == L"progress" || d.state == L"paused") continue;
+        out += Utf8(Field(d.url) + L"\t" + Field(d.path) + L"\t" + d.state + L"\t" + std::to_wstring(d.total) + L"\t" +
+                    std::to_wstring(d.started)) + "\n";
+    }
+    WriteFileUtf8(g.dataDir + L"\\downloads.tsv", out);
+}
+
+static void LoadDownloads() {
+    for (auto& row : ReadTable(L"downloads.tsv")) {
+        if (row.size() < 5) continue;
+        Download d;
+        d.id = g_nextDownload++;
+        d.url = row[0];
+        d.path = row[1];
+        d.state = row[2];
+        d.total = d.received = _wtoi64(row[3].c_str());
+        d.started = _wtoi64(row[4].c_str());
+        g_downloads.push_back(d);
+    }
+}
+
+static std::wstring DownloadsJson() {
+    std::wstring items;
+    for (auto it = g_downloads.rbegin(); it != g_downloads.rend(); ++it) {
+        auto& d = *it;
+        std::wstring name = d.path.substr(d.path.find_last_of(L'\\') + 1);
+        bool exists = d.state != L"done" || GetFileAttributesW(d.path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!items.empty()) items += L",";
+        items += L"{\"id\":" + std::to_wstring(d.id) + L",\"url\":" + Json(d.url) + L",\"name\":" + Json(name) + L",\"state\":" +
+                 Json(exists ? d.state : L"gone") + L",\"received\":" + std::to_wstring(d.received) + L",\"total\":" +
+                 std::to_wstring(d.total) + L",\"started\":" + std::to_wstring(d.started) + L"}";
+    }
+    return L"[" + items + L"]";
+}
+
+static void RefreshNewTabs();
+
+// Progress arrives many times a second; the Bar and pages hear it at most every 250ms.
+static void QueueDownloads() {
+    if (g_downloadsPending) return;
+    g_downloadsPending = true;
+    SetTimer(g.hwnd, WM_APP_DOWNLOADS, 250, nullptr);
+}
+
+static void SendDownloads() {
+    g_downloadsPending = false;
+    UiPost(L"{\"t\":\"downloads\",\"items\":" + DownloadsJson() + L"}");
+    RefreshNewTabs();
+}
+
+static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) {
+    // A tab opened only to fetch a file (it never showed a page) steps aside at once and closes once the file is
+    // finished, as in Chrome. Closing it sooner left the file half done: WebView2 never finished a download whose
+    // page was gone (the whole file sat as a .tmp at 0%).
+    int closeTab = 0;
+    if (Tab* t = FindTab(tabId); t && t->core) {
+        BOOL back = FALSE;
+        t->core->get_CanGoBack(&back);
+        if (!back && (t->title.empty() || t->url == L"about:blank")) {
+            closeTab = tabId;
+            size_t i = IndexOf(tabId);
+            if (g.activeId == tabId && g.tabs.size() > 1) Activate(g.tabs[i > 0 ? i - 1 : i + 1]->id);
+        }
+    }
+    ComPtr<ICoreWebView2DownloadOperation> op;
+    if (FAILED(a->get_DownloadOperation(&op))) return;
+    a->put_Handled(TRUE);  // no Edge popup: the Bar shows it
+    Download d;
+    d.id = g_nextDownload++;
+    d.op = op;
+    d.closeTab = closeTab;
+    d.state = L"progress";
+    d.started = NowSeconds();
+    LPWSTR uri = nullptr, path = nullptr;
+    op->get_Uri(&uri);
+    a->get_ResultFilePath(&path);
+    d.url = Take(uri);
+    d.path = Take(path);
+    INT64 total = 0;
+    op->get_TotalBytesToReceive(&total);
+    d.total = total;
+    int id = d.id;
+    g_downloads.push_back(d);
+    if (g_downloads.size() > 500) g_downloads.erase(g_downloads.begin());
+    EventRegistrationToken tok;
+    op->add_BytesReceivedChanged(Callback<ICoreWebView2BytesReceivedChangedEventHandler>(
+        [id](ICoreWebView2DownloadOperation* op, IUnknown*) -> HRESULT {
+            if (Download* d = FindDownload(id)) {
+                INT64 got = 0, total = 0;
+                op->get_BytesReceived(&got);
+                op->get_TotalBytesToReceive(&total);
+                d->received = got;
+                d->total = total;
+                QueueDownloads();
+            }
+            return S_OK;
+        }).Get(), &tok);
+    op->add_StateChanged(Callback<ICoreWebView2StateChangedEventHandler>(
+        [id](ICoreWebView2DownloadOperation* op, IUnknown*) -> HRESULT {
+            Download* d = FindDownload(id);
+            if (!d) return S_OK;
+            COREWEBVIEW2_DOWNLOAD_STATE state;
+            op->get_State(&state);
+            LPWSTR path = nullptr;
+            if (SUCCEEDED(op->get_ResultFilePath(&path))) d->path = Take(path);
+            if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
+                d->state = L"done";
+                d->received = d->total = std::max(d->received, d->total);
+            } else if (state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED) {
+                COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON reason;
+                op->get_InterruptReason(&reason);
+                d->state = reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED ? L"cancelled" : L"failed";
+                wchar_t line[96];
+                swprintf_s(line, L"download %d interrupted: reason %d\n", id, (int)reason);
+                OutputDebugStringW(line);
+                std::string log = Utf8(line);
+                HANDLE f = CreateFileW((g.dataDir + L"\\exo.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+                if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, log.data(), (DWORD)log.size(), &w, nullptr); CloseHandle(f); }
+            }
+            if (d->state != L"progress" && d->state != L"paused") {
+                d->op.Reset();
+                if (d->closeTab) PostMessageW(g.hwnd, WM_COMMAND, MAKEWPARAM(1, 0), (LPARAM)d->closeTab);
+                d->closeTab = 0;
+                SaveDownloads();
+            }
+            SendDownloads();
+            return S_OK;
+        }).Get(), &tok);
+    SendDownloads();
+}
+
+static void DownloadAction(const std::wstring& verb, int id) {
+    Download* d = FindDownload(id);
+    if (verb == L"dlClear") {
+        std::erase_if(g_downloads, [](auto& x) { return x.state != L"progress" && x.state != L"paused"; });
+    } else if (!d) {
+        return;
+    } else if (verb == L"dlOpen") {
+        ShellExecuteW(g.hwnd, L"open", d->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    } else if (verb == L"dlShow") {
+        if (PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(d->path.c_str())) {
+            SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+            ILFree(pidl);
+        }
+    } else if (verb == L"dlCancel" && d->op) {
+        d->op->Cancel();
+    } else if (verb == L"dlPause" && d->op) {
+        if (d->state == L"paused") { d->op->Resume(); d->state = L"progress"; }
+        else { d->op->Pause(); d->state = L"paused"; }
+    } else if (verb == L"dlRemove") {
+        if (d->op) d->op->Cancel();
+        std::erase_if(g_downloads, [id](auto& x) { return x.id == id; });
+    }
+    SaveDownloads();
+    SendDownloads();
+}
+
+// ---------------------------------------------------------------------------------------
+// The Settings page, the new tab page and every manager are files in ui/ served at newtab.exo;
+// their data is JSON at api.newtab.exo, readable by that origin alone (CORS).
+
+static const wchar_t kSettingsPage[] = L"https://newtab.exo/settings.html";
+
+// Settings is one floating sheet in the chrome page, with every section in it.
+static void OpenSettings(const std::wstring& section) {
+    UiPost(L"{\"t\":\"settings.open\",\"section\":" + Json(section) + L"}");
+}
+
+// The installer registers Exo Browser with Windows as a browser (Software\RegisteredApplications); Windows says
+// which browser opens web links in the https UserChoice.
+static bool IsRegistered() {
+    DWORD size = 0;
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\RegisteredApplications", L"Exo Browser", RRF_RT_REG_SZ, nullptr, nullptr, &size) == ERROR_SUCCESS;
+}
+
+static bool IsDefaultBrowser() {
+    wchar_t progId[128] = {};
+    DWORD size = sizeof progId;
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice", L"ProgId",
+                        RRF_RT_REG_SZ, nullptr, progId, &size) == ERROR_SUCCESS && wcscmp(progId, L"ExoBrowserURL") == 0;
+}
+
+// What Windows hands the browser to open: a web address as it is, a file (an .html Windows opens with it) as a file URL.
+static std::wstring OpenArgument(const std::wstring& arg) {
+    if (arg.size() > 2 && (arg[1] == L':' || arg.rfind(L"\\\\", 0) == 0) && GetFileAttributesW(arg.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        wchar_t url[2048];
+        DWORD n = ARRAYSIZE(url);
+        if (SUCCEEDED(UrlCreateFromPathW(arg.c_str(), url, &n, 0))) return url;
+    }
+    return arg;
+}
+
+static std::wstring StateJson() {
+    std::wstring values;
+    for (auto& [k, v] : g.settings) {
+        if (!values.empty()) values += L",";
+        values += Json(k) + L":" + Json(v);
+    }
+    LPWSTR engine = nullptr;
+    GetAvailableCoreWebView2BrowserVersionString(nullptr, &engine);
+    // What Exo Shield is made of (its build writes exo-shield.json: versions, list sizes, build date).
+    std::string shield = ReadFileUtf8(g.exeDir + L"\\extensions\\exo-shield\\exo-shield.json");
+    return L"{\"settings\":{" + values + L"},\"theme\":" + Json(g.theme) + L",\"sources\":" + SourcesJson() + L",\"engine\":" +
+           Json(Take(engine)) + L",\"history\":" + std::to_wstring(g.history.size()) + L",\"bookmarks\":" +
+           std::to_wstring(g.bookmarks.size()) + L",\"shield\":" + (shield.empty() ? L"null" : Wide(shield)) +
+           L",\"version\":" + Json(EXO_VERSION_W) + L",\"registered\":" + Bool(IsRegistered()) + L",\"isDefault\":" + Bool(IsDefaultBrowser()) + L"}";
+}
+
+static std::wstring HistoryJson() {
+    std::vector<const Visit*> all;
+    for (auto& [_, v] : g.history) all.push_back(&v);
+    std::sort(all.begin(), all.end(), [](auto a, auto b) { return a->last > b->last; });
+    if (all.size() > 5000) all.resize(5000);
+    std::wstring items, favs;
+    std::unordered_map<std::wstring, bool> seen;
+    for (auto v : all) {
+        if (!items.empty()) items += L",";
+        items += L"[" + Json(v->url) + L"," + Json(v->title) + L"," + std::to_wstring(v->visits) + L"," + std::to_wstring(v->last) + L"]";
+        std::wstring site = SiteOf(v->url);
+        if (seen[site]) continue;
+        seen[site] = true;
+        if (auto it = g.favicons.find(site); it != g.favicons.end()) {
+            if (!favs.empty()) favs += L",";
+            favs += Json(site) + L":" + Json(it->second);
+        }
+    }
+    return L"{\"items\":[" + items + L"],\"favicons\":{" + favs + L"}}";
+}
+
+
+// The data behind the new tab page and Settings, by path. Pages in tabs fetch it from
+// https://api.newtab.exo/<path>; the chrome page (Settings' sheet) asks with "api\t<id>\t<path>".
+using ApiReply = std::function<void(const std::string& body, const wchar_t* type, int status)>;
+
+static void ApiData(const std::wstring& path, ApiReply reply) {
+    if (path == L"/ntp.json") reply(Utf8(NewTabJson()), L"application/json", 200);
+    else if (path == L"/state.json") reply(Utf8(StateJson()), L"application/json", 200);
+    else if (path == L"/bookmarks.json") reply(Utf8(BookmarksJson()), L"application/json", 200);
+    else if (path == L"/history.json") reply(Utf8(HistoryJson()), L"application/json", 200);
+    else if (path == L"/downloads.json") reply(Utf8(DownloadsJson()), L"application/json", 200);
+    // /icon/<site>: the icon this browser already has for a site (Exo Vault's rows), never fetched for it.
+    else if (path.rfind(L"/icon/", 0) == 0) reply(Utf8(Json(FavFor(L"https://" + path.substr(6) + L"/"))), L"application/json", 200);
+    else if (path.rfind(L"/exticon/", 0) == 0) {
+        // /exticon/<extension id>/<path inside it>: as a data: URL in JSON, which both kinds of page can use.
+        std::wstring rest = path.substr(9);
+        std::wstring id = rest.substr(0, rest.find(L'/'));
+        std::wstring rel = rest.substr(std::min(rest.size(), id.size() + 1));
+        auto it = g_extFolders.find(id);
+        if (it == g_extFolders.end() || rel.find(L"..") != std::wstring::npos) { reply("null", L"application/json", 200); return; }
+        for (auto& c : rel) if (c == L'/') c = L'\\';
+        std::wstring data = FileDataUrl(it->second + L"\\" + rel);
+        reply(Utf8(Json(data)), L"application/json", 200);
+    } else if (path == L"/extensions.json") {
+        ComPtr<ICoreWebView2Profile7> p7 = TabProfile();
+        if (!p7) { reply("[]", L"application/json", 200); return; }
+        p7->GetBrowserExtensions(Callback<ICoreWebView2ProfileGetBrowserExtensionsCompletedHandler>(
+            [reply](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
+                reply(Utf8(ExtensionsJson(hr, list)), L"application/json", 200);
+                return S_OK;
+            }).Get());
+    } else {
+        reply("", L"text/plain", 404);
+    }
+}
+
+static void Respond(ICoreWebView2WebResourceRequestedEventArgs* a, const std::string& body, const wchar_t* type, int status) {
+    ComPtr<IStream> stream;
+    stream.Attach(SHCreateMemStream((const BYTE*)body.data(), (UINT)body.size()));
+    ComPtr<ICoreWebView2WebResourceResponse> response;
+    std::wstring headers = std::wstring(L"Content-Type: ") + type +
+                           L"\r\nAccess-Control-Allow-Origin: https://newtab.exo\r\nCache-Control: no-store";
+    g.env->CreateWebResourceResponse(stream.Get(), status, status == 200 ? L"OK" : L"Not Found", headers.c_str(), &response);
+    a->put_Response(response.Get());
+}
+
+static void ServeApi(ICoreWebView2WebResourceRequestedEventArgs* a) {
+    ComPtr<ICoreWebView2WebResourceRequest> request;
+    LPWSTR uri = nullptr;
+    a->get_Request(&request);
+    request->get_Uri(&uri);
+    std::wstring path = Take(uri).substr(wcslen(L"https://api.newtab.exo"));
+    path = path.substr(0, path.find(L'?'));
+    ComPtr<ICoreWebView2Deferral> deferral;
+    a->GetDeferral(&deferral);
+    ComPtr<ICoreWebView2WebResourceRequestedEventArgs> args = a;
+    ApiData(path, [args, deferral](const std::string& body, const wchar_t* type, int status) {
+        Respond(args.Get(), body, type, status);
+        deferral->Complete();
+    });
+}
+
+// ---------------------------------------------------------------------------------------
+// The Chrome Web Store's own "Add to Chrome" button installs into Exo instead.
+
+extern const wchar_t kStoreScriptRef[] =
+    L"(() => { if (location.hostname !== 'chromewebstore.google.com') return;"
+    L" const idOf = () => (location.pathname.match(/\\/detail\\/(?:[^/]+\\/)?([a-p]{32})/) || [])[1];"
+    L" const words = /^(add to chrome|switch to chrome|add to edge|add extension|get|install)$/i;"
+    L" const fix = () => { const id = idOf(); if (!id) return;"
+    L"  for (const b of document.querySelectorAll('button, a[role=button], a[href*=\"google.com/chrome\"]')) {"
+    L"   const text = (b.innerText || '').trim(); if (b.dataset.exo === id || !(words.test(text) || b.dataset.exo)) continue;"
+    L"   b.dataset.exo = id; b.removeAttribute('disabled'); b.setAttribute('aria-disabled', 'false'); b.style.pointerEvents = 'auto';"
+    L"   const label = [...b.querySelectorAll('span, div')].reverse().find((s) => words.test((s.innerText || '').trim())) || b;"
+    L"   label.textContent = 'Add to Exo';"
+    L"   if (!b.dataset.exoBound) { b.dataset.exoBound = '1'; b.addEventListener('click', (e) => { e.preventDefault(); e.stopImmediatePropagation();"
+    L"    window.chrome.webview.postMessage('exo-install\\t' + idOf()); }, true); } } };"
+    L" new MutationObserver(fix).observe(document, { subtree: true, childList: true, characterData: true }); })();";
+
+// Store extensions, installed one after another (each is a download).
+static std::vector<std::wstring> g_installQueue;
+static bool g_installing = false;
+
+static void InstallNext() {
+    if (g_installing || g_installQueue.empty()) return;
+    g_installing = true;
+    std::wstring id = g_installQueue.front();
+    g_installQueue.erase(g_installQueue.begin());
+    InstallFromStore(id);
+}
+
+static void InstallStoreExtension(const std::wstring& id) {
+    if (!IsStoreId(id)) { Toast(L"That is not a Chrome Web Store extension."); return; }
+    g_installQueue.push_back(id);
+    InstallNext();
+}
+
+// ---------------------------------------------------------------------------------------
+// Window states
+
+static void OpenOverlay(const wchar_t* mode, const std::wstring& text) {
+    if (!g.uiReady) return;
+    bool was = g.overlay;
+    g.overlay = true;
+    SetRevealed(true);
+    Tab* a = Active();
+    UiPost(std::wstring(L"{\"t\":\"overlay\",\"mode\":\"") + mode + L"\",\"url\":" + Json(a ? a->url : L"") +
+           L",\"text\":" + Json(text) + L"}");
+    FocusTarget(kUi);
+}
+
+// tell: the host let go on its own (a page opened, a link from another app), so the chrome page closes what it
+// has open (Settings, a menu, search) instead of leaving it on screen with no mouse.
+static void CloseOverlay(bool tell = true) {
+    if (!g.overlay) return;
+    g.overlay = false;
+    if (tell) UiPost(L"{\"t\":\"overlay.closed\"}");
+    SetBlur(false);
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g.hwnd, &pt);
+    AutoHideTrack(pt, false);
+    if (Tab* a = Active(); a && a->ctl) FocusTarget(a->id);
+}
+
+static void SetFullscreen(bool on) {
+    if (on == g.fullscreen) return;
+    g.fullscreen = on;
+    if (on) {
+        GetWindowPlacement(g.hwnd, &g.placement);
+        g.savedStyle = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongPtrW(g.hwnd, GWL_STYLE, (g.savedStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        g.chromeLayer.IsVisible(false);
+        SetWindowPos(g.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongPtrW(g.hwnd, GWL_STYLE, g.savedStyle);
+        g.chromeLayer.IsVisible(true);
+        SetWindowPlacement(g.hwnd, &g.placement);
+        SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    Layout();
+    QueueState();
+}
+
+static void Navigate(const std::wstring& url, bool newTab) {
+    Tab* a = Active();
+    if (newTab || !a) {
+        AddTab(url, true, a ? IndexOf(a->id) + 1 : g.tabs.size());
+        return;
+    }
+    a->url = url;
+    if (a->core) a->core->Navigate(url.c_str());
+    else { a->pendingNav = url; EnsureView(a, nullptr); }
+    QueueState();
+}
+
+static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
+    Tab* a = Active();
+    if (ctrl && !alt) {
+        if (vk == VK_TAB || vk == VK_NEXT || vk == VK_PRIOR) {
+            CycleTab((vk == VK_PRIOR || (vk == VK_TAB && shift)) ? -1 : 1);
+            return true;
+        }
+        if (repeat) return vk == 'T' || vk == 'L' || vk == 'K' || vk == 'W' || vk == 'D' || vk == 'N' || vk == 'H' || vk == 'J';
+        switch (vk) {
+        case 'T': if (shift) ReopenClosed(); else NewTabPage(); return true;
+        case 'N': if (!shift) { NewTabPage(); return true; } return false;
+        case 'D': if (!shift && a) ToggleBookmark(a->url, a->title); return !shift;
+        case 'E': if (shift) { UiPost(L"{\"t\":\"extensions.open\"}"); return true; } return false;
+        case 'H': if (!shift) { OpenSettings(L"history"); return true; } return false;
+        case 'J': if (!shift) { OpenSettings(L"downloads"); return true; } return false;
+        case 'L': OpenOverlay(L"edit"); return true;
+        case 'K': if (g.overlay && g.tabs.size()) UiPost(L"{\"t\":\"close\"}"); else OpenOverlay(L"palette"); return true;
+        case 'W': case VK_F4: if (a) CloseTab(a->id); return true;
+        case 'F': if (!shift && a) { UiPost(L"{\"t\":\"find\"}"); FocusTarget(kUi); } return !shift;
+        case 'R': if (fromUi && a && a->core) a->core->Reload(); return fromUi;
+        }
+        if (vk >= '1' && vk <= '9' && !g.tabs.empty()) {
+            size_t i = vk == '9' ? g.tabs.size() - 1 : std::min<size_t>(vk - '1', g.tabs.size() - 1);
+            Activate(g.tabs[i]->id);
+            return true;
+        }
+        return false;
+    }
+    if (repeat) return false;
+    if (alt && !ctrl) {
+        if (vk == 'D') { OpenOverlay(L"edit"); return true; }
+        if (fromUi && a && a->core && (vk == VK_LEFT || vk == VK_RIGHT)) {
+            if (vk == VK_LEFT) a->core->GoBack(); else a->core->GoForward();
+            return true;
+        }
+        return false;
+    }
+    switch (vk) {
+    case VK_F6: OpenOverlay(L"edit"); return true;
+    case VK_F11: if (!g.elementFullscreen) SetFullscreen(!g.fullscreen); return true;
+    case VK_F5: if (fromUi && a && a->core) { a->core->Reload(); return true; } return false;
+    case VK_F3: if (a && a->find) { if (shift) a->find->FindPrevious(); else a->find->FindNext(); } return true;
+    case VK_ESCAPE: if (g.fullscreen && !g.elementFullscreen && !fromUi) { SetFullscreen(false); return true; } return false;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------------------
+// Messages from a new tab page (checked to come from its origin).
+
+static void OnNewTabMessage(int id, const std::wstring& msg) {
+    auto p = Split(msg, L'\t');
+    auto arg = [&](size_t i) { return i < p.size() ? p[i] : std::wstring(); };
+    Tab* t = FindTab(id);
+    if (!t) return;
+    const std::wstring& v = p[0];
+    if (v == L"open") {
+        std::wstring url = arg(1);
+        if (url.rfind(L"http://", 0) != 0 && url.rfind(L"https://", 0) != 0) return;
+        if (arg(2) == L"new") AddTab(url, false, IndexOf(id) + 1);
+        else if (t->core) t->core->Navigate(url.c_str());
+    } else if (v == L"palette") {
+        if (id == g.activeId) OpenOverlay(L"ntp", arg(1));
+    } else if (v == L"unbookmark") {
+        ToggleBookmark(arg(1), L"");
+    } else if (v == L"forget") {
+        std::wstring site = SiteOf(arg(1));
+        for (auto it = g.history.begin(); it != g.history.end();)
+            it = SiteOf(it->first) == site ? g.history.erase(it) : std::next(it);
+        SaveHistory();
+        SendHistory();
+        RefreshNewTabs();
+    } else if (v == L"settings") {
+        OpenSettings(arg(1));
+    } else if (v.rfind(L"vault", 0) != 0) {  // the vault answers the chrome page alone
+        OnUiMessage(msg);
+        RefreshNewTabs();
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Exo Vault. The file and its keys are vault.cpp's; here are its messages, auto-lock, the clipboard,
+// passwords from other browsers and sign-in forms. The vault window (the chrome page) holds the unlocked
+// items and picks what to fill; a page only ever receives the login you chose for it, and only while it
+// is still the site you chose it for. Secrets and free text travel base64-encoded (they may hold tabs).
+
+static const UINT WM_APP_VAULT = WM_APP + 5;  // lParam: new VaultJob*
+static const UINT kTimerVault = 9, kTimerClipboard = 10;
+struct VaultJob { std::wstring op; vault::Opened opened; vault::Result result = vault::Ok; };
+static ULONGLONG g_vaultActive = 0;
+static DWORD g_clipboardSeq = 0;
+static bool g_helloReady = false;
+static std::wstring g_vaultImportFile;  // an .exovault picked to import, waiting for its password
+
+static std::wstring VaultFile() { return g.dataDir + L"\\vault.exovault"; }
+
+static std::string FromB64(const std::wstring& b64) {
+    DWORD n = 0;
+    if (b64.empty() || !CryptStringToBinaryW(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr)) return "";
+    std::string out(n, 0);
+    CryptStringToBinaryW(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)out.data(), &n, nullptr, nullptr);
+    out.resize(n);
+    return out;
+}
+
+static const wchar_t* VaultReason(vault::Result r) {
+    switch (r) {
+    case vault::WrongPassword: return L"wrong";
+    case vault::NoFile: return L"nofile";
+    case vault::Corrupt: return L"corrupt";
+    case vault::WriteFailed: return L"write";
+    case vault::NoHello: return L"nohello";
+    case vault::HelloCancelled: return L"cancelled";
+    case vault::HelloFailed: return L"hellofailed";
+    default: return L"ok";
+    }
+}
+
+static void VaultPost(const std::wstring& kind, const std::wstring& rest = L"") {
+    UiPost(L"{\"t\":\"vault\",\"kind\":" + Json(kind) + rest + L"}");
+}
+
+static void VaultState() {
+    std::wstring state = vault::Unlocked() ? L"unlocked" : vault::Exists(VaultFile()) ? L"locked" : L"none";
+    VaultPost(L"state", L",\"state\":" + Json(state) + L",\"hello\":" + Bool(vault::Exists(VaultFile()) && vault::HasHello(VaultFile())) +
+                            L",\"helloReady\":" + Bool(g_helloReady));
+}
+
+static void VaultError(const std::wstring& op, vault::Result r) {
+    VaultPost(L"error", L",\"op\":" + Json(op) + L",\"reason\":" + Json(VaultReason(r)));
+}
+
+// Argon2id takes a moment: the work runs on its own thread and comes back as WM_APP_VAULT.
+static void VaultOffThread(const std::wstring& op, std::function<VaultJob()> work) {
+    std::thread([op, work] {
+        auto* job = new VaultJob(work());
+        job->op = op;
+        if (!PostMessageW(g.hwnd, WM_APP_VAULT, 0, (LPARAM)job)) { vault::Wipe(job->opened.key); vault::Wipe(job->opened.json); delete job; }
+    }).detach();
+}
+
+static void VaultOpened(vault::Opened& o) {
+    vault::Adopt(o.key);
+    vault::Wipe(o.key);
+    g_vaultActive = GetTickCount64();
+    VaultPost(L"opened", L",\"json\":" + Json(Wide(o.json)));
+    vault::Wipe(o.json);
+    VaultState();
+}
+
+static void OnVaultJob(VaultJob* job) {
+    std::unique_ptr<VaultJob> owned(job);
+    vault::Opened& o = job->opened;
+    if (job->op == L"create" || job->op == L"unlock" || job->op == L"hello") {
+        if (o.result == vault::Ok) VaultOpened(o);
+        else VaultError(job->op, o.result);
+    } else if (job->op == L"importExo") {
+        if (o.result == vault::Ok) VaultPost(L"importJson", L",\"json\":" + Json(Wide(o.json)));
+        else VaultError(L"import", o.result);
+        vault::Wipe(o.key);
+        vault::Wipe(o.json);
+    } else if (job->op == L"password") {
+        if (job->result == vault::Ok) VaultPost(L"passwordChanged");
+        else VaultError(L"password", job->result);
+    } else if (job->op == L"export") {
+        if (job->result == vault::Ok) VaultPost(L"exported");
+        else VaultError(L"export", job->result);
+    }
+}
+
+static void VaultLock() {
+    if (!vault::Unlocked()) return;
+    vault::Lock();
+    VaultPost(L"locked");
+    VaultState();
+}
+
+static void VaultTouch() { g_vaultActive = GetTickCount64(); }
+
+// Locks after the minutes in "vaultLock" without use (15 by default), and whenever Windows locks or sleeps.
+static void VaultTick() {
+    if (!vault::Unlocked()) return;
+    int minutes = _wtoi(Setting(L"vaultLock", L"15").c_str());
+    if (minutes > 0 && GetTickCount64() - g_vaultActive > (ULONGLONG)minutes * 60000) VaultLock();
+}
+
+// Copied secrets stay out of Windows' clipboard history and cloud clipboard, and are cleared after 30 seconds
+// unless something else was copied since.
+static void VaultCopy(const std::string& utf8) {
+    std::wstring text = Wide(utf8);
+    if (!OpenClipboard(g.hwnd)) return;
+    EmptyClipboard();
+    auto put = [](UINT format, const void* data, size_t size) {
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, size);
+        if (!mem) return;
+        memcpy(GlobalLock(mem), data, size);
+        GlobalUnlock(mem);
+        if (!SetClipboardData(format, mem)) GlobalFree(mem);
+    };
+    put(CF_UNICODETEXT, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    DWORD no = 0;
+    put(RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing"), &no, sizeof no);
+    put(RegisterClipboardFormatW(L"CanIncludeInClipboardHistory"), &no, sizeof no);
+    put(RegisterClipboardFormatW(L"CanUploadToCloudClipboard"), &no, sizeof no);
+    CloseClipboard();
+    SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+    g_clipboardSeq = GetClipboardSequenceNumber();
+    SetTimer(g.hwnd, kTimerClipboard, 30000, nullptr);
+}
+
+static void VaultClearClipboard() {
+    KillTimer(g.hwnd, kTimerClipboard);
+    if (g_clipboardSeq && GetClipboardSequenceNumber() == g_clipboardSeq && OpenClipboard(g.hwnd)) {
+        EmptyClipboard();
+        CloseClipboard();
+    }
+    g_clipboardSeq = 0;
+}
+
+// Saved passwords from a Chromium browser on this PC: its "Login Data" (and "Login Data For Account", where
+// Chrome keeps a signed-in account's), opened with the same key as its cookies. Chrome's app-bound ("v20")
+// passwords can only be read by Chrome: they are counted, so the vault can say to export them from Chrome.
+// Every profile of the browser (Default, Profile 1, ...): any folder in its User Data with a Login Data.
+static std::vector<std::wstring> ProfileDirs(const std::wstring& dir) {
+    std::wstring parent = dir.substr(0, dir.find_last_of(L'\\'));
+    std::vector<std::wstring> out{dir};
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((parent + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::wstring p = parent + L"\\" + fd.cFileName;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.' && _wcsicmp(p.c_str(), dir.c_str()) != 0 &&
+            Exists(p + L"\\Login Data"))
+            out.push_back(p);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return out;
+}
+
+static std::string ChromiumPasswords(const std::wstring& dir, int& locked) {
+    std::string key = ChromiumKey(dir);
+    std::wstring items;
+    std::unordered_set<std::wstring> seen;
+    Sql sql;
+    std::vector<std::wstring> files;
+    for (auto& profile : ProfileDirs(dir))
+        for (const wchar_t* db : {L"\\Login Data", L"\\Login Data For Account"}) files.push_back(profile + db);
+    for (auto& file : files) {
+        sql.Query(file, "SELECT origin_url, username_value, password_value, date_created FROM logins WHERE blacklisted_by_user = 0",
+                  [&](void* st) {
+                      std::wstring url = sql.Text(st, 0), user = sql.Text(st, 1);
+                      auto enc = (const BYTE*)sql.blob(st, 2);
+                      int n = sql.bytes(st, 2);
+                      if (!enc || n <= 0) return;
+                      std::string plain;
+                      if (n > 3 && memcmp(enc, "v20", 3) == 0) { locked++; return; }
+                      if (n > 3 && (memcmp(enc, "v10", 3) == 0 || memcmp(enc, "v11", 3) == 0)) {
+                          if (n < 3 + 12 + 16 || !AesGcm(key, enc + 3, enc + 15, (size_t)n - 15, plain)) { locked++; return; }
+                      } else {
+                          // Before Chrome 80: each password sealed for this Windows user on its own.
+                          DATA_BLOB in{(DWORD)n, (BYTE*)enc}, out{};
+                          if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) { locked++; return; }
+                          plain.assign((char*)out.pbData, out.cbData);
+                          SecureZeroMemory(out.pbData, out.cbData);
+                          LocalFree(out.pbData);
+                      }
+                      std::wstring password = Wide(plain);
+                      vault::Wipe(plain);
+                      if (url.empty() || !seen.insert(url + L"\n" + user + L"\n" + password).second) {
+                          SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+                          return;
+                      }
+                      // Chromium's times are microseconds since 1601.
+                      long long created = (sql.int64(st, 3) / 1000) - 11644473600000LL;
+                      if (!items.empty()) items += L",";
+                      items += L"{\"url\":" + Json(url) + L",\"username\":" + Json(user) + L",\"password\":" + Json(password) +
+                               L",\"created\":" + std::to_wstring(created > 0 ? created : 0) + L"}";
+                      SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+                  });
+    }
+    vault::Wipe(key);
+    std::string out = Utf8(L"[" + items + L"]");
+    SecureZeroMemory(items.data(), items.size() * sizeof(wchar_t));
+    return out;
+}
+
+// Firefox keeps saved passwords in logins.json, encrypted with a key that its NSS library keeps in key4.db,
+// itself encrypted (PBES2: PBKDF2-SHA-256 and AES-256-CBC) under a Primary Password, empty unless you set
+// one. With one set they stay locked, and the vault asks for Firefox's CSV export instead.
+namespace ff {
+struct Leaf { BYTE tag; std::string bytes; };
+
+// Every OID, INTEGER and OCTET STRING in a DER structure, in order.
+static void Leaves(const BYTE* p, const BYTE* end, std::vector<Leaf>& out, int depth = 0) {
+    while (p + 2 <= end && depth < 16) {
+        BYTE tag = *p++;
+        size_t len = *p++;
+        if (len & 0x80) {
+            int n = len & 0x7f;
+            if (n < 1 || n > 4 || p + n > end) return;
+            len = 0;
+            while (n--) len = (len << 8) | *p++;
+        }
+        if (len > (size_t)(end - p)) return;
+        if (tag == 0x30) Leaves(p, p + len, out, depth + 1);
+        else if (tag == 0x02 || tag == 0x04 || tag == 0x06) out.push_back({tag, std::string((const char*)p, len)});
+        p += len;
+    }
+}
+
+static std::string Hash(BCRYPT_ALG_HANDLE alg, size_t size, const std::string& data) {
+    std::string out(size, 0);
+    BCryptHash(alg, nullptr, 0, (PUCHAR)data.data(), (ULONG)data.size(), (PUCHAR)out.data(), (ULONG)size);
+    return out;
+}
+
+static std::string Decrypt(BCRYPT_ALG_HANDLE alg, const std::string& key, std::string iv, const std::string& data) {
+    BCRYPT_KEY_HANDLE k = nullptr;
+    std::string out(data.size(), 0);
+    ULONG got = 0;
+    if (BCryptGenerateSymmetricKey(alg, &k, nullptr, 0, (PUCHAR)key.data(), (ULONG)key.size(), 0) != 0) return "";
+    NTSTATUS st = BCryptDecrypt(k, (PUCHAR)data.data(), (ULONG)data.size(), nullptr, (PUCHAR)iv.data(), (ULONG)iv.size(),
+                                (PUCHAR)out.data(), (ULONG)out.size(), &got, 0);
+    BCryptDestroyKey(k);
+    if (st != 0 || got == 0) return "";
+    out.resize(got);
+    BYTE pad = (BYTE)out.back();  // PKCS #7
+    if (pad >= 1 && pad <= 16 && pad <= out.size()) out.resize(out.size() - pad);
+    return out;
+}
+
+static const std::string kPbes2("\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d", 9), kAes256Cbc("\x60\x86\x48\x01\x65\x03\x04\x01\x2a", 9),
+    kDes3Cbc("\x2a\x86\x48\x86\xf7\x0d\x03\x07", 8);
+
+// PBES2 under the Primary Password (empty): key = PBKDF2-SHA-256(SHA-1(global salt), salt, iterations).
+static std::string OpenPbes2(const std::string& der, const std::string& globalSalt) {
+    std::vector<Leaf> l;
+    Leaves((const BYTE*)der.data(), (const BYTE*)der.data() + der.size(), l);
+    std::vector<std::string> octets, ints;
+    bool pbes2 = false;
+    for (auto& x : l) {
+        if (x.tag == 0x06 && x.bytes == kPbes2) pbes2 = true;
+        if (x.tag == 0x04) octets.push_back(x.bytes);
+        if (x.tag == 0x02) ints.push_back(x.bytes);
+    }
+    if (!pbes2 || octets.size() < 3 || ints.empty() || ints[0].size() > 4) return "";
+    ULONG iterations = 0;
+    for (BYTE c : ints[0]) iterations = (iterations << 8) | c;
+    std::string password = Hash(BCRYPT_SHA1_ALG_HANDLE, 20, globalSalt), key(32, 0);
+    if (BCryptDeriveKeyPBKDF2(BCRYPT_HMAC_SHA256_ALG_HANDLE, (PUCHAR)password.data(), (ULONG)password.size(), (PUCHAR)octets[0].data(),
+                              (ULONG)octets[0].size(), iterations, (PUCHAR)key.data(), 32, 0) != 0)
+        return "";
+    // NSS stores a 14-byte IV; the real one is its DER header (04 0E) and those 14 bytes.
+    std::string iv = octets[1].size() == 14 ? std::string("\x04\x0e", 2) + octets[1] : octets[1];
+    return Decrypt(BCRYPT_AES_CBC_ALG_HANDLE, key, iv, octets.back());
+}
+
+// One of logins.json's encrypted fields: { key id, { cipher, IV }, ciphertext }.
+static std::string OpenField(const std::string& b64, const std::string& key) {
+    std::string der;
+    DWORD n = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr)) return "";
+    der.assign(n, 0);
+    CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)der.data(), &n, nullptr, nullptr);
+    std::vector<Leaf> l;
+    Leaves((const BYTE*)der.data(), (const BYTE*)der.data() + der.size(), l);
+    std::string oid, iv, data;
+    for (auto& x : l) {
+        if (x.tag == 0x06) oid = x.bytes;
+        else if (x.tag == 0x04 && !oid.empty() && iv.empty()) iv = x.bytes;
+        else if (x.tag == 0x04 && !iv.empty()) data = x.bytes;
+    }
+    if (oid == kDes3Cbc && key.size() >= 24) return Decrypt(BCRYPT_3DES_CBC_ALG_HANDLE, key.substr(0, 24), iv, data);
+    if (oid == kAes256Cbc && key.size() >= 32) return Decrypt(BCRYPT_AES_CBC_ALG_HANDLE, key.substr(0, 32), iv, data);
+    return "";
+}
+
+static std::string JsonField(const std::string& obj, const char* name) {
+    std::string k = std::string("\"") + name + "\":";
+    size_t at = obj.find(k);
+    if (at == std::string::npos) return "";
+    at += k.size();
+    if (obj[at] == '"') return obj.substr(at + 1, obj.find('"', at + 1) - at - 1);
+    return obj.substr(at, obj.find_first_of(",}", at) - at);
+}
+}  // namespace ff
+
+static std::string FirefoxPasswords(const std::wstring& dir, int& locked) {
+    std::string logins = ReadFileUtf8(dir + L"\\logins.json");
+    if (logins.empty()) return "[]";
+    Sql sql;
+    std::string globalSalt, check, key;
+    sql.Query(dir + L"\\key4.db", "SELECT item1, item2 FROM metaData WHERE id = 'password'", [&](void* st) {
+        if (sql.bytes(st, 0) > 0) globalSalt.assign((const char*)sql.blob(st, 0), sql.bytes(st, 0));
+        if (sql.bytes(st, 1) > 0) check.assign((const char*)sql.blob(st, 1), sql.bytes(st, 1));
+    });
+    bool open = ff::OpenPbes2(check, globalSalt).rfind("password-check", 0) == 0;
+    if (open)
+        sql.Query(dir + L"\\key4.db", "SELECT a11, a102 FROM nssPrivate", [&](void* st) {
+            static const std::string id("\xf8\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x01", 16);
+            if (!key.empty() || sql.bytes(st, 0) <= 0 || sql.bytes(st, 1) != 16 || memcmp(sql.blob(st, 1), id.data(), 16) != 0) return;
+            key = ff::OpenPbes2(std::string((const char*)sql.blob(st, 0), sql.bytes(st, 0)), globalSalt);
+        });
+    std::wstring items;
+    for (size_t at = 0; (at = logins.find("\"hostname\":", at)) != std::string::npos; at++) {
+        size_t end = logins.find("\"hostname\":", at + 1);
+        std::string obj = logins.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (key.empty()) { locked++; continue; }
+        std::string user = ff::OpenField(ff::JsonField(obj, "encryptedUsername"), key);
+        std::string pass = ff::OpenField(ff::JsonField(obj, "encryptedPassword"), key);
+        if (pass.empty()) { locked++; continue; }
+        if (!items.empty()) items += L",";
+        items += L"{\"url\":" + Json(Wide(ff::JsonField(obj, "hostname"))) + L",\"username\":" + Json(Wide(user)) + L",\"password\":" +
+                 Json(Wide(pass)) + L",\"created\":" + std::to_wstring(_atoi64(ff::JsonField(obj, "timeCreated").c_str())) + L"}";
+        vault::Wipe(pass);
+    }
+    vault::Wipe(key);
+    std::string out = Utf8(L"[" + items + L"]");
+    SecureZeroMemory(items.data(), items.size() * sizeof(wchar_t));
+    return out;
+}
+
+static void VaultImportBrowser(const std::wstring& key) {
+    for (auto& b : DetectBrowsers()) {
+        if (b.key != key) continue;
+        int locked = 0;
+        std::string items = b.firefox ? FirefoxPasswords(b.dir, locked) : ChromiumPasswords(b.dir, locked);
+        VaultPost(L"importItems", L",\"source\":" + Json(b.name) + L",\"locked\":" + std::to_wstring(locked) + L",\"items\":" + Json(Wide(items)));
+        vault::Wipe(items);
+        return;
+    }
+}
+
+static void VaultSources() {
+    std::wstring items;
+    for (auto& b : DetectBrowsers()) {
+        if (!items.empty()) items += L",";
+        items += L"[" + Json(b.key) + L"," + Json(b.name) + L"," + Bool(b.firefox) + L"]";
+    }
+    VaultPost(L"sources", L",\"items\":[" + items + L"]");
+}
+
+// A file to import: an Exo Vault export waits for its password; anything else (CSV or JSON from another
+// password manager) goes to the vault window as text to read.
+static void VaultImportFile() {
+    std::wstring file = PickFile(false, L"Passwords (Exo Vault, CSV, JSON)", L"*.exovault;*.csv;*.json;*.txt", L"csv", L"");
+    if (file.empty()) return;
+    std::wstring name = file.substr(file.find_last_of(L"\\/") + 1);
+    std::wstring lower = name;
+    for (auto& c : lower) c = towlower(c);
+    if (lower.size() > 9 && lower.compare(lower.size() - 9, 9, L".exovault") == 0) {
+        g_vaultImportFile = file;
+        VaultPost(L"importLocked", L",\"name\":" + Json(name));
+        return;
+    }
+    std::string text = ReadFileUtf8(file);
+    if (text.size() >= 3 && (BYTE)text[0] == 0xEF && (BYTE)text[1] == 0xBB && (BYTE)text[2] == 0xBF) text.erase(0, 3);
+    VaultPost(L"importText", L",\"name\":" + Json(name) + L",\"text\":" + Json(Wide(text)));
+    vault::Wipe(text);
+}
+
+static void VaultExport(std::string password, std::string json) {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wchar_t name[64];
+    swprintf_s(name, L"Exo Vault %04d-%02d-%02d.exovault", now.wYear, now.wMonth, now.wDay);
+    std::wstring file = PickFile(true, L"Exo Vault export", L"*.exovault", L"exovault", name);
+    if (file.empty()) { vault::Wipe(password); vault::Wipe(json); return; }
+    VaultOffThread(L"export", [file, password = std::move(password), json = std::move(json)]() mutable {
+        VaultJob job;
+        job.result = vault::Export(file, password, json);
+        vault::Wipe(password);
+        vault::Wipe(json);
+        return job;
+    });
+}
+
+static std::wstring OriginOf(const std::wstring& url) {
+    size_t scheme = url.find(L"://");
+    if (scheme == std::wstring::npos) return L"";
+    size_t end = url.find_first_of(L"/?#", scheme + 3);
+    return url.substr(0, end);
+}
+
+static void OnVaultMessage(const std::vector<std::wstring>& p) {
+    const std::wstring& v = p[0];
+    auto arg = [&](size_t i) { return i < p.size() ? p[i] : std::wstring(); };
+    if (v != L"vaultState") VaultTouch();
+    if (v == L"vaultState") {
+        VaultState();
+    } else if (v == L"vaultCreate" || v == L"vaultUnlock") {
+        bool create = v == L"vaultCreate";
+        std::string password = FromB64(arg(1));
+        std::wstring file = VaultFile();
+        VaultOffThread(create ? L"create" : L"unlock", [create, file, password]() mutable {
+            VaultJob job;
+            job.opened = create ? vault::Create(file, password, "{\"version\":1,\"items\":[]}") : vault::Unlock(file, password);
+            vault::Wipe(password);
+            return job;
+        });
+        vault::Wipe(password);
+    } else if (v == L"vaultHello") {
+        std::wstring file = VaultFile();
+        vault::HelloKey(false, [file](vault::Result r, std::string key) {
+            if (r != vault::Ok) { VaultError(L"hello", r); return; }
+            VaultOffThread(L"hello", [file, key]() mutable {
+                VaultJob job;
+                job.opened = vault::UnlockWithHelloKey(file, key);
+                vault::Wipe(key);
+                return job;
+            });
+        });
+    } else if (v == L"vaultHelloOn") {
+        if (!vault::Unlocked()) return;
+        vault::HelloKey(true, [](vault::Result r, std::string key) {
+            vault::Result saved = r == vault::Ok ? vault::SetHelloKey(VaultFile(), key) : r;
+            vault::Wipe(key);
+            if (saved != vault::Ok) VaultError(L"helloOn", saved);
+            VaultState();
+        });
+    } else if (v == L"vaultHelloOff") {
+        if (vault::Unlocked()) vault::SetHelloKey(VaultFile(), "");
+        VaultState();
+    } else if (v == L"vaultLock") {
+        VaultLock();
+    } else if (v == L"vaultSave") {
+        std::string json = FromB64(arg(1));
+        vault::Result r = vault::Save(VaultFile(), json);
+        vault::Wipe(json);
+        if (r == vault::Ok) VaultPost(L"saved");
+        else VaultError(L"save", r);
+    } else if (v == L"vaultPassword") {
+        // The current password proves it's you before the new one replaces it.
+        std::string current = FromB64(arg(1)), next = FromB64(arg(2)), key = vault::Key();
+        std::wstring file = VaultFile();
+        VaultOffThread(L"password", [file, current, next, key]() mutable {
+            VaultJob job;
+            vault::Opened check = vault::Unlock(file, current);
+            job.result = check.result != vault::Ok ? check.result : check.key != key ? vault::WrongPassword : vault::ChangePassword(file, key, next);
+            vault::Wipe(check.key);
+            vault::Wipe(check.json);
+            vault::Wipe(current);
+            vault::Wipe(next);
+            vault::Wipe(key);
+            return job;
+        });
+    } else if (v == L"vaultExport") {
+        if (vault::Unlocked()) VaultExport(FromB64(arg(1)), FromB64(arg(2)));
+    } else if (v == L"vaultImportFile") {
+        VaultImportFile();
+    } else if (v == L"vaultImportOpen") {
+        std::string password = FromB64(arg(1));
+        std::wstring file = g_vaultImportFile;
+        VaultOffThread(L"importExo", [file, password]() mutable {
+            VaultJob job;
+            job.opened = vault::Open(file, password);
+            vault::Wipe(password);
+            return job;
+        });
+    } else if (v == L"vaultSources") {
+        VaultSources();
+    } else if (v == L"vaultImportBrowser") {
+        if (vault::Unlocked()) VaultImportBrowser(arg(1));
+    } else if (v == L"vaultCopy") {
+        std::string text = FromB64(arg(1));
+        VaultCopy(text);
+        vault::Wipe(text);
+    } else if (v == L"vaultFill") {
+        // Only into the tab it was picked for, and only while that tab still shows the same site.
+        Tab* t = FindTab(_wtoi(arg(1).c_str()));
+        std::wstring origin = arg(2);
+        std::string payload = FromB64(arg(3));
+        if (vault::Unlocked() && t && t->core && !origin.empty() && OriginOf(t->url) == origin) {
+            std::wstring script = L"window.__exoVaultFill&&window.__exoVaultFill(" + Wide(payload) + L")";
+            t->core->ExecuteScript(script.c_str(), nullptr);
+            SecureZeroMemory(script.data(), script.size() * sizeof(wchar_t));
+        }
+        vault::Wipe(payload);
+    } else if (v == L"vaultFocusTab") {
+        // Back to the page after the fill menu (a click there gave the chrome page the keyboard).
+        if (FindTab(_wtoi(arg(1).c_str()))) FocusTarget(_wtoi(arg(1).c_str()));
+    } else if (v == L"vaultHot") {
+        // The fill menu's place, in the chrome page's pixels; none when it closes.
+        float k = Scale();
+        g_uiHot = p.size() < 5 ? RECT{} : RECT{(LONG)(_wtof(arg(1).c_str()) * k), (LONG)(_wtof(arg(2).c_str()) * k),
+                                               (LONG)((_wtof(arg(1).c_str()) + _wtof(arg(3).c_str())) * k), (LONG)((_wtof(arg(2).c_str()) + _wtof(arg(4).c_str())) * k)};
+    }
+}
+
+// What a page's sign-in fields report (ui/vault-page.js): the field you're in, where it is, and what was
+// submitted. The page's own words reach the vault window as a string to parse, beside what the host knows
+// for certain (which tab, which site, where the tab sits), so a page can't speak for another site.
+static void OnVaultPage(Tab* t, const std::wstring& from, const std::wstring& raw) {
+    if (!t || raw.size() > 65536 || t->id != g.activeId) return;
+    double zoom = 1;
+    if (t->ctl) t->ctl->get_ZoomFactor(&zoom);
+    float k = Scale();
+    UiPost(L"{\"t\":\"vaultPage\",\"tab\":" + std::to_wstring(t->id) + L",\"origin\":" + Json(OriginOf(from)) +
+           L",\"dx\":" + std::to_wstring(g.contentRect.left / k) + L",\"dy\":" + std::to_wstring(g.contentRect.top / k) +
+           L",\"zoom\":" + std::to_wstring(zoom) + L",\"page\":" + Json(raw) + L"}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Messages from the chrome page: a verb and tab-separated arguments.
+
+static void OnUiMessage(const std::wstring& msg) {
+    auto p = Split(msg, L'\t');
+    const std::wstring& v = p[0];
+    if (v.rfind(L"vault", 0) == 0) { OnVaultMessage(p); return; }
+    auto arg = [&](size_t i) { return i < p.size() ? p[i] : std::wstring(); };
+    auto argId = [&](size_t i) { return _wtoi(arg(i).c_str()); };
+    Tab* a = Active();
+    if (v == L"ready") {
+        g.uiReady = true;
+        SendSettings();
+        SendHistory();
+        SendState();
+        for (auto& t : g.tabs) if (!t->favicon.empty()) SendFavicon(t.get());
+        UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
+        SendImportSources();
+        SendExtensions();
+    } else if (v == L"activate") {
+        Activate(argId(1));
+    } else if (v == L"close") {
+        CloseTab(argId(1));
+    } else if (v == L"navigate") {
+        CloseOverlay();
+        Navigate(arg(1), arg(2) == L"new");
+    } else if (v == L"overlay") {
+        // 1: a menu or sheet takes the whole window's input; 0: back to the page.
+        if (arg(1) == L"0") CloseOverlay(false);
+        else if (!g.overlay) {
+            g.overlay = true;
+            SetRevealed(true);
+            if (arg(2) == L"blur") SetBlur(true);
+            FocusTarget(kUi);
+        }
+    } else if (v == L"makeDefault") {
+        // Only you can choose the default browser: Windows' Default apps, open at Exo Browser once Setup registered it.
+        ShellExecuteW(nullptr, L"open", IsRegistered() ? L"ms-settings:defaultapps?registeredAppUser=Exo%20Browser" : L"ms-settings:defaultapps",
+                      nullptr, nullptr, SW_SHOWNORMAL);
+    } else if (v == L"back") {
+        if (a && a->core) a->core->GoBack();
+    } else if (v == L"forward") {
+        if (a && a->core) a->core->GoForward();
+    } else if (v == L"reload") {
+        if (a && a->core) { if (a->loading) a->core->Stop(); else a->core->Reload(); }
+    } else if (v == L"min") {
+        ShowWindow(g.hwnd, SW_MINIMIZE);
+    } else if (v == L"max") {
+        ShowWindow(g.hwnd, IsZoomed(g.hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+    } else if (v == L"closewin") {
+        PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    } else if (v == L"mute") {
+        if (Tab* t = FindTab(argId(1)); t && t->core) {
+            ComPtr<ICoreWebView2_8> c8;
+            if (SUCCEEDED(t->core.As(&c8))) {
+                t->muted = !t->muted;
+                c8->put_IsMuted(t->muted);
+                QueueState();
+            }
+        }
+    } else if (v == L"pin") {
+        if (Tab* t = FindTab(argId(1))) {
+            t->pinned = !t->pinned;
+            // Pinned tabs lead the strip.
+            std::stable_partition(g.tabs.begin(), g.tabs.end(), [](auto& x) { return x->pinned; });
+            MarkSessionDirty();
+            QueueState();
+        }
+    } else if (v == L"move") {
+        size_t from = IndexOf(argId(1)), to = (size_t)argId(2);
+        if (from < g.tabs.size() && to < g.tabs.size() && from != to) {
+            auto t = std::move(g.tabs[from]);
+            g.tabs.erase(g.tabs.begin() + from);
+            g.tabs.insert(g.tabs.begin() + to, std::move(t));
+            MarkSessionDirty();
+            QueueState();
+        }
+    } else if (v == L"duplicate") {
+        if (Tab* t = FindTab(argId(1)); t && !t->url.empty()) AddTab(t->url, true, IndexOf(t->id) + 1);
+    } else if (v == L"sleep") {
+        if (Tab* t = FindTab(argId(1)); t && t->id != g.activeId) { Discard(t); QueueState(); }
+    } else if (v == L"closeOthers") {
+        int keep = argId(1);
+        std::vector<int> ids;
+        for (auto& t : g.tabs) if (t->id != keep && !t->pinned) ids.push_back(t->id);
+        for (int id : ids) CloseTab(id);
+    } else if (v == L"reopen") {
+        ReopenClosed();
+    } else if (v == L"find") {
+        g_findTerm = arg(1);
+        ApplyFind(a);
+    } else if (v == L"findNext") {
+        if (a && a->find) a->find->FindNext();
+    } else if (v == L"findPrev") {
+        if (a && a->find) a->find->FindPrevious();
+    } else if (v == L"findClose") {
+        g_findTerm.clear();
+        if (a && a->find) a->find->Stop();
+        if (a && a->ctl) FocusTarget(a->id);
+    } else if (v == L"newtab") {
+        NewTabPage();
+    } else if (v == L"openSettings") {
+        OpenSettings(arg(1));
+    } else if (v == L"api") {
+        std::wstring reqId = arg(1);
+        ApiData(arg(2), [reqId](const std::string& body, const wchar_t*, int) {
+            UiPost(L"{\"t\":\"api\",\"id\":" + Json(reqId) + L",\"data\":" + (body.empty() ? L"null" : Wide(body)) + L"}");
+        });
+    } else if (v == L"bookmarksExport") {
+        ExportBookmarks();
+    } else if (v == L"bookmarksImport") {
+        ImportBookmarksFile();
+    } else if (v == L"importSources") {
+        SendImportSources();
+    } else if (v == L"chrome") {
+        // The page's chrome: top px, sidebar px, auto-hide.
+        g.chromeTopDip = std::max(0, argId(1));
+        g.sidebarDip = std::max(0, argId(2));
+        bool was = g.autohide;
+        g.autohide = arg(3) == L"1";
+        Layout();
+        RefreshNewTabs();
+        // Turning auto-hide on or off settles both at once, without animating.
+        if (!g.autohide || !was) {
+            Reveal(true, !g.autohide, true);
+            Reveal(false, !g.autohide, true);
+            FollowNewTab();
+        } else {
+            SendRevealed();
+        }
+    } else if (v == L"glass") {
+        SetGlass(arg(1));
+    } else if (v == L"pin") {
+        // Something of the chrome is open (find, a menu): the Bar stays.
+        g.pinned = arg(1) == L"1";
+        if (g.pinned) Reveal(true, true);
+        else { POINT pt; GetCursorPos(&pt); ScreenToClient(g.hwnd, &pt); AutoHideTrack(pt, false); }
+    } else if (v == L"peek") {
+    } else if (v == L"bookmarkAdd") {
+        if (std::none_of(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& b) { return b.url == arg(1); })) {
+            g.bookmarks.push_back({arg(1), arg(2).empty() ? SiteOf(arg(1)) : arg(2)});
+            SaveBookmarks();
+            SendBookmarks();
+        }
+    } else if (v == L"bookmarkEdit") {
+        for (auto& b : g.bookmarks)
+            if (b.url == arg(1)) { b.title = arg(2); if (!arg(3).empty()) b.url = arg(3); }
+        SaveBookmarks();
+        SendBookmarks();
+    } else if (v == L"bookmarkMove") {
+        size_t from = (size_t)argId(1), to = (size_t)argId(2);
+        if (from < g.bookmarks.size() && to < g.bookmarks.size()) {
+            Bookmark b = g.bookmarks[from];
+            g.bookmarks.erase(g.bookmarks.begin() + from);
+            g.bookmarks.insert(g.bookmarks.begin() + to, b);
+            SaveBookmarks();
+            SendBookmarks();
+        }
+    } else if (v == L"historyDelete") {
+        for (size_t i = 1; i < p.size(); i++) g.history.erase(p[i]);
+        SaveHistory();
+        SendHistory();
+        RefreshNewTabs();
+    } else if (v == L"clearData") {
+        // Cookies, site storage and cache across every site.
+        if (Tab* t = a ? a : (g.tabs.empty() ? nullptr : g.tabs[0].get()); t && t->core) {
+            ComPtr<ICoreWebView2_13> c13;
+            ComPtr<ICoreWebView2Profile> profile;
+            ComPtr<ICoreWebView2Profile2> p2;
+            if (SUCCEEDED(t->core.As(&c13)) && SUCCEEDED(c13->get_Profile(&profile)) && SUCCEEDED(profile.As(&p2)))
+                p2->ClearBrowsingData((COREWEBVIEW2_BROWSING_DATA_KINDS)(COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE |
+                                      COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE),
+                    Callback<ICoreWebView2ClearBrowsingDataCompletedHandler>([](HRESULT) -> HRESULT {
+                        Toast(L"Cookies, site data and cache cleared");
+                        return S_OK;
+                    }).Get());
+        }
+    } else if (v.rfind(L"dl", 0) == 0) {
+        DownloadAction(v, argId(1));
+    } else if (v == L"downloads") {
+        SendDownloads();
+    } else if (v == L"extInstallMany") {
+        for (size_t i = 1; i < p.size(); i++) {
+            bool have = std::any_of(g_extFolders.begin(), g_extFolders.end(), [&](auto& e) {
+                return e.first == p[i] || e.second == ExtensionsDir() + L"\\" + p[i]; });
+            if (IsStoreId(p[i]) && !have && std::find(g_installQueue.begin(), g_installQueue.end(), p[i]) == g_installQueue.end())
+                g_installQueue.push_back(p[i]);
+        }
+        InstallNext();
+    } else if (v == L"bookmark") {
+        if (a) ToggleBookmark(a->url, a->title);
+    } else if (v == L"unbookmark") {
+        ToggleBookmark(arg(1), L"");
+    } else if (v == L"addBookmarks") {
+        // Imported: url, title pairs; ones already saved are skipped.
+        int added = 0;
+        for (size_t i = 1; i + 1 < p.size(); i += 2) {
+            if (std::none_of(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& b) { return b.url == p[i]; })) {
+                g.bookmarks.push_back({p[i], p[i + 1]});
+                added++;
+            }
+        }
+        if (added) { SaveBookmarks(); SendBookmarks(); }
+    } else if (v == L"sidebar") {
+        g.sidebarDip = std::max(0, argId(1));
+        Layout();
+    } else if (v == L"import") {
+        Import(arg(1));
+    } else if (v == L"extensions") {
+        SendExtensions();
+    } else if (v == L"extInstall") {
+        InstallStoreExtension(arg(1));
+    } else if (v == L"extLoad") {
+        PickExtensionFolder();
+    } else if (v == L"extIcon") {
+        SendExtensionIcon(arg(1), arg(2));
+    } else if (v == L"extPopup") {
+        CloseOverlay();
+        OpenExtensionPopup(arg(1), arg(2), argId(3), argId(4));
+    } else if ((v == L"extToggle" || v == L"extRemove") && arg(1) != g_shieldId) {
+        bool remove = v == L"extRemove";
+        WithExtension(arg(1), [remove](ICoreWebView2BrowserExtension* ext) {
+            auto done = [](HRESULT) -> HRESULT { SendExtensions(); return S_OK; };
+            if (remove) {
+                ext->Remove(Callback<ICoreWebView2BrowserExtensionRemoveCompletedHandler>(done).Get());
+            } else {
+                BOOL on = FALSE;
+                ext->get_IsEnabled(&on);
+                ext->Enable(!on, Callback<ICoreWebView2BrowserExtensionEnableCompletedHandler>(done).Get());
+            }
+        });
+    } else if (v == L"pip") {
+        // Picture in picture for the page's largest playing video.
+        if (a && a->core)
+            a->core->ExecuteScript(
+                L"(() => { const v = [...document.querySelectorAll('video')].sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];"
+                L" if (!v) return; if (document.pictureInPictureElement) document.exitPictureInPicture(); else v.requestPictureInPicture(); })()",
+                nullptr);
+    } else if (v == L"set") {
+        g.settings[arg(1)] = arg(2);
+        SaveSettings();
+        if (arg(1) == L"appearance") {
+            ApplyTheme();
+            g.profileReady = false;
+            if (Tab* t = Active(); t && t->core) ConfigureProfile(t->core.Get());
+        }
+        if (arg(1) == L"material" || arg(1) == L"appearance") SetGlass(g_glassSpec);
+        SendSettings();
+        RefreshNewTabs();
+    } else if (v == L"key") {
+        HandleKey((UINT)_wtoi(arg(1).c_str()), false, true);
+    } else if (v == L"clearHistory") {
+        g.history.clear();
+        SaveHistory();
+        SendHistory();
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Startup: the environment, the chrome page, then the session.
+
+static std::wstring BrowserArguments() {
+    // Secure DNS, always Cloudflare and with no plaintext fallback: every lookup goes over HTTPS to it.
+    std::wstring enable = L"ParallelDownloading,DnsOverHttps:Fallback/false/Templates/https%3A%2F%2Fchrome.cloudflare-dns.com%2Fdns-query";
+    std::wstring debug;
+    wchar_t port[16] = {};
+    if (GetEnvironmentVariableW(L"EXO_BROWSER_CDP", port, 16)) debug = std::wstring(L" --remote-debugging-port=") + port;
+    wchar_t extra[512] = {};
+    if (GetEnvironmentVariableW(L"EXO_BROWSER_ARGS", extra, 512)) debug += std::wstring(L" ") + extra;
+    return L"--process-per-site --no-pings --disable-domain-reliability"
+           L" --disable-features=msWebOOUI,msPdfOOUI,SpareRendererForSitePerProcess,msSmartScreenProtection"
+           L" --enable-features=" + enable + debug;
+}
+
+static void RestoreSession() {
+    size_t active = 0;
+    bool fresh = Setting(L"startup", L"restore") == L"fresh";
+    for (auto& row : fresh ? std::vector<std::vector<std::wstring>>{} : ReadTable(L"session.tsv")) {
+        if (row[0] == L"active" && row.size() > 1) active = (size_t)_wtoi(row[1].c_str());
+        if (row[0] != L"tab" || row.size() < 3) continue;
+        auto t = std::make_unique<Tab>();
+        t->id = g.nextId++;
+        t->url = row[1];
+        t->pendingNav = row[1];
+        t->title = row[2];
+        t->pinned = row.size() > 3 && row[3] == L"1";
+        // An asleep tab shows its site's icon from last time, not a blank globe, until it loads.
+        if (auto it = g.favicons.find(SiteOf(t->url)); it != g.favicons.end()) t->favicon = it->second;
+        g.tabs.push_back(std::move(t));
+    }
+    // Only the tab on screen loads; the rest wait, asleep, until they are opened.
+    for (auto& u : g.startupUrls) AddTab(u, false, g.tabs.size());
+    if (!g.startupUrls.empty()) active = g.tabs.size() - 1;
+    if (!g.tabs.empty()) Activate(g.tabs[std::min(active, g.tabs.size() - 1)]->id);
+    else NewTabPage();
+}
+
+static void CreateUi() {
+    ComPtr<ICoreWebView2ControllerOptions> opts;
+    g.env->CreateCoreWebView2ControllerOptions(&opts);
+    // Its own profile: no extensions, no history, nothing from the web.
+    opts->put_ProfileName(L"Chrome");
+    if (ComPtr<ICoreWebView2ControllerOptions3> o3; SUCCEEDED(opts.As(&o3))) o3->put_DefaultBackgroundColor({0, 0, 0, 0});
+    g.env->CreateCoreWebView2CompositionControllerWithOptions(g.hwnd, opts.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
+            [](HRESULT hr, ICoreWebView2CompositionController* comp) -> HRESULT {
+                if (FAILED(hr) || !comp) return S_OK;
+                g.uiComp = comp;
+                comp->QueryInterface(IID_PPV_ARGS(&g.uiCtl));
+                g.uiCtl->get_CoreWebView2(&g.ui);
+                comp->put_RootVisualTarget(static_cast<::IUnknown*>(winrt::get_unknown(g.chromeVisual)));
+                if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(g.uiCtl.As(&c2))) c2->put_DefaultBackgroundColor({0, 0, 0, 0});
+                ComPtr<ICoreWebView2Settings> s;
+                g.ui->get_Settings(&s);
+                s->put_IsStatusBarEnabled(FALSE);
+                s->put_IsZoomControlEnabled(FALSE);
+                s->put_AreDefaultContextMenusEnabled(FALSE);
+#ifndef _DEBUG
+                s->put_AreDevToolsEnabled(FALSE);
+#endif
+                if (ComPtr<ICoreWebView2Settings3> s3; SUCCEEDED(s.As(&s3))) s3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+                if (ComPtr<ICoreWebView2Settings5> s5; SUCCEEDED(s.As(&s5))) s5->put_IsPinchZoomEnabled(FALSE);
+                if (ComPtr<ICoreWebView2Settings6> s6; SUCCEEDED(s.As(&s6))) s6->put_IsSwipeNavigationEnabled(FALSE);
+                if (ComPtr<ICoreWebView2Settings9> s9; SUCCEEDED(s.As(&s9))) s9->put_IsNonClientRegionSupportEnabled(TRUE);
+                EventRegistrationToken tok;
+                g.ui->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                    [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+                        LPWSTR m = nullptr;
+                        if (SUCCEEDED(a->TryGetWebMessageAsString(&m))) OnUiMessage(Take(m));
+                        return S_OK;
+                    }).Get(), &tok);
+                comp->add_CursorChanged(Callback<ICoreWebView2CursorChangedEventHandler>(
+                    [](ICoreWebView2CompositionController* c, IUnknown*) -> HRESULT {
+                        c->get_Cursor(&g.uiCursor);
+                        if (g.hover == kUi) SetCursor(g.uiCursor);
+                        return S_OK;
+                    }).Get(), &tok);
+                g.uiCtl->add_AcceleratorKeyPressed(Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+                    [](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* a) -> HRESULT {
+                        COREWEBVIEW2_KEY_EVENT_KIND kind;
+                        a->get_KeyEventKind(&kind);
+                        if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                            return S_OK;
+                        UINT vk = 0;
+                        a->get_VirtualKey(&vk);
+                        COREWEBVIEW2_PHYSICAL_KEY_STATUS st;
+                        a->get_PhysicalKeyStatus(&st);
+                        if (HandleKey(vk, st.WasKeyDown, true)) a->put_Handled(TRUE);
+                        return S_OK;
+                    }).Get(), &tok);
+                if (ComPtr<ICoreWebView2_3> c3; SUCCEEDED(g.ui.As(&c3)))
+                    c3->SetVirtualHostNameToFolderMapping(L"exo.browser", (g.exeDir + L"\\ui").c_str(),
+                                                          COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+                Layout();
+                g.uiCtl->put_IsVisible(TRUE);
+                g.ui->Navigate(L"https://exo.browser/browser.html");
+                return S_OK;
+            }).Get());
+}
+
+
+static void InitBrowser() {
+    BuiltinFolder(L"exo-shield");
+    auto options = Make<CoreWebView2EnvironmentOptions>();
+    std::wstring args = BrowserArguments();
+    options->put_AdditionalBrowserArguments(args.c_str());
+    if (ComPtr<ICoreWebView2EnvironmentOptions2> o2; SUCCEEDED(options.As(&o2))) o2->put_ExclusiveUserDataFolderAccess(TRUE);
+    // Crash dumps stay on this PC instead of going to Microsoft.
+    if (ComPtr<ICoreWebView2EnvironmentOptions3> o3; SUCCEEDED(options.As(&o3))) o3->put_IsCustomCrashReportingEnabled(TRUE);
+    if (ComPtr<ICoreWebView2EnvironmentOptions6> o6; SUCCEEDED(options.As(&o6))) o6->put_AreBrowserExtensionsEnabled(TRUE);
+    std::wstring profile = g.dataDir + L"\\Profile";
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, profile.c_str(), options.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+                if (FAILED(hr) || !env || FAILED(env->QueryInterface(IID_PPV_ARGS(&g.env)))) {
+                    MessageBoxW(g.hwnd, L"Exo Browser needs the Microsoft Edge WebView2 Runtime.", L"Exo Browser", MB_ICONERROR);
+                    PostQuitMessage(1);
+                    return S_OK;
+                }
+                CreateUi();
+                RestoreSession();
+                return S_OK;
+            }).Get());
+    if (FAILED(hr)) {
+        MessageBoxW(g.hwnd, L"Exo Browser needs the Microsoft Edge WebView2 Runtime.", L"Exo Browser", MB_ICONERROR);
+        PostQuitMessage(1);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Window
+
+static void SavePlacement() {
+    WINDOWPLACEMENT wp{sizeof wp};
+    if (g.fullscreen) wp = g.placement;
+    else GetWindowPlacement(g.hwnd, &wp);
+    RECT r = wp.rcNormalPosition;
+    g.settings[L"window"] = std::to_wstring(r.left) + L"," + std::to_wstring(r.top) + L"," + std::to_wstring(r.right) +
+                            L"," + std::to_wstring(r.bottom) + L"," + (wp.showCmd == SW_SHOWMAXIMIZED ? L"1" : L"0");
+    SaveSettings();
+}
+
+static bool IsMouseMessage(UINT m) {
+    return (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST && m != WM_MOUSEWHEEL && m != WM_MOUSEHWHEEL);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (IsMouseMessage(msg)) {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        bool down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN ||
+                    msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDBLCLK;
+        bool up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP || msg == WM_XBUTTONUP;
+        int target = g.capture ? g.capture : HitTarget(pt);
+        if (msg == WM_MOUSEMOVE && !g.capture) AutoHideTrack(pt, false);
+        if (msg == WM_MOUSEMOVE) {
+            if (!g.tracking) {
+                TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+                g.tracking = true;
+            }
+            if (g.hover && g.hover != target) SendLeave(g.hover);
+            g.hover = target;
+        }
+        if (down) {
+            if (!g.capture) SetCapture(hwnd);
+            g.capture = target;
+            if (g.focus != target) FocusTarget(target);
+        }
+        if (target) SendMouse(target, (COREWEBVIEW2_MOUSE_EVENT_KIND)msg, wp, pt);
+        if (up && !(GET_KEYSTATE_WPARAM(wp) & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2))) {
+            g.capture = 0;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+    switch (msg) {
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        if (int target = HitTarget(pt)) SendMouse(target, (COREWEBVIEW2_MOUSE_EVENT_KIND)msg, wp, pt);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g.tracking = false;
+        AutoHideTrack({0, 0}, true);
+        if (g.hover && !g.capture) { SendLeave(g.hover); g.hover = 0; }
+        return 0;
+    case WM_NCMOUSEMOVE: {
+        if (g.hover) { SendLeave(g.hover); g.hover = 0; }
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        AutoHideTrack(pt, false);
+        break;
+    }
+    case WM_CAPTURECHANGED:
+        if ((HWND)lp != hwnd) g.capture = 0;
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            HCURSOR c = nullptr;
+            if (g.hover == kUi) c = g.uiCursor;
+            else if (Tab* t = FindTab(g.hover)) c = t->cursor;
+            SetCursor(c ? c : LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    case WM_NCCALCSIZE:
+        // The whole window is client area; when maximized, Windows hangs the frame off-screen.
+        if (wp && !g.fullscreen) {
+            if (IsZoomed(hwnd)) {
+                auto* p = (NCCALCSIZE_PARAMS*)lp;
+                int f = GetSystemMetricsForDpi(SM_CXFRAME, g.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, g.dpi);
+                p->rgrc[0].left += f;
+                p->rgrc[0].top += f;
+                p->rgrc[0].right -= f;
+                p->rgrc[0].bottom -= f;
+            }
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST: {
+        if (g.fullscreen) return HTCLIENT;
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (!IsZoomed(hwnd)) {
+            int b = Px(kResizeDip);
+            bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, d = pt.y >= rc.bottom - b;
+            if (t && l) return HTTOPLEFT;
+            if (t && r) return HTTOPRIGHT;
+            if (d && l) return HTBOTTOMLEFT;
+            if (d && r) return HTBOTTOMRIGHT;
+            if (t) return HTTOP;
+            if (d) return HTBOTTOM;
+            if (l) return HTLEFT;
+            if (r) return HTRIGHT;
+        }
+        bool inBar = g.autohide ? g.revealTop && pt.y < g.revealTop : pt.y < g.contentRect.top;
+        if (!g.overlay && inBar && g.uiComp) {
+            ComPtr<ICoreWebView2CompositionController4> c4;
+            COREWEBVIEW2_NON_CLIENT_REGION_KIND kind = COREWEBVIEW2_NON_CLIENT_REGION_KIND_CLIENT;
+            if (SUCCEEDED(g.uiComp.As(&c4)) && SUCCEEDED(c4->GetNonClientRegionAtPoint(pt, &kind)) &&
+                kind == COREWEBVIEW2_NON_CLIENT_REGION_KIND_CAPTION)
+                return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+    case WM_SIZE:
+        g.minimized = wp == SIZE_MINIMIZED;
+        if (Tab* a = Active(); a && a->ctl) a->ctl->put_IsVisible(!g.minimized);
+        if (g.uiCtl) g.uiCtl->put_IsVisible(!g.minimized);
+        if (!g.minimized) Layout();
+        QueueState();
+        return 0;
+    case WM_DPICHANGED: {
+        g.dpi = HIWORD(wp);
+        auto* r = (RECT*)lp;
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        Layout();
+        return 0;
+    }
+    case WM_SETFOCUS:
+        if (g.focus) FocusTarget(g.focus);
+        else if (g.overlay) FocusTarget(kUi);
+        else if (Tab* a = Active(); a && a->ctl) FocusTarget(a->id);
+        return 0;
+    case WM_GETMINMAXINFO: {
+        auto* mm = (MINMAXINFO*)lp;
+        mm->ptMinTrackSize = {Px(520), Px(360)};
+        return 0;
+    }
+    case WM_APP_STATE:
+        SendState();
+        return 0;
+    case WM_APP_VAULT:
+        OnVaultJob((VaultJob*)lp);
+        return 0;
+    // Exo Vault locks with Windows, and before the PC sleeps.
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK) VaultLock();
+        break;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) VaultLock();
+        break;
+    case WM_APP_ICON: {
+        std::unique_ptr<std::pair<std::wstring, std::wstring>> icon((std::pair<std::wstring, std::wstring>*)lp);
+        if (!icon->second.empty()) {
+            g_icons[icon->first] = icon->second;
+            SaveIcons();
+            RefreshNewTabs();
+        }
+        return 0;
+    }
+    case WM_APP_EXT_READY: {
+        std::unique_ptr<std::wstring> result((std::wstring*)lp);
+        if (!result->empty() && (*result)[0] == L'!') Toast(result->substr(1));
+        else AddExtensionFolder(*result);
+        g_installing = false;
+        InstallNext();
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT r;
+        GetClientRect(hwnd, &r);
+        HBRUSH b = CreateSolidBrush(g.page);
+        FillRect((HDC)wp, &r, b);
+        DeleteObject(b);
+        return 1;
+    }
+    case WM_SETTINGCHANGE:
+        if (Setting(L"appearance", L"void") == L"match" && lp && wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
+            ApplyTheme();
+            SendSettings();
+            RefreshNewTabs();
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wp) == 1) CloseTab((int)lp);  // a page closed its own window
+        return 0;
+    case WM_COPYDATA: {
+        auto* cd = (COPYDATASTRUCT*)lp;
+        std::wstring url = OpenArgument(std::wstring((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t)));
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        if (!url.empty()) { CloseOverlay(); Navigate(url, true); }
+        return TRUE;
+    }
+    case WM_TIMER:
+        if (wp == kTimerHide || wp == kTimerHideSide) {
+            bool top = wp == kTimerHide;
+            KillTimer(hwnd, wp);
+            (top ? g_hideTopPending : g_hideSidePending) = false;
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            bool in = PtInRect(&rc, pt) && (top ? pt.y < Px(g.chromeTopDip) + Px(18) : pt.x < Px(g.sidebarDip) + Px(18));
+            if (!in && !(top && (g.overlay || g.pinned))) Reveal(top, false);
+            return 0;
+        }
+        if (wp == kTimerSleep) {
+            SleepTick();
+            if (g.historyDirty) SaveHistory();
+            if (g.faviconsDirty) SaveFavicons();
+        } else if (wp == WM_APP_DOWNLOADS) {
+            KillTimer(hwnd, WM_APP_DOWNLOADS);
+            SendDownloads();
+        } else if (wp == kTimerSave) {
+            KillTimer(hwnd, kTimerSave);
+            if (g.sessionDirty) SaveSession();
+        } else if (wp == kTimerVault) {
+            VaultTick();
+        } else if (wp == kTimerClipboard) {
+            VaultClearClipboard();
+        }
+        return 0;
+    case WM_CLOSE:
+        vault::Lock();
+        VaultClearClipboard();
+        SavePlacement();
+        SaveSession();
+        SaveHistory();
+        if (g.faviconsDirty) SaveFavicons();
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        for (auto& t : g.tabs) if (t->ctl) t->ctl->Close();
+        if (g.uiCtl) g.uiCtl->Close();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static std::wstring ExeDir() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring s = path;
+    return s.substr(0, s.find_last_of(L'\\'));
+}
+
+static std::wstring DataDir() {
+    // EXO_BROWSER_DATA runs a separate profile (testing logged out, beside your own window).
+    wchar_t custom[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"EXO_BROWSER_DATA", custom, MAX_PATH)) {
+        CreateDirectoryW(custom, nullptr);
+        return custom;
+    }
+    PWSTR local = nullptr;
+    SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local);
+    std::wstring dir = Take(local) + L"\\ExoBrowser";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; i < argc; i++)
+        if (argv[i][0] != L'-') g.startupUrls.push_back(OpenArgument(argv[i]));
+    LocalFree(argv);
+
+    // One window per profile: a second start hands its address to the first.
+    bool separate = GetEnvironmentVariableW(L"EXO_BROWSER_DATA", nullptr, 0) > 0;
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, separate ? L"ExoBrowser.SingleInstance.Separate" : L"ExoBrowser.SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS && !separate) {
+        if (HWND other = FindWindowW(kClassName, nullptr)) {
+            std::wstring url = g.startupUrls.empty() ? L"" : g.startupUrls[0];
+            COPYDATASTRUCT cd{1, (DWORD)(url.size() * sizeof(wchar_t)), (void*)url.data()};
+            AllowSetForegroundWindow(ASFW_ANY);
+            SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cd);
+        }
+        return 0;
+    }
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    g.exeDir = ExeDir();
+    g.dataDir = DataDir();
+    for (auto& row : ReadTable(L"settings.tsv"))
+        if (row.size() >= 2) g.settings[row[0]] = row[1];
+    LoadHistory();
+    for (auto& row : ReadTable(L"bookmarks.tsv"))
+        if (row.size() >= 2) g.bookmarks.push_back({row[0], row[1]});
+    for (auto& row : ReadTable(L"favicons.tsv"))
+        if (row.size() >= 2) g.favicons[row[0]] = row[1];
+    for (auto& row : ReadTable(L"icons.tsv"))
+        if (row.size() >= 2) g_icons[row[0]] = row[1];
+    for (auto& row : ReadTable(L"extensions.tsv"))
+        if (row.size() >= 2) g_extFolders[row[0]] = row[1];
+    LoadDownloads();
+    g.autohide = Setting(L"autohide", L"off") == L"on";
+    g.chromeTopDip = Setting(L"tabs", L"horizontal") == L"vertical" ? 52 : 94;
+    if (Setting(L"tabs", L"horizontal") == L"vertical") g.sidebarDip = _wtoi(Setting(L"sidebarWidth", L"240").c_str());
+    ApplyTheme();
+
+    WNDCLASSEXW wc{sizeof wc};
+    wc.style = CS_DBLCLKS;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    wc.lpszClassName = kClassName;
+    RegisterClassExW(&wc);
+
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int w = std::min(1440L, work.right - work.left - 80), h = std::min(900L, work.bottom - work.top - 80);
+    RECT r{work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2, 0, 0};
+    r.right = r.left + w;
+    r.bottom = r.top + h;
+    bool maximized = false;
+    auto saved = Split(Setting(L"window", L""), L',');
+    if (saved.size() == 5) {
+        RECT s{_wtoi(saved[0].c_str()), _wtoi(saved[1].c_str()), _wtoi(saved[2].c_str()), _wtoi(saved[3].c_str())};
+        if (MonitorFromRect(&s, MONITOR_DEFAULTTONULL) && s.right - s.left > 300 && s.bottom - s.top > 200) r = s;
+        maximized = saved[4] == L"1";
+    }
+
+    g.hwnd = CreateWindowExW(0, kClassName, L"Exo Browser", WS_OVERLAPPEDWINDOW,
+                             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
+    g.dpi = GetDpiForWindow(g.hwnd);
+    ApplyTheme();
+    InitComposition();
+    SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    ShowWindow(g.hwnd, maximized ? SW_SHOWMAXIMIZED : show);
+    Layout();
+    InitBrowser();
+    SetTimer(g.hwnd, kTimerSleep, 30 * 1000, nullptr);
+    SetTimer(g.hwnd, kTimerVault, 20 * 1000, nullptr);
+    WTSRegisterSessionNotification(g.hwnd, NOTIFY_FOR_THIS_SESSION);
+    vault::HelloAvailable([](bool yes) { g_helloReady = yes; if (g.uiReady) VaultState(); });
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0)) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    CoUninitialize();
+    if (mutex) CloseHandle(mutex);
+    return 0;
+}

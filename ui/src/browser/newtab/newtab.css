@@ -1,0 +1,156 @@
+/* The new tab page: the mark, a line to read, Search, then bookmarks as Liquid Glass cards lit by their own site's
+   colors (its icon, enlarged and blurred, under the glass), then the sites you visit most. Nothing sponsored, no
+   feed. One centered column in the middle of the page, Exo's tokens throughout. */
+
+html, body, #root { min-height: 100%; margin: 0; background: var(--color-bg); color: var(--color-fg); font-family: var(--font-sans); }
+body { overflow-x: hidden; scrollbar-width: none; }
+
+@keyframes exb-arrive { from { opacity: 0; translate: 0 8px; } }
+
+.exb-ntp {
+  min-height: 100vh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  /* In the window's middle, not just the space beside the Bar and side tabs. */
+  translate: calc(var(--exb-inset-left, 0px) / -2) calc(var(--exb-inset-top, 0px) / -2);
+}
+.exb-ntp-mark { width: 72px; height: 72px; margin-bottom: 18px; animation: exb-arrive 280ms var(--ease-out) backwards; }
+
+.exb-ntp-quote { margin: 0; max-width: 760px; text-align: center; animation: exb-arrive 280ms var(--ease-out) 24ms backwards; }
+/* The line to read is set apart from Exo's Inter: Josefin Sans Light (SIL OFL, unmodified in the browser's fonts
+   folder, as its reserved name asks), geometric and airy, a little letter space to breathe. */
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block;
+  src: url("/fonts/JosefinSans%5Bwght%5D.ttf") format("truetype");
+}
+.exb-ntp-quote blockquote {
+  margin: 0;
+  font-family: "Josefin Sans", var(--font-sans);
+  /* design-disable-next-line exo/type-scale -- the new tab page's quote is display type, the page's one large line */
+  font-size: calc(40px * var(--exo-scale, 1));
+  font-weight: 300;
+  letter-spacing: 0.02em;
+  line-height: 1.25;
+  text-wrap: balance;
+}
+/* Who said it, in the quote's own voice: the same face, small, in spaced capitals, quieter than the line above. */
+.exb-ntp-quote figcaption {
+  margin-top: 14px;
+  color: var(--color-muted);
+  font-family: "Josefin Sans", var(--font-sans);
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 400;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+.exb-ntp-quote figcaption::before { content: "\2014\2002"; letter-spacing: 0; }
+
+.exb-ntp-marks { display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; width: min(960px, 100%); margin-top: 44px; user-select: none; }
+.exb-ntp-marks + .exb-ntp-marks { margin-top: 28px; }
+.exb-ntp-marks.is-bar { gap: 6px; }
+/* Rearranging: the others slide to make room; the one in hand rides above them, a touch larger. */
+.exb-ntp-marks [data-url] { transition: transform var(--dur-move) var(--ease-out), translate var(--dur-move) var(--ease-out), scale var(--dur-quick) var(--ease-out), background-color var(--dur-quick) var(--ease-out); }
+.exb-ntp-marks [data-url].is-dragging { z-index: 2; scale: 1.04; cursor: grabbing; transition: scale var(--dur-quick) var(--ease-out); }
+
+.exb-card {
+  position: relative;
+  width: 148px;
+  height: 116px;
+  overflow: hidden;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  border-radius: var(--exo-panel-radius, 18px);
+  background: var(--exo-tile);
+  box-shadow: var(--glassy-ring), var(--glassy-rim), var(--glassy-shadow);
+  color: var(--color-fg);
+  text-decoration: none;
+  animation: exb-arrive 280ms var(--ease-out) calc(80ms + min(var(--i, 0), 8) * 24ms) backwards;
+  transition: translate var(--dur-move) var(--ease-out), scale var(--dur-quick) var(--ease-out);
+}
+.exb-card-wash {
+  position: absolute;
+  inset: -45%;
+  z-index: -2;
+  background: var(--tint) center / cover no-repeat;
+  /* Exo's large liquid glass over the site's colors: its frost, saturation and dim, then its tint (::after). */
+  filter: blur(24px) saturate(1.8) var(--glassy-overlay-tone);
+  transition: scale 600ms var(--ease-out);
+}
+.exb-card::after { content: ""; position: absolute; inset: 0; z-index: -1; background-color: var(--glassy-overlay); background-image: var(--glassy-sheen); }
+:root[data-exo-glass="solid"] .exb-card-wash { opacity: 0.35; }
+.exb-card:hover { translate: 0 -3px; }
+.exb-card:hover .exb-card-wash { scale: 1.12; }
+.exb-card:active { scale: 0.97; transition-duration: var(--dur-press); }
+.exb-card-face {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--exo-fill);
+  box-shadow: var(--glassy-ring), var(--glassy-rim);
+  font-size: calc(20px * var(--exo-scale, 1));
+  font-weight: 700;
+}
+.exb-card-face img { width: 30px; height: 30px; border-radius: 7px; object-fit: contain; }
+.exb-card-name { max-width: 100%; box-sizing: border-box; overflow: hidden; padding: 5px 11px; border-radius: 999px; white-space: nowrap; text-overflow: ellipsis; font-size: calc(12px * var(--exo-scale, 1)); font-weight: 600; }
+.exb-card-x {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  color: var(--color-fg);
+  opacity: 0;
+  transition: opacity var(--dur-quick);
+}
+.exb-card:hover .exb-card-x { opacity: 1; }
+
+.is-tiles .exb-card { width: 108px; height: 96px; gap: 10px; border-radius: var(--exo-card-radius, 14px); }
+.is-tiles .exb-card-face { width: 40px; height: 40px; border-radius: 12px; }
+.is-tiles .exb-card-face img { width: 26px; height: 26px; }
+.is-tiles .exb-card-wash { opacity: 0.6; }
+
+/* Bookmarks as a bar, or icons only: Exo's capsules. */
+.exb-chip {
+  height: 34px;
+  max-width: 200px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 0 10px;
+  border-radius: 999px;
+  color: var(--color-fg);
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 600;
+  text-decoration: none;
+  animation: exb-arrive 280ms var(--ease-out) calc(80ms + min(var(--i, 0), 8) * 24ms) backwards;
+  transition: background-color var(--dur-quick) var(--ease-out), scale var(--dur-quick) var(--ease-out);
+}
+.exb-chip:hover { background-color: var(--hover-fill); }
+.exb-chip:active { scale: 0.97; }
+.exb-chip img, .exb-chip svg { width: 16px; height: 16px; flex: none; border-radius: 4px; object-fit: contain; }
+.exb-chip span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.is-icons .exb-chip { width: 44px; height: 44px; padding: 0; justify-content: center; }
+.is-icons .exb-chip :is(img, svg) { width: 20px; height: 20px; }
+.is-icons .exb-chip span { display: none; }
+
+.exb-ntp-menu.exo-shelf-sort-menu { position: fixed; display: flex; inset: auto; margin: 0; min-width: 210px; }

@@ -1,0 +1,57 @@
+name: Report a problem
+description: Something in Exo Browser isn't working as expected.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [help guide](https://github.com/ImAvgErix/ExoBrowser/blob/main/docs/HELP.md) and existing issues first. This report is public: remove passwords, sign-ins, email addresses and personal file paths from anything you attach. Security problems go [here, privately](https://github.com/ImAvgErix/ExoBrowser/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: Exo Browser version
+      description: The version shown in Settings > About.
+      placeholder: "Settings > About"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does it happen?
+      options:
+        - Install, update or uninstall
+        - A website (it looks or works wrong)
+        - Exo Shield (ads or blocking)
+        - Exo Vault (passwords)
+        - The Bar, tabs or search
+        - The new tab page
+        - Importing from another browser
+        - Extensions
+        - Settings
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected. Include the exact error message if there is one, and the site's address if it's about a website.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we reproduce it?
+      description: List the steps, and say whether it happens every time or only sometimes.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Your PC
+      description: Your Windows version, and the browser you imported from if it's about importing.
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Screenshots
+      description: Optional. Remove personal information first. Never attach your vault or your ExoBrowser data folder.

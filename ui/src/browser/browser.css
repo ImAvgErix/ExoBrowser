@@ -1,0 +1,318 @@
+/* Exo Browser's chrome: only how the browser's pieces are laid out. Colors, glass, type, motion, buttons, rows,
+   menus and the settings sheet are Exo's own (tokens.css, exo-shell.css, styles/*.css), so the two look as one.
+   The host composites this page over the tab: the page itself is clear, and the window draws the live glass under
+   the Bar and the floating sidebar. */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent !important;
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  user-select: none;
+}
+
+.exb {
+  --exb-gap: var(--exo-gap, 10px);
+  --exb-bar-h: 52px;
+  --exb-row-h: 42px;
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+.exb > * { pointer-events: auto; }
+
+/* ---------------------------------------------------------------- The Bar: Exo's band of glass capsules */
+
+/* As Exo's Bar (exo-shell.css, shelf.css): a clear 52px band, each group a 36px capsule of small Liquid Glass
+   10px from the window's edges and from each other; with tabs on top, their capsule rides in a row under it. */
+.exb-bar.exo-titlebar {
+  position: fixed;
+  inset: 0 0 auto;
+  height: auto;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+/* The empty band between the capsules moves the window; the capsules take clicks. (A drag region on the whole Bar
+   with no-drag on its controls made the host see all of it as caption, so no click reached the page.) */
+.exb-bar-row, .exb-tabrow { -webkit-app-region: drag; app-region: drag; }
+.exb-bar-row > *, .exb-tabrow > * { -webkit-app-region: no-drag; app-region: no-drag; }
+
+.exb-bar-row {
+  height: var(--exb-bar-h);
+  display: grid;
+  grid-template-columns: 1fr minmax(0, auto) 1fr;
+  align-items: center;
+  gap: var(--exb-gap);
+  padding: 0 var(--exb-gap);
+}
+.exb-pill { justify-self: start; }
+/* With tabs down the side, the back/forward capsule is exactly as wide as the side tabs' pane under it. */
+.is-vertical .exb-nav.exo-titlebar-tools { width: calc(var(--exb-side-w, 240px) - 2 * var(--exb-gap)); justify-content: space-evenly; }
+.exb-pill.is-end { justify-self: end; }
+.exb-bar .exo-titlebar-button:disabled { opacity: 0.3; }
+
+/* The address: Exo's Search capsule, wide and centered; the place a page shows it is loading. */
+.exb-address {
+  position: relative;
+  width: clamp(320px, 46vw, 760px);
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  transition: background-image var(--dur-quick) var(--ease-out);
+}
+.is-vertical .exb-address { width: clamp(320px, 52vw, 820px); }
+/* Exo's hover on a glass capsule: the lift laid over its slab, never in its place (glass.css). */
+@media (hover: hover) and (pointer: fine) {
+  .exb-address:hover { background-image: linear-gradient(var(--hover-fill), var(--hover-fill)), var(--glassy-sheen); }
+}
+.exb-address-text {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--color-fg);
+  font: inherit;
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 500;
+  cursor: text;
+}
+.exb-address-icon { color: var(--color-muted); }
+.exb-address-url, .exb-address-placeholder { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.exb-address-placeholder { color: var(--color-faint); }
+.exb-address-path { color: var(--color-muted); }
+.exb-star.is-on { color: #ffcc4d; }
+:root[data-exo-theme="light"] .exb-star.is-on { color: #c98a00; }
+.exb-store-add { height: 28px; flex: none; }
+
+/* Loading: a light travels along the field (Exo's work sheen) and lands as a brief glow. */
+.exb-load { position: absolute; inset: 0; z-index: -1; border-radius: inherit; overflow: hidden; pointer-events: none; visibility: hidden; }
+.exb-load::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 45%;
+  background: linear-gradient(90deg, transparent, rgb(var(--exo-ink-rgb) / 0.13) 50%, transparent);
+  transform: translateX(-100%);
+}
+.exb-load::after {
+  content: "";
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, rgb(var(--exo-ink-rgb) / 0.75) 50%, transparent);
+  transform: scaleX(0);
+}
+.exb-load.is-loading, .exb-load.is-landed { visibility: visible; }
+.exb-load.is-loading::before { animation: exb-sweep 1.1s cubic-bezier(0.45, 0, 0.25, 1) infinite; }
+.exb-load.is-loading::after { animation: exb-grow 1.1s cubic-bezier(0.45, 0, 0.25, 1) infinite alternate; }
+.exb-load.is-landed::after { transform: scaleX(1); background: linear-gradient(90deg, transparent, rgb(var(--exo-ink-rgb) / 0) 50%, transparent); transition: background 420ms var(--ease-out); }
+@keyframes exb-sweep { to { transform: translateX(330%); } }
+@keyframes exb-grow { from { transform: scaleX(0.08); } to { transform: scaleX(1); } }
+
+.exb-find { flex: 1; min-width: 0; height: 30px; display: flex; align-items: center; gap: 6px; padding: 0 2px 0 10px; }
+.exb-find-input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; color: var(--color-fg); font: inherit; font-size: calc(13px * var(--exo-scale, 1)); font-weight: 500; user-select: text; }
+.exb-find-input::placeholder { color: var(--color-faint); }
+.exb-find-count { color: var(--color-muted); font-size: calc(12px * var(--exo-scale, 1)); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* Downloads: a ring around the icon shows progress. */
+.exb-dl { position: relative; }
+.exb-ring { position: absolute; inset: 0; margin: auto; width: 22px; height: 22px; rotate: -90deg; pointer-events: none; }
+.exb-ring circle { fill: none; stroke-width: 2; stroke: transparent; }
+.exb-dl.is-busy .exb-ring circle:first-child { stroke: rgb(var(--exo-ink-rgb) / 0.15); }
+.exb-dl.is-busy .exb-ring .exb-arc { stroke: var(--color-fg); stroke-linecap: round; stroke-dasharray: 50.27; transition: stroke-dashoffset var(--dur-base) var(--ease-out); }
+
+/* ---------------------------------------------------------------- Tabs across the top: Exo's Rooms capsule */
+
+.exb-tabrow { height: var(--exb-row-h); display: flex; justify-content: center; align-items: flex-start; padding: 0 var(--exb-gap); }
+.exb-tabs.exo-top-rooms {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.exb-tab.exo-nav-btn {
+  height: 30px;
+  flex: 0 1 auto;
+  min-width: 34px;
+  max-width: 220px;
+  gap: 8px;
+  padding: 0 4px 0 11px;
+  font-weight: 600;
+  cursor: default;
+}
+.exb-tab.exo-nav-btn > * { pointer-events: auto; }
+.exb-tab:hover:not(.is-on) { color: var(--color-fg); background: var(--hover-fill); }
+.exb-tab.is-on { color: var(--color-fg); }
+.exb-tab.is-sleeping:not(.is-on) { color: rgb(var(--exo-ink-rgb) / 0.42); }
+.exb-tab.is-pinned { padding: 0; width: 34px; justify-content: center; }
+.exb-tab.is-pinned :is(.exb-tab-title, .exb-tab-close) { display: none; }
+.exb-tab.is-dragging, .exb-vtab.is-dragging { z-index: 3; transition: none; background: var(--exo-pressed); }
+.exb-tabs.is-tight .exb-tab:not(.is-on) .exb-tab-title { display: none; }
+.exb-tabs.is-tight .exb-tab:not(.is-on) { padding: 0 9px; }
+.exb-tabs.is-tight .exb-tab:not(.is-on) .exb-tab-close { display: none; }
+.exb-tab-title { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.exb-tab-act {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--color-muted);
+  transition: background-color var(--dur-quick), color var(--dur-quick);
+}
+.exb-tab-act:hover { background: var(--hover-fill); color: var(--color-fg); }
+.exb-tab-close { opacity: 0; }
+:is(.exb-tab, .exb-vtab):is(:hover, .is-on) .exb-tab-close { opacity: 1; }
+.exb-new { width: 30px !important; flex: none; }
+
+.exb-fav { width: 16px; height: 16px; flex: none; border-radius: 4px; object-fit: contain; }
+.exb-fav-blank { color: var(--color-muted); }
+.exb-spin { width: 14px; height: 14px; flex: none; margin: 1px; border-radius: 50%; border: 2px solid rgb(var(--exo-ink-rgb) / 0.18); border-top-color: var(--color-fg); animation: exb-spin 0.8s linear infinite; }
+@keyframes exb-spin { to { rotate: 360deg; } }
+
+/* ---------------------------------------------------------------- Tabs down the side: a floating pane of glass */
+
+.exb-side.exo-glass {
+  position: fixed;
+  left: var(--exb-gap);
+  top: var(--exb-bar-h);
+  bottom: var(--exb-gap);
+  width: calc(var(--exb-side-w, 240px) - 2 * var(--exb-gap));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  border-radius: var(--exo-panel-radius, 18px);
+}
+.exb-side-new, .exb-vtab {
+  position: relative;
+  height: 36px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 6px 0 10px;
+  border: 0;
+  border-radius: var(--exo-row-radius, 12px);
+  background: none;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 600;
+  text-align: left;
+  transition: background-color var(--dur-quick) var(--ease-out), color var(--dur-quick) var(--ease-out), scale var(--dur-quick) var(--ease-out);
+}
+.exb-side-new { justify-content: center; padding: 0; border-radius: 999px; }
+.exb-side-new:hover, .exb-vtab:hover:not(.is-on) { background: var(--hover-fill); color: var(--color-fg); }
+.exb-side-new:active, .exb-vtab:active { scale: 0.97; }
+.exb-vtab.is-on { color: var(--color-fg); }
+.exb-vtab .exb-tab-title { flex: 1; }
+.exb-side-tabs { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; scrollbar-width: none; }
+.exb-side-tabs.exo-glide::before { border-radius: var(--exo-row-radius, 12px); }
+.exb-side-pinned { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); gap: 6px; }
+.exb-ptab { height: 40px; display: grid; place-items: center; border: 0; border-radius: var(--exo-row-radius, 12px); background: var(--exo-fill); }
+.exb-ptab:hover, .exb-ptab.is-on { background: var(--exo-selected); }
+.exb-side-grip { position: absolute; top: 12px; right: -6px; bottom: 12px; width: 8px; cursor: ew-resize; }
+
+/* ---------------------------------------------------------------- Auto-hide: each slides in from its own edge */
+
+.is-autohide .exb-bar.exo-titlebar { opacity: 0; translate: 0 -10px; transition: opacity 140ms var(--ease-out), translate 140ms var(--ease-out); }
+.is-autohide.reveal-top .exb-bar.exo-titlebar { opacity: 1; translate: none; transition: opacity 180ms var(--ease-out), translate 260ms var(--ease-out); }
+.is-autohide .exb-side { opacity: 0; translate: -14px 0; transition: opacity 140ms var(--ease-out), translate 140ms var(--ease-out); }
+.is-autohide.reveal-side .exb-side { opacity: 1; translate: none; transition: opacity 180ms var(--ease-out), translate 260ms var(--ease-out); }
+
+/* ---------------------------------------------------------------- Search, opened in the address */
+
+.exb-search-layer { position: fixed; inset: 0; z-index: 60; }
+/* Search takes the address's place: the capsule (its glass too) steps aside while it is open, so there is one surface. */
+:root:has(.exb-search-layer) .exb-address { visibility: hidden; }
+.exb-search {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  max-height: min(560px, calc(100vh - 24px));
+  overflow: hidden;
+  border-radius: 18px;
+  transform-origin: top center;
+  animation: exb-search-in var(--dur-base) var(--ease-out);
+}
+@keyframes exb-search-in { from { scale: 0.98; } }
+/* Laid out like the address it opens over (icon and text centered together), so nothing moves when it opens. */
+.exb-search-field { height: 36px; flex: none; display: flex; align-items: center; justify-content: center; gap: 9px; padding: 0 13px; }
+.exb-search-icon { flex: none; color: var(--color-muted); }
+.exb-search-field input { flex: 0 1 auto; field-sizing: content; min-width: 1ch; max-width: 100%; height: 32px; border: 0; outline: 0; background: none; color: var(--color-fg); font: inherit; font-size: calc(13px * var(--exo-scale, 1)); font-weight: 500; user-select: text; }
+.exb-search-field input::placeholder { color: var(--color-muted); }
+.exb-search-list { min-height: 0; flex: 1; overflow-y: auto; scrollbar-width: none; padding: 6px; border-top: 1px solid var(--exo-float-line); }
+.exb-search-group { padding: 8px 10px 4px; font-size: calc(12px * var(--exo-scale, 1)); font-weight: 500; color: var(--color-muted); }
+.exb-search-row { min-height: 44px; display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: var(--exo-row-radius, 12px); transition: background-color 120ms; }
+.exb-search-row.is-selected { background: var(--hover-fill); }
+.exb-search-lead { color: var(--color-muted); }
+.exb-search-fav { width: 16px; height: 16px; flex: none; border-radius: 4px; object-fit: contain; }
+.exb-search-text { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.exb-search-main { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: calc(13px * var(--exo-scale, 1)); font-weight: 500; }
+.exb-search-sub { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: calc(12px * var(--exo-scale, 1)); color: var(--color-muted); }
+
+/* ---------------------------------------------------------------- Menus at a point or under a button */
+
+.exb-menu-scrim { position: fixed; inset: 0; z-index: 70; }
+.exb-menu.exo-shelf-sort-menu { position: fixed; inset: auto; margin: 0; min-width: 220px; max-width: 360px; }
+.exb-menu.is-right { transform-origin: top right; }
+.exb-menu .exo-menu-item.is-off { color: var(--color-faint); }
+.exb-menu-img { width: 16px; height: 16px; flex: none; border-radius: 4px; object-fit: contain; }
+.exb-menu-label { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.exb-menu-meta { flex: none; color: var(--color-faint); font-size: calc(12px * var(--exo-scale, 1)); font-variant-numeric: tabular-nums; }
+.exb-menu-rule { height: 1px; flex: none; margin: 4px 0; background: var(--exo-float-line); }
+.exb-menu-progress, .exb-progress { display: block; height: 3px; margin: 0 10px 6px 36px; overflow: hidden; border-radius: 3px; background: var(--exo-track); }
+.exb-progress { margin: 6px 0 0; height: 4px; }
+:is(.exb-menu-progress, .exb-progress) i { display: block; height: 100%; border-radius: inherit; background: var(--color-fg); transform-origin: left; transition: transform var(--dur-base) var(--ease-out); }
+
+/* ---------------------------------------------------------------- Settings: Exo's sheet, under the whole Bar */
+
+.exb-set-room.exo-set-room { inset: var(--exb-bar-h) 0 0; }
+.is-horizontal .exb-set-room.exo-set-room { inset: calc(var(--exb-bar-h) + var(--exb-row-h)) 0 0; }
+.is-autohide .exb-set-room.exo-set-room { inset: 0; }
+.exb-set-actions { display: flex; align-items: center; gap: 8px; }
+.exb-field.exo-field { width: 200px; user-select: text; }
+.exo-set-item-control:has(.exb-field + .exb-field) .exb-field { width: 160px; }
+.exb-set-lead { width: 22px; height: 22px; flex: none; border-radius: 6px; object-fit: contain; }
+.exb-set-lead.is-blank { color: var(--color-muted); padding: 3px; }
+/* A bookmark's name and address, editable in place, in the row's own type (Exo's label and detail). */
+.exb-edit { width: 100%; margin: -2px -6px; padding: 2px 6px; border: 0; outline: 0; border-radius: 6px; background: transparent; font-family: inherit; line-height: 1.4; user-select: text; }
+.exb-edit.exo-set-item-label { color: var(--color-fg); font-size: calc(13px * var(--exo-scale, 1)); font-weight: 500; }
+.exb-edit.exo-set-item-detail { color: var(--color-muted); font-size: calc(13px * var(--exo-scale, 1)); font-weight: 400; }
+.exb-edit:focus { background: var(--exo-fill); box-shadow: var(--exo-field-rim); }
+.exb-handle { width: 24px; height: 32px; margin: 0 -6px 0 -4px; flex: none; display: grid; place-items: center; color: var(--color-faint); cursor: grab; touch-action: none; }
+.exb-handle:hover { color: var(--color-fg); }
+.exb-mark { transition: transform var(--dur-move) var(--ease-out); }
+.exb-mark.is-dragging { position: relative; z-index: 2; transition: none; cursor: grabbing; border-radius: 12px; background: var(--glassy-overlay); box-shadow: var(--glassy-shadow-raised); }
+
+/* ---------------------------------------------------------------- Toasts: Exo's, under the Bar */
+
+.exb-toasts.exo-toast-stack { top: calc(var(--exb-bar-h) + 10px); pointer-events: none; }
+.is-horizontal .exb-toasts.exo-toast-stack { top: calc(var(--exb-bar-h) + var(--exb-row-h) + 10px); }

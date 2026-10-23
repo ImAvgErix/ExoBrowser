@@ -1,0 +1,446 @@
+/* Settings, as Discord's settings in Exo's look: a plain section list in a floating panel, and each
+   section a title over rows on the black, split by hairlines, using the window's width. Shared
+   status, segmented and busy-button rules used elsewhere also live here. */
+
+/* A busy apply button keeps its width while the count changes. */
+.exo-upscaler-btn.is-morph {
+  position: relative;
+  overflow: hidden;
+  color: var(--color-fg);
+  border-color: var(--color-line);
+  font-variant-numeric: tabular-nums;
+}
+
+.exo-set-error {
+  margin: 8px 0 0;
+  color: var(--color-bad);
+  font-size: calc(13px * var(--exo-scale, 1));
+  line-height: 1.4;
+}
+
+.exo-set-state {
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  white-space: nowrap;
+}
+
+.exo-set-state.is-on {
+  color: var(--color-good);
+}
+
+/* A status leading a row's line (System › Exo's profile: Applied) takes the line's own size. */
+.exo-set-item-detail .exo-set-state {
+  font-size: inherit;
+}
+
+/* ── Room layout ── */
+
+.exo-settings {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  background: var(--color-bg);
+}
+
+.exo-settings-scroll {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  scroll-padding-top: 24px;
+}
+/* A readable column, centred in the space beside the nav so a maximized
+   window has no empty band on one side. */
+.exo-settings-layout {
+  max-width: 820px;
+  margin-inline: auto;
+  padding: 40px 56px 96px;
+}
+
+/* Pinned to the window's left edge; only the content column scrolls. */
+.exo-settings-nav {
+  flex: none;
+  width: 240px;
+  padding: 24px 12px;
+  border-right: 1px solid var(--exo-float-line);
+  overflow-y: auto;
+}
+
+.exo-settings-nav h1 {
+  margin: 0 0 10px;
+  padding: 0 10px;
+  color: var(--color-faint);
+  font-size: calc(12px * var(--exo-scale, 1));
+  font-weight: 600;
+}
+
+.exo-settings-nav ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exo-settings-nav button {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  text-align: left;
+  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out);
+}
+
+.exo-settings-nav button.is-current {
+  background: var(--exo-selected);
+  color: var(--color-fg);
+}
+
+.exo-settings-column {
+  display: flex;
+  flex-direction: column;
+  gap: 40px;
+  min-width: 0;
+}
+
+/* ── Sections and rows ── */
+
+.exo-set-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 32px;
+  margin: 0 0 12px;
+}
+
+.exo-set-section-head h2 {
+  margin: 0;
+  color: var(--color-fg);
+  font-size: calc(20px * var(--exo-scale, 1));
+  font-weight: 600;
+}
+
+/* The section list moves focus here so Tab continues inside the section; a heading is not a control. */
+.exo-set-section-head h2:focus {
+  outline: none;
+}
+
+.exo-set-item {
+  padding: 12px 0;
+}
+
+.exo-set-item + .exo-set-item,
+.exo-set-list > .exo-set-item:first-child {
+  border-top: 1px solid var(--exo-float-line);
+}
+
+.exo-set-item-main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  /* One row height whatever the control (switch, button, dropdown) or one or two lines of copy. */
+  min-height: 38px;
+}
+
+.exo-set-item-icon {
+  display: inline-flex;
+  flex: none;
+}
+
+/* A row's error lines up with its label, past the 22px icon and the row's 16px gap. */
+.exo-set-item:has(> .exo-set-item-main > .exo-set-item-icon) > .exo-set-error {
+  padding-left: 38px;
+}
+
+.exo-set-item-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.exo-set-item-label {
+  color: var(--color-fg);
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 500;
+}
+
+.exo-set-item-detail {
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/* A quiet second line under a row's detail (Epic: the launcher's other account). */
+.exo-set-item-aside {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-faint);
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+.exo-set-item-control {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 60%;
+}
+
+.exo-set-item > .exo-set-item-label {
+  display: block;
+  margin-bottom: 12px;
+}
+
+/* Key fields */
+
+/* At the narrowest window with Large text the buttons wrap under the field instead of pushing the row wide. */
+.exo-set-key-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The field is 220px and gives way to 120px before a button wraps (a width in % of the form left it guessing, and
+   Get one and Remove wrapped under the field at every size). */
+.exo-set-key-form .exo-field {
+  flex: 0 1 220px;
+  width: 220px;
+  min-width: 120px;
+  margin: 0;
+}
+
+
+/* Primary and progress buttons (update) */
+
+.exo-set-btn.is-primary {
+  border-color: var(--color-fg);
+  background: var(--color-fg);
+  color: var(--color-primary-fg);
+}
+
+.exo-set-progress {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.exo-set-progress:disabled::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgba(0, 0, 0, 0.18);
+  transform-origin: left;
+  transform: scaleX(var(--progress, 0));
+}
+
+.exo-set-progress:disabled {
+  opacity: 1;
+}
+
+/* Store chips and links */
+
+.exo-set-chips,
+.exo-set-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exo-set-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 14px 0 10px;
+  border: 1px solid rgb(var(--exo-ink-rgb) / 0.14);
+  border-radius: 999px;
+  background: var(--exo-fill);
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  transition: color 120ms var(--ease-out), border-color 120ms var(--ease-out);
+}
+
+.exo-set-link {
+  height: 32px;
+  padding: 0 4px;
+  border: 0;
+  /* A text link still gets a rounded focus ring. */
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  text-decoration: underline;
+  text-decoration-color: rgb(var(--exo-ink-rgb) / 0.25);
+  text-underline-offset: 3px;
+  transition: color 120ms var(--ease-out);
+}
+
+.exo-set-links {
+  gap: 4px 20px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .exo-settings-nav button:hover:not(.is-current),
+  .exo-set-chip:hover:not(:disabled),
+  .exo-set-link:hover {
+    color: var(--color-fg);
+  }
+
+  .exo-set-chip:hover:not(:disabled) {
+    background: var(--hover-fill);
+  }
+
+  .exo-set-btn:hover:not(:disabled) {
+    background: var(--hover-fill);
+  }
+
+  .exo-set-btn.is-primary:hover:not(:disabled) {
+    background-color: var(--exo-primary-hover);
+  }
+}
+
+
+/* ── Lucid ── */
+
+/* The headphone list opens under its row: search, then each kind as Lucid groups them. */
+/* The picker opens under its row as its own framed panel: the search, then the list with room to read. */
+.exo-lucid-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: var(--exo-panel-radius);
+  background: var(--exo-float);
+  box-shadow: inset 0 0 0 1px var(--exo-float-line);
+}
+
+.exo-lucid-picker .exo-field {
+  width: 100%;
+}
+
+.exo-lucid-list {
+  max-height: 440px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.exo-lucid-kind {
+  margin: 16px 0 6px;
+  padding: 0 12px;
+  color: var(--color-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+  font-weight: 400;
+}
+
+.exo-lucid-headphone {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  transition: background-color 120ms var(--ease-out);
+}
+
+.exo-lucid-headphone.is-current {
+  background: var(--exo-selected);
+}
+
+.exo-lucid-pick {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-fg);
+  font-size: calc(13px * var(--exo-scale, 1));
+  text-align: left;
+}
+
+.exo-lucid-pick small {
+  overflow: hidden;
+  color: var(--color-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exo-lucid-star {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-faint);
+  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out);
+}
+
+.exo-lucid-star.is-on {
+  color: var(--color-fg);
+}
+
+.exo-lucid-empty {
+  margin: 8px 0;
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .exo-lucid-headphone:not(.is-current):hover,
+  .exo-lucid-star:hover {
+    background: var(--hover-fill);
+  }
+
+  .exo-lucid-star:hover {
+    color: var(--color-fg);
+  }
+}
+
+html[data-exo-motion="reduce"] :is(.exo-lucid-headphone, .exo-lucid-star) {
+  transition: none;
+}
+
+/* Lucid's cue sound volumes: the slider, then its value on the row's right edge. */
+.exo-lucid-volume {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-variant-numeric: tabular-nums;
+}
+
+.exo-lucid-volume input[type='range'] {
+  width: 180px;
+}
+
+.exo-lucid-volume span {
+  min-width: 36px;
+  text-align: right;
+}

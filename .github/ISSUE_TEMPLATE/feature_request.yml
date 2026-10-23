@@ -1,0 +1,26 @@
+name: Suggest a feature
+description: Share an idea that would make Exo Browser better.
+title: "[Idea] "
+body:
+  - type: markdown
+    attributes:
+      value: Please check existing issues for a similar suggestion first.
+  - type: textarea
+    id: need
+    attributes:
+      label: What would you like to do?
+      description: Describe the task or problem you want Exo Browser to help with.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your suggestion
+      description: Explain how you would like it to work.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything else?
+      description: Optional examples, alternatives or screenshots. Remove personal information before posting.

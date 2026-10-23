@@ -1,0 +1,13 @@
+# Exo Browser security
+
+## Reporting a vulnerability
+
+Please report security problems privately: on GitHub, **Security > Report a vulnerability** in this repository. Don't open a public issue for them. Say what you found, how to reproduce it and which version you used (**Settings > About**). You'll get an answer, and a fix ships in the next release with a line in the changelog.
+
+## How Exo Browser is put together
+
+- **One process, your rights.** `ExoBrowser.exe` runs as your Windows user (`asInvoker`) and installs per user; nothing runs as administrator or as a service.
+- **The interface has no web.** The Bar, new tab page, Settings and Exo Vault are Exo Browser's own pages, served from the app folder in their own WebView2 profile with no extensions and no access to the web. Web pages run in another profile and can't reach the interface: the host answers a tab only for Exo's own new tab page, Exo Vault's fill and save (matched to the page's real address as WebView2 reports it), and the Chrome Web Store's Add to Exo button, from that store's own address.
+- **Exo Vault.** The vault key is random and never written in the clear: it is wrapped by a key derived from your master password with Argon2id (256 MiB, 4 passes, 4 lanes) and, optionally, by Windows Hello. Items are encrypted with AES-256-GCM through Windows' CNG. The file is written to a temporary file and swapped in, with the previous save kept as a backup. Decrypted items live only in the interface page while the vault is open; it locks on idle, Windows lock and sleep. Copied secrets are excluded from clipboard history and cleared after 30 seconds.
+- **Exo Shield** is a built-in extension the host loads from the app folder and keeps on: it refuses to disable or remove it, and closes any page of it a site or extension tries to open.
+- **Updates** come only from a new Setup you run. Setup stages the new version beside the old one and swaps it in whole, putting the old one back if anything fails.

@@ -1,0 +1,5 @@
+uBlock Origin Lite 2026.1021.1354 (MV3, Edge build), Raymond Hill and contributors
+Source: https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.1021.1354/uBOLite_2026.1021.1354.edge.zip
+Zip SHA-256: a12cf7dbb7021fc4890c136c97ee7493f405c637ff67acab5a3a537c602e8ab5
+Corresponding source: https://github.com/gorhill/uBlock/tree/master/platform/mv3 (uBOL-home tag 2026.1021.1354)
+License: GPL-3.0 (LICENSE.txt), shipped unmodified.

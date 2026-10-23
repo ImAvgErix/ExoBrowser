@@ -1,0 +1,12 @@
+# Light rules for user-facing docs: catch broken Markdown, not house style.
+config:
+  default: true
+  MD013: false # long lines are fine
+  MD033: false # inline HTML is fine (the README header)
+  MD041: false # the README opens with an HTML logo, not a heading
+  MD022: false # a heading may sit directly on its list
+  MD032: false # a list may follow a paragraph or heading directly
+  MD036: false # release notes carry their date as an italic line
+  MD001: false # release notes go from the title straight to ### sections, as GitHub releases do
+  MD024:
+    siblings_only: true # the CHANGELOG repeats "### Music" under each release

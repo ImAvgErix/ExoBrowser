@@ -1,0 +1,932 @@
+import { spotifyMock } from './spotifyMock'
+import { mockAdmin, mockAppMessages, mockApps, mockChannels, mockFriends, mockHome, mockMembers, mockMessages, mockProfile } from './discordMock'
+/** Browser development fixtures. Dynamically loaded only outside the packaged host. */
+import type { Game, GameProperties, LauncherSettings, InstallProgress, ReplacedApp, StoreGift } from './host'
+import type { CaptureItem } from './capture'
+import { emitHostEvent } from './host'
+const MOCK_GAMES: Game[] = [
+  {
+    id: 'local:add',
+    title: 'Add portable game',
+    store: 'local',
+    installed: false,
+    owned: true,
+    canInstall: true,
+    primaryAction: 'install',
+    status: 'Ready',
+    deps: [],
+    launchNote: '',
+    isAddPortable: true,
+  },
+  {
+    id: 'mock:valorant',
+    title: 'VALORANT',
+    store: 'riot',
+    installed: false,
+    owned: true,
+    canInstall: true,
+    primaryAction: 'install',
+    status: 'Demo',
+    playtimeMinutes: 0,
+    sizeBytes: 30 * 1024 ** 3,
+    deps: ['Riot Client', 'Vanguard'],
+    launchNote: '',
+  },
+  {
+    id: 'mock:hades',
+    title: 'Hades',
+    store: 'steam',
+    installed: true,
+    owned: true,
+    primaryAction: 'play',
+    status: 'Ready',
+    playtimeMinutes: 1240,
+    sizeBytes: 15 * 1024 ** 3,
+    deps: ['Steam client'],
+    launchNote: '',
+    lastPlayedUtc: new Date(Date.now() - 26 * 3600_000).toISOString(),
+  },
+  {
+    id: 'mock:eldenring',
+    title: 'Elden Ring',
+    store: 'steam',
+    installed: true,
+    owned: true,
+    primaryAction: 'play',
+    status: 'Ready',
+    playtimeMinutes: 4380,
+    sizeBytes: 49 * 1024 ** 3,
+    deps: [],
+    launchNote: '',
+    lastPlayedUtc: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    isRunning: true,
+  },
+  {
+    id: 'mock:rivals',
+    title: 'Marvel Rivals',
+    store: 'steam',
+    installed: true,
+    owned: true,
+    primaryAction: 'play',
+    status: 'Ready',
+    playtimeMinutes: 3125,
+    sizeBytes: 74083193346,
+    deps: [],
+    launchNote: '',
+    lastPlayedUtc: new Date(Date.now() - 2 * 86400_000).toISOString(),
+  },
+  {
+    id: 'mock:fortnite',
+    title: 'Fortnite',
+    store: 'epic',
+    installed: true,
+    owned: true,
+    primaryAction: 'play',
+    status: 'Ready',
+    playtimeMinutes: 980,
+    sizeBytes: 31 * 1024 ** 3,
+    deps: [],
+    launchNote: '',
+  },
+  {
+    id: 'mock:cyberpunk',
+    title: 'Cyberpunk 2077',
+    store: 'gog',
+    installed: true,
+    owned: true,
+    primaryAction: 'play',
+    status: 'Ready',
+    playtimeMinutes: 2210,
+    sizeBytes: 70 * 1024 ** 3,
+    deps: [],
+    launchNote: '',
+    updateAvailable: true,
+    lastPlayedUtc: new Date(Date.now() - 5 * 86400_000).toISOString(),
+  },
+  {
+    id: 'mock:control',
+    title: 'Control',
+    store: 'epic',
+    installed: false,
+    owned: true,
+    canInstall: true,
+    primaryAction: 'install',
+    status: 'Demo',
+    playtimeMinutes: 720,
+    sizeBytes: 42 * 1024 ** 3,
+    deps: [],
+    launchNote: '',
+  },
+  {
+    id: 'mock:disco',
+    title: 'Disco Elysium',
+    store: 'gog',
+    installed: false,
+    owned: true,
+    canInstall: true,
+    primaryAction: 'install',
+    status: 'Demo',
+    playtimeMinutes: 2100,
+    sizeBytes: 20 * 1024 ** 3,
+    deps: [],
+    launchNote: '',
+  },
+]
+
+/** `?onboarding` in browser dev replays first-run setup against the mock. */
+const mockFirstRun = typeof location !== 'undefined' && new URLSearchParams(location.search).has('onboarding')
+
+/** `?shaders` in browser dev: an Exo Shaders engine with two games whose compile time a scan learns. */
+const mockShaders = typeof location !== 'undefined' && new URLSearchParams(location.search).has('shaders')
+let mockShadersScanned = false
+const mockShadersSnapshot = () => ({
+  rev: mockShadersScanned ? 2 : 1,
+  app: { scanning: false },
+  queue: { current: null, waiting: [], finished: [], running: false, paused: false, canStart: false },
+  games: [
+    { id: 'cyberpunk', name: 'Cyberpunk 2077', statusText: 'Ready to compile', tone: 'primary', inAddAllReady: true, actions: { compile: true }, compileTime: mockShadersScanned ? '1 h 5 min' : undefined },
+    { id: 'hogwarts', name: 'Hogwarts Legacy', statusText: 'Ready to compile', tone: 'primary', inAddAllReady: true, actions: { compile: true }, compileTime: mockShadersScanned ? '12 min' : undefined },
+  ],
+})
+
+/** `?gpu=amd` or `?gpu=intel` in browser dev: System's profile and a game's frame generation for that GPU instead of a GeForce. */
+const mockGpu = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('gpu') : null
+let mockFrameGen = 'game'
+
+/** `?cpu=intel` in browser dev: This PC and Settings' chipset switch for an Intel processor instead of a Ryzen. */
+const mockIntelCpu = typeof location !== 'undefined' && new URLSearchParams(location.search).get('cpu') === 'intel'
+
+// ?whatsnew: a user just updated to 3.14.0 from before What's New, so its sheet opens over the Library.
+const mockWhatsNew = typeof location !== 'undefined' && new URLSearchParams(location.search).has('whatsnew')
+
+// ?folders: two Library folders to start with, Hades in both, one sorted by time played.
+const mockFolders = typeof location !== 'undefined' && new URLSearchParams(location.search).has('folders')
+
+const mockSettings: LauncherSettings = {
+  onboardingComplete: !mockFirstRun,
+  appVersion: mockWhatsNew ? '3.14.0' : '1.0.0-dev',
+  whatsNewSeen: mockWhatsNew ? null : '1.0.0-dev',
+  reduceMotion: false,
+  framelessPinTop: false,
+  framelessPinSide: false,
+  textColour: 'white',
+  textSize: 'normal',
+  sortMode: 'name',
+  steamWebApiKeySet: false,
+  itchApiKeySet: false,
+  riotId: null,
+  riotHoursImported: false,
+  recent: [],
+  showLibraryTools: false,
+  countHoursAcrossAccounts: false,
+  hdrForGames: false,
+    hdrSdrGamma: true,
+    discordNoiseSuppression: true,
+    discordQuietWhilePlaying: true,
+  igdbTwitchClientIdSet: false,
+  igdbTwitchClientSecretSet: false,
+  igdbTwitchConnected: false,
+  steamGridDbKeySet: false,
+  openXblKeySet: false,
+  autoUpdateChipset: true,
+  chipset: mockIntelCpu ? 'intel' : 'amd',
+  ...(mockFolders ? {
+    libraryFolders: [
+      { id: 'mockfav', name: 'Favorites', color: 'blue', sort: 'played', games: ['mock:hades', 'mock:eldenring', 'mock:valorant'] },
+      { id: 'mockrogue', name: 'Roguelikes', color: 'orange', games: ['mock:hades'] },
+    ],
+  } : {}),
+}
+
+/** The browser mock has no file dialog and no cover cache to copy a picture into. */
+const MOCK_NO_PICKER = 'Browser mock — picking a picture needs the Exo host.'
+
+let mockProgress: InstallProgress = {
+  gameId: '',
+  phase: 'idle',
+  status: '',
+  canCancel: false,
+  isActive: false,
+}
+
+type MockHandler = (params?: Record<string, unknown>) => unknown
+
+function mockParamId(params?: Record<string, unknown>): string {
+  return String(params?.id ?? '')
+}
+
+function mockLibraryGet() {
+  return {
+    games: MOCK_GAMES,
+    count: MOCK_GAMES.length,
+    stores: mockStoresMatrix(),
+    progress: mockProgress,
+    sortMode: mockSettings.sortMode,
+    recent: mockSettings.recent,
+  }
+}
+
+function mockGameGet(params?: Record<string, unknown>) {
+  const id = mockParamId(params)
+  const game = MOCK_GAMES.find((g) => g.id === id)
+  return game ? { ok: true, game } : { ok: false, message: 'Game not found.' }
+}
+
+function mockGameInstall(params?: Record<string, unknown>) {
+  const id = mockParamId(params)
+  mockProgress = {
+    gameId: id,
+    phase: 'downloading',
+    percent: 42,
+    bytesPerSecond: 12.5 * 1024 * 1024,
+    status: 'Mock progress (host required for real install)',
+    canCancel: true,
+    isActive: true,
+  }
+  emitHostEvent('install.progress', mockProgress)
+  return {
+    ok: false,
+    message: 'Browser mock — install only works inside the WinUI host.',
+    progress: mockProgress,
+  }
+}
+
+function mockArtRefresh(reset: boolean): MockHandler {
+  return (params) => {
+    const id = mockParamId(params)
+    const index = MOCK_GAMES.findIndex((game) =>
+      game.id === id || game.variants?.some((variant) => variant.id === id),
+    )
+    if (index < 0) return { ok: false, message: 'Game not found.' }
+    const current = MOCK_GAMES[index]
+    const next: Game = {
+      ...current,
+      ...(reset ? { coverUrl: null, coverSource: null } : {}),
+      artRevision: (current.artRevision ?? 0) + 1,
+    }
+    MOCK_GAMES[index] = next
+    emitHostEvent('library.updated', { games: [...MOCK_GAMES], count: MOCK_GAMES.length })
+    return {
+      ok: true,
+      message: reset ? 'Cover reset.' : 'Artwork refreshed.',
+      game: next,
+      artRevision: next.artRevision,
+    }
+  }
+}
+
+/** The host binds the game process a moment after launch and pushes each change. */
+function mockRunState(running: boolean): MockHandler {
+  return (params) => {
+    const id = mockParamId(params)
+    const index = MOCK_GAMES.findIndex((game) => game.id === id)
+    if (index < 0 || !MOCK_GAMES[index].installed) return { ok: false, message: 'Browser mock — only installed demo games run.' }
+    setTimeout(() => {
+      MOCK_GAMES[index] = { ...MOCK_GAMES[index], isRunning: running, canStop: running }
+      emitHostEvent('game.runState', { id, isRunning: running, canStop: running })
+    }, running ? 1200 : 150)
+    return { ok: true, message: running ? 'Mock: game started.' : 'Game closed.' }
+  }
+}
+
+/** One game ships DLSS in two folders; one copy is Exo's, one is the game's own. */
+/** Games Update all brought up in this mock session: every file current from then on. */
+const mockDlssUpdated = new Set<string>()
+
+function mockDlssStatus(params?: Record<string, unknown>) {
+  if (mockDlssUpdated.has(String(params?.id))) {
+    return { ok: true, items: [{ key: 'nvngx_dlss.dll', fileName: 'nvngx_dlss.dll', folder: null, displayName: 'DLSS Super Resolution', currentVersion: '310.9.1', currentRelease: 'dlss-310.9.1', latestVersion: '310.9.1', latestRelease: 'dlss-310.9.1', state: 'current', origin: 'exo', originalVersion: '310.2.1', originalState: 'saved', canUpdate: false, canRestore: true }] }
+  }
+  return {
+    ok: true,
+    items: [
+      { key: 'nvngx_dlss.dll', fileName: 'nvngx_dlss.dll', folder: null, displayName: 'DLSS Super Resolution', currentVersion: '310.9.1', currentRelease: 'dlss-310.9.1', latestVersion: '310.9.1', latestRelease: 'dlss-310.9.1', state: 'current', origin: 'exo', originalVersion: '310.2.1', originalState: 'saved', canUpdate: false, canRestore: true },
+      { key: 'Engine/Plugins/DLSS/nvngx_dlss.dll', fileName: 'nvngx_dlss.dll', folder: 'Engine/Plugins/DLSS', displayName: 'DLSS Super Resolution', currentVersion: '310.2.1', latestVersion: '310.9.1', latestRelease: 'dlss-310.9.1', state: 'outdated', origin: 'reverted', originalVersion: '310.2.1', originalState: 'saved', canUpdate: true, canRestore: false },
+    ],
+  }
+}
+
+
+/** Shaders per demo game, as the Exo Shaders engine would list them. */
+function mockShadersStatus(params?: Record<string, unknown>) {
+  switch (String(params?.id ?? '')) {
+    case 'mock:valorant': return { ok: true, state: 'unsupported', reason: 'Needs a recording, which its anti-cheat blocks.' }
+    case 'mock:control': return { ok: true, state: 'warmed', reason: 'Compiled for driver 617.42.', warmed: { at: '2026-10-12T21:04:00-05:00', driver: '617.42' } }
+    case 'mock:disco': return { ok: true, state: 'stale', reason: 'Driver changed' }
+    default: return { ok: true, state: 'ready' }
+  }
+}
+
+function mockCancelInstall() {
+  mockProgress = { ...mockProgress, phase: 'cancelled', isActive: false, canCancel: false, status: 'Canceled.' }
+  return { ok: true, message: 'Cancel requested.' }
+}
+
+let MOCK_GIFTS: StoreGift[] = [
+  { store: 'steam', id: '237160366753599703', title: 'Hollow Signal', image: null, sender: 'Rocket alt', message: null },
+  { store: 'epic', id: 'a1b2c3d4e5f6', title: 'Night Harbor', image: null, sender: 'Mira', message: 'Happy birthday! Saw you wishlisted this.' },
+]
+
+let MOCK_REPLACED: ReplacedApp[] = [
+  { id: 'discord', name: 'Discord', detail: 'Exo has its own Discord: servers, DMs and calls', installed: true, leftovers: 9, bytes: 412_000_000, needsAdmin: false },
+  { id: 'snipping', name: 'Snipping Tool', detail: 'Exo snips with Print Screen and edits in Captures', installed: true, leftovers: 0, bytes: 0, needsAdmin: false },
+  { id: 'photos', name: 'Photos', detail: 'Exo shows and trims your captures', installed: true, leftovers: 0, bytes: 0, needsAdmin: false },
+  { id: 'gamebar', name: 'Xbox Game Bar', detail: 'Exo records clips and replays', installed: true, leftovers: 0, bytes: 0, needsAdmin: false },
+  { id: 'clipchamp', name: 'Clipchamp', detail: 'Exo trims and shares your clips', installed: false, leftovers: 0, bytes: 0, needsAdmin: false },
+  { id: 'nvidia', name: 'NVIDIA App', detail: 'Exo updates the driver and sets its profile; the driver stays', installed: true, leftovers: 6, bytes: 1_300_000_000, needsAdmin: true },
+]
+
+function mockDepsList() {
+  return {
+    items: [
+      { id: 'vcredist', name: 'Visual C++ Redistributable', status: 'Present', detail: 'Mock', canOfferInstall: true },
+      { id: 'directx', name: 'DirectX', status: 'Present', detail: 'Mock', canOfferInstall: true },
+      { id: 'dotnet', name: '.NET Desktop Runtime', status: 'Present', detail: 'Mock', canOfferInstall: true },
+      { id: 'webview2', name: 'WebView2 Runtime', status: 'Present', detail: 'Mock', canOfferInstall: true },
+    ],
+  }
+}
+
+function mockStoresCheck() {
+  return {
+    state: 'complete',
+    checkedAtUtc: new Date().toISOString(),
+    code: 'local_check_complete',
+    stores: [
+      {
+        store: 'local',
+        client: 'missing',
+        backend: 'present',
+        session: 'present',
+        cache: 'present',
+        readiness: 'ready',
+        code: 'ready',
+      },
+    ],
+  }
+}
+
+function mockStoresMatrix() {
+  return [
+    {
+      store: 'local',
+      displayName: 'Local',
+      agentPresent: true,
+      backendPresent: true,
+      signedIn: true,
+      cachePresent: true,
+      detail: 'Ready',
+      checkCode: 'checked',
+      checkedAtUtc: new Date().toISOString(),
+    },
+    { store: 'steam', displayName: 'Steam', agentPresent: true, clientPresent: true, backendPresent: true, signedIn: true },
+    { store: 'epic', displayName: 'Epic Games', agentPresent: true, clientPresent: true, backendPresent: true, signedIn: false },
+    { store: 'gog', displayName: 'GOG', agentPresent: true, clientPresent: false, backendPresent: true, signedIn: false },
+    { store: 'riot', displayName: 'Riot Games', agentPresent: true, clientPresent: true, signedIn: true },
+  ]
+}
+
+function mockAbsorbSecretFlags(next: Record<string, unknown>) {
+  if (typeof next.steamWebApiKey === 'string') {
+    mockSettings.steamWebApiKeySet = next.steamWebApiKey.trim().length > 0
+    delete next.steamWebApiKey
+  }
+  if (typeof next.itchApiKey === 'string') {
+    mockSettings.itchApiKeySet = next.itchApiKey.trim().length > 0
+    delete next.itchApiKey
+  }
+  if (typeof next.igdbTwitchClientId === 'string') {
+    mockSettings.igdbTwitchClientIdSet = next.igdbTwitchClientId.trim().length > 0
+    delete next.igdbTwitchClientId
+  }
+  if (typeof next.igdbTwitchClientSecret === 'string') {
+    mockSettings.igdbTwitchClientSecretSet = next.igdbTwitchClientSecret.trim().length > 0
+    delete next.igdbTwitchClientSecret
+  }
+  if (typeof next.steamGridDbKey === 'string') {
+    mockSettings.steamGridDbKeySet = next.steamGridDbKey.trim().length > 0
+    delete next.steamGridDbKey
+  }
+  if (typeof next.openXblKey === 'string') {
+    mockSettings.openXblKeySet = next.openXblKey.trim().length > 0
+    delete next.openXblKey
+  }
+}
+
+function mockAbsorbIdSettings(next: Record<string, unknown>) {
+  if (typeof next.riotId === 'string') {
+    const trimmed = next.riotId.trim()
+    mockSettings.riotId = trimmed.length > 0 ? trimmed : null
+    delete next.riotId
+  }
+}
+
+/** Two captures, so Favorite and its chip can be tried without the add-on. */
+const mockCaptures: CaptureItem[] = [
+  { id: 'cap0000000000001', kind: 'image', game: 'Desktop', name: 'Snip 1', created: '2026-10-19T16:08:00Z', size: 120_000, favourite: false, url: '', thumb: null },
+  { id: 'cap0000000000002', kind: 'video', game: 'Elden Ring', gameId: 'steam:1245620', name: 'Clip 1', created: '2026-10-18T20:00:00Z', size: 48_000_000, durationMs: 60_000, favourite: false, url: '', thumb: null },
+]
+
+function mockCaptureItem(params?: Record<string, unknown>) {
+  const at = mockCaptures.findIndex(item => item.id === mockParamId(params))
+  if (at < 0) return { ok: false, message: 'That capture is gone.' }
+  if (params?.action === 'favourite' || params?.action === 'unfavourite') mockCaptures[at] = { ...mockCaptures[at], favourite: params.action === 'favourite' }
+  return { ok: true, item: mockCaptures[at] }
+}
+
+function mockSettingsSet(params?: Record<string, unknown>) {
+  const next = { ...(params ?? {}) } as Record<string, unknown>
+  mockAbsorbSecretFlags(next)
+  mockAbsorbIdSettings(next)
+  Object.assign(mockSettings, next)
+  delete (mockSettings as { steamWebApiKey?: string }).steamWebApiKey
+  delete (mockSettings as { itchApiKey?: string }).itchApiKey
+  return { ...mockSettings }
+}
+
+// Discord settings > Voice & Video and the rest, kept for the session so the pages can be clicked through.
+let mockDiscordClient: Record<string, unknown> = {
+  inputProfile: 'exo', noiseSuppression: true, noiseSuppressionKind: 'ai', othersNoiseSuppression: false, onlyMyVoice: false, myVoiceLearned: false, evenVoices: true, echoCancellation: true, voiceFocus: true, pushToTalk: false, pttDelay: 20,
+  autoSensitivity: true, sensitivity: -60, attenuation: 0, attenuateSelf: false, attenuateOthers: true, keybinds: [], desktopNotifications: true,
+  unreadBadge: true, taskbarFlash: true, disabledSounds: [], disableAllSounds: false, selectedChannelSound: false, soundVolume: 60,
+}
+
+const mockOk: MockHandler = () => ({ ok: true })
+
+const GB = 1024 ** 3
+/** Properties as the host builds them: Marvel Rivals' real Steam shape (its High-Resolution Pack switched off), an Epic game's optional content. */
+const mockProperties: Record<string, GameProperties> = {}
+const STEAM_PROPERTIES: Partial<GameProperties> = {
+  verifyLabel: 'Verify files',
+  autoUpdate: '0',
+  autoUpdateChoices: [
+    { value: '0', label: "Use Steam's setting" }, { value: '3', label: 'Keep it up to date' },
+    { value: '1', label: 'Only when I launch it' }, { value: '2', label: 'Before other games' },
+  ],
+  background: '0',
+  backgroundChoices: [{ value: '0', label: "Use Steam's setting" }, { value: '1', label: 'Always allow' }, { value: '2', label: 'Never' }],
+  cloud: true,
+  language: 'english',
+  languageChoices: [
+    { value: 'english', label: 'English', sizeBytes: 0 }, { value: 'french', label: 'French', sizeBytes: 0 },
+    { value: 'german', label: 'German', sizeBytes: 0 }, { value: 'japanese', label: 'Japanese', sizeBytes: 0 },
+    { value: 'schinese', label: 'Simplified Chinese', sizeBytes: 0 },
+  ],
+  beta: '',
+  betaChoices: [{ value: '', label: 'None' }],
+  betaCode: true,
+  // A pack with files has a switch; cosmetics (no files) say whether the account holds them, as 007 First Light's do.
+  content: [
+    { id: '4406010', name: 'Marvel Rivals - High-Resolution Pack', enabled: false, sizeBytes: 22376494559, toggle: true, state: null },
+    ...['Day of the Dead (Exclusive Outfit)', 'Desert Explorer (Exclusive Outfit)', 'Gentleman Operator (Exclusive Outfit)',
+      'Silent Anchor (Exclusive Outfit)', 'Gleaming Earphones (Gadget Skin)', 'Gleaming Lighter (Gadget Skin)', 'Gleaming Pen (Gadget Skin)',
+      'Gleaming Phone (Gadget Skin)', "Agent's Mark (Weapon Skin)", 'Deluxe Edition Upgrade']
+      .map((name, index) => ({ id: String(3950810 + index), name, enabled: true, sizeBytes: null, toggle: false, state: 'Owned' })),
+    { id: '4707780', name: 'Season Pass', enabled: true, sizeBytes: null, toggle: false, state: 'Not owned' },
+  ],
+  folder: '0',
+  folderChoices: [{ value: '0', label: 'C:', detail: '412 GB free' }, { value: '1', label: 'D:', detail: '1210 GB free' }],
+  storeProperties: 'Steam',
+  overlay: false,
+}
+const EPIC_PROPERTIES: Partial<GameProperties> = {
+  cloudSync: true,
+  contentLabel: 'Optional content',
+  content: [
+    { id: 'hd_textures', name: 'High Resolution Textures', enabled: true, sizeBytes: 22 * GB, toggle: true, state: null },
+    { id: 'stw', name: 'Fortnite Save the World', enabled: false, sizeBytes: 9 * GB, toggle: true, state: null },
+  ],
+}
+function mockPropertiesFor(id: string): GameProperties {
+  const game = MOCK_GAMES.find(entry => entry.id === id)
+  mockProperties[id] ??= {
+    ok: true, store: game?.store ?? 'local', launchOptions: '', sizeBytes: game?.sizeBytes ?? null, verifyLabel: 'Repair',
+    canBrowse: true, running: !!game?.isRunning, autoUpdate: null, autoUpdateChoices: [], background: null, backgroundChoices: [],
+    cloud: null, cloudSync: false, language: null, languageChoices: [], beta: null, betaChoices: [], betaCode: false,
+    contentLabel: 'DLC', content: null, folder: null, folderChoices: [], moving: null, storeProperties: null, overlay: null,
+    ...(game?.store === 'steam' ? STEAM_PROPERTIES : game?.store === 'epic' ? EPIC_PROPERTIES : {}),
+  }
+  return mockProperties[id]
+}
+
+function mockSetProperty(params?: Record<string, unknown>) {
+  const id = String(params?.id ?? '')
+  const key = String(params?.key ?? '')
+  const value = String(params?.value ?? '')
+  const current = mockPropertiesFor(id)
+  if (key === 'betaCode') return { ok: false, message: 'Steam did not accept that code.' }
+  const next: GameProperties = { ...current }
+  let message: string | null = null
+  if (key === 'content') {
+    const [itemId, state] = value.split(':')
+    next.content = (current.content ?? []).map(item => item.id === itemId ? { ...item, enabled: state === 'on' } : item)
+    message = state === 'on' ? 'Steam is downloading it.' : 'Steam is removing its files.'
+  } else if (key === 'launchOptions') next.launchOptions = value
+  else if (key === 'cloud') next.cloud = value === 'on'
+  else if (key === 'overlay') next.overlay = value === 'on'
+  else if (key === 'autoUpdate') next.autoUpdate = value
+  else if (key === 'background') next.background = value
+  else if (key === 'language') { next.language = value; message = 'Steam is updating the game.' }
+  else if (key === 'storeProperties') message = "Opened in Steam. Its Properties are under the gear on the game's page."
+  mockProperties[id] = next
+  return { ok: true, message, properties: next }
+}
+
+// Go Live's picker in the browser: a game, two windows and two screens, drawn as gradients.
+const goLivePicture = (from: string, to: string) => `data:image/svg+xml,${encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="${from}"/><stop offset="1" stop-color="${to}"/></linearGradient></defs><rect width="640" height="360" fill="url(#g)"/></svg>`)}`
+const mockFavoriteEmojis = ['heart', 'fire', '968812152267866172']
+const mockFavoriteStickers = ['749054660769218631']
+
+const mockGoLive = [
+  { id: 'screen:1', kind: 'screen', title: 'Screen 1', app: 'Screen', thumb: goLivePicture('#1d2b64', '#f8cdda') },
+  { id: 'screen:2', kind: 'screen', title: 'Screen 2', app: 'Screen', thumb: goLivePicture('#0f2027', '#2c5364') },
+  { id: 'window:1', kind: 'window', title: 'VALORANT', app: 'VALORANT', thumb: goLivePicture('#ff4655', '#0f1923'), game: 'VALORANT' },
+  { id: 'window:2', kind: 'window', title: 'Exo Launcher - GitHub - Google Chrome', app: 'Google Chrome', thumb: goLivePicture('#232526', '#414345') },
+  { id: 'window:3', kind: 'window', title: 'notes.txt - Notepad', app: 'Notepad', thumb: null },
+]
+const mockGoLiveHandler: MockHandler = (params?: { action?: string; source?: string }) => {
+  if (params?.action === 'sources') return { ok: true, sources: mockGoLive }
+  if (params?.action === 'preview') return { ok: true, thumb: (mockGoLive.find(s => s.id === params.source) ?? mockGoLive[0]).thumb }
+  if (params?.action === 'start') {
+    const title = mockGoLive.find(s => s.id === params.source)?.title ?? null
+    setTimeout(() => emitHostEvent('discord.golive', { state: 'live', title }), 400)
+    setTimeout(() => emitHostEvent('discord.golive.stats', { width: 1920, height: 1080, fps: 60, bitrate: 8_100_000 }), 1400)
+    return { ok: true }
+  }
+  if (params?.action === 'stop') setTimeout(() => emitHostEvent('discord.golive', { state: 'off' }), 50)
+  return { ok: true }
+}
+
+const mockCaptureState = {
+  present: true, running: true, buffering: true, recording: false, recordingMs: 0, codec: 'HEVC',
+  encoder: 'NVIDIA HEVC Encoder MFT', hdr: false, hotkeys: { saveReplay: true, record: true, snip: true, printScreen: true },
+}
+const mockCaptureSettings: Record<string, unknown> = {
+  quality: 50, replaySeconds: 60, maxFps: 60, replayMode: 'games',
+  cursor: true, saveReplayKeys: 'Ctrl+Alt+F10', recordKeys: 'Ctrl+Alt+F9', snipKeys: 'Ctrl+Alt+F8', printScreen: false,
+  folder: 'C:\\Users\\Player\\Videos\\Exo Captures', keepGb: 0, keepDays: 0,
+}
+
+/** One Store game with Steam's longest kind of page (a long description and requirements), to lay the game page out against. */
+const MOCK_STORE_TILE = { appId: '1091500', name: 'Cyberpunk 2077', final: 2999, initial: 5999, discount: 50, currency: 'USD', priceText: '$29.99', wasText: '$59.99' }
+function mockStoreGame() {
+  const art = (file: string) => `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1091500/${file}`
+  return {
+    ok: true, ...MOCK_STORE_TILE, comingSoon: false, released: 'Dec 9, 2020', free: false,
+    description: 'Cyberpunk 2077 is an open-world, action-adventure RPG set in the dark future of Night City — a dangerous megalopolis obsessed with power, glamor, and ceaseless body modification. Play as V, a cyberpunk mercenary, and take on the most powerful forces of the city in a fight for glory and survival. Explore a vast city of the future where your choices shape the story and the world around you, with a branching narrative, deep character customization, and the Phantom Liberty expansion.',
+    developers: ['CD PROJEKT RED'], publishers: ['CD PROJEKT RED'], genres: ['RPG'], metacritic: 86,
+    reviewWord: 'Very Positive', reviewPercent: 88, reviewCount: 812345,
+    tags: ['Cyberpunk', 'Open World', 'RPG', 'Sci-fi', 'Singleplayer', 'Story Rich', 'Atmospheric'],
+    offers: [{ store: '1', name: 'Steam', final: 2999, initial: 5999, discount: 50, currency: 'USD', priceText: '$29.99', wasText: '$59.99', url: 'https://store.steampowered.com/app/1091500' }],
+    media: [],
+    screenshots: Array.from({ length: 10 }, (_, i) => `${art(i % 2 ? 'library_hero.jpg' : 'header.jpg')}?${i}`),
+    specs: [
+      { label: 'OS', minimum: 'Windows 10', recommended: 'Windows 10', mine: 'Windows 11', meets: 'recommended' },
+      { label: 'Processor', minimum: 'i7-6700 · Ryzen 5 1600', recommended: 'i7-12700 · Ryzen 7 7800X3D', mine: 'Ryzen 7 9800X3D', meets: 'recommended' },
+      { label: 'Graphics', minimum: 'GTX 1060 · RX 580 · Arc A380', recommended: 'RTX 2060 Super · RX 5700 XT · Arc A770', mine: 'RTX 4080 Super', meets: 'recommended' },
+      { label: 'Memory', minimum: '12 GB', recommended: '16 GB', mine: '32 GB', meets: 'recommended' },
+      { label: 'Storage', minimum: '70 GB SSD', recommended: '70 GB SSD', mine: '412 GB free', meets: 'recommended' },
+      { label: 'DirectX', minimum: 'DirectX 12', recommended: 'DirectX 12', mine: null, meets: null },
+    ],
+    fit: 'recommended',
+  }
+}
+
+const MOCK_HANDLERS: Record<string, MockHandler> = {
+  ...spotifyMock,
+  'library.get': mockLibraryGet,
+  'library.refresh': mockLibraryGet,
+  'game.get': mockGameGet,
+  'game.launch': mockRunState(true),
+  'game.stop': mockRunState(false),
+  'game.install': mockGameInstall,
+  'game.update': mockGameInstall,
+  'game.resumeDownload': () => ({ ok: false, message: 'Browser mock — saved downloads resume only inside the Exo host.' }),
+  'game.uninstall': () => ({ ok: false, message: 'Browser mock.' }),
+  'game.openFolder': mockOk,
+  'game.properties': (params) => mockPropertiesFor(String(params?.id ?? '')),
+  'game.properties.set': mockSetProperty,
+  'art.replace': () => ({ ok: false, cancelled: false, message: MOCK_NO_PICKER }),
+  'art.reset': mockArtRefresh(true),
+  'art.refetch': mockArtRefresh(false),
+  // No cover cache here: the picture comes back as itself.
+  'library.folderArt': (params) => ({ ok: true, art: `data:image/png;base64,${String(params?.image ?? '')}` }),
+  'library.refreshAll': () => ({ ok: true, achievements: 0, covers: 0 }),
+  'game.repair': () => ({ ok: true, queued: false, message: 'Mock: would verify files.' }),
+  'game.extras': () => ({ ok: true, achievementsUnlocked: 23, achievementsTotal: 50 }),
+  'game.cancelInstall': mockCancelInstall,
+  'game.dequeue': mockOk,
+  'game.progress': () => mockProgress,
+  'stores.auth': () => ({ ok: false, message: 'Browser mock — auth requires host.', requiresUserAction: true }),
+  'playtime.refresh': () => ({ ok: false, message: 'Hours are read in the app only.' }),
+  'playtime.riotRefresh': () => ({
+    ok: false,
+    profilePrivate: true,
+    message:
+      'This tracker.gg profile is private. Sign in with Riot on tracker.gg once so the profile is public.',
+    profileUrl: 'https://tracker.gg/valorant',
+  }),
+  'web.preferences.get': () => ({ microphone: 'ask', camera: 'ask', clipboard: 'ask', notifications: 'ask' }),
+  'shaders.addon': () => ({ ok: true, present: mockShaders }),
+  'capture.status': () => ({ ok: true, state: mockCaptureState, settings: mockCaptureSettings }),
+  'capture.settings': (params) => {
+    Object.assign(mockCaptureSettings, params)
+    return { ok: true, state: mockCaptureState, settings: mockCaptureSettings }
+  },
+  'capture.act': () => ({ ok: true, state: mockCaptureState }),
+  'capture.list': () => ({ ok: true, items: mockCaptures }),
+  'capture.item': mockCaptureItem,
+  'capture.edit': () => ({ ok: false, message: 'Mock: no capture add-on.' }),
+  'capture.saveImage': () => ({ ok: false, message: 'Mock: no capture add-on.' }),
+  'shell.pickProgram': () => ({ ok: false, cancelled: true }),
+  'shaders.call': (params) => {
+    if (!mockShaders) return { ok: false, message: 'Mock: no shader add-on.' }
+    if (params?.method === 'scan') mockShadersScanned = true
+    return { ok: true, result: params?.method === 'snapshot' ? mockShadersSnapshot() : {} }
+  },
+  'shaders.estimates': () => ({ ok: true, seconds: {} }),
+  'friends.badge': () => ({ count: 0 }),
+  'desktopClients.status': () => ({
+    ok: true,
+    apps: [
+      { id: 'discord', title: 'Discord', state: 'installed' },
+      { id: 'spotify', title: 'Spotify', state: 'notInstalled' },
+    ],
+  }),
+  'desktopClients.install': mockOk,
+  'discord.status': () => ({ state: 'ready', signedIn: true }),
+  'discord.signIn': mockOk,
+  'discord.signOut': mockOk,
+  'discord.home': () => mockHome,
+  'discord.channels': () => mockChannels,
+  'discord.admin': mockAdmin,
+  'discord.messages': (params?: { before?: string }) => ({ ok: true, messages: params?.before ? [] : [...mockMessages, ...mockAppMessages].reverse() }),
+  'discord.apps': (params?: { action?: string }) => params?.action === 'commands' ? mockApps : { ok: true, nonce: '900000000000000001' },
+  'discord.send': mockOk,
+  'discord.edit': mockOk,
+  'discord.delete': mockOk,
+  'discord.ack': mockOk,
+  'discord.thread': () => ({ ok: true, thread: { id: '600000000000000003', name: 'New post' } }),
+  'discord.typing': mockOk,
+  'discord.upload': () => ({ ok: true, uploadId: 'mock' }),
+  'discord.react': mockOk,
+  'discord.emojis': () => ({ premium: false, guilds: [{ id: '200000000000000001', name: 'Exo Lab', icon: null, emojis: [{ id: '968812152267866172', name: 'Troll', animated: false, native: true }, { id: '968812607832203274', name: 'Yoshi', animated: false, native: false }] }] }),
+  'discord.emojiFavorites': (p?: { action?: string; emoji?: string }) => {
+    if (p?.emoji && p.action === 'add' && !mockFavoriteEmojis.includes(p.emoji)) mockFavoriteEmojis.push(p.emoji)
+    if (p?.emoji && p.action === 'remove') mockFavoriteEmojis.splice(mockFavoriteEmojis.indexOf(p.emoji), 1)
+    return { ok: true, favorites: [...mockFavoriteEmojis], frequent: ['joy', 'thumbsup', 'fire', '968812152267866172', 'heart', 'skull', 'sob', 'eyes', 'pray', 'copyright'], reactions: ['thumbsup', 'joy', 'heart'] }
+  },
+  'discord.view': mockOk,
+  'discord.voice': (params?: { action?: string; guildId?: string; channelId?: string }) => ({ ok: true, voice: params?.action === 'join' ? { state: 'connected', guildId: params.guildId ?? null, channelId: params.channelId ?? null, muted: false, deafened: false, e2ee: true } : { state: 'off', guildId: null, channelId: null, muted: false, deafened: false, e2ee: false } }),
+  'discord.ring': mockOk,
+  'discord.golive': mockGoLiveHandler,
+  'discord.friends': () => ({ friends: mockFriends }),
+  'discord.friend': mockOk,
+  'discord.markRead': mockOk,
+  'discord.channel': () => ({ ok: true, muted: true, url: 'https://discord.gg/exo' }),
+  'discord.mentions': () => ({ ok: true, messages: mockMessages.filter(m => m.mentions.length), places: { '400000000000000002': { name: 'general', guildId: '300000000000000001', guild: 'Exo Squad', parentId: null } } }),
+  'discord.forYou': () => ({ ok: true, hasMore: false, items: [
+    { id: '1300000000000000000', type: 'friend_request_accepted', body: '**Kai** accepted your friend request.', acked: false, other_user: mockMessages[2].author },
+    { id: '1290000000000000000', type: 'scheduled_guild_event_started', body: '**Scrim night** is starting in **Exo Squad**.', acked: true, deeplink: 'https://discord.com/channels/300000000000000001/400000000000000002' },
+  ] }),
+  'discord.unreads': () => ({ channels: [
+    { channelId: '400000000000000002', name: 'general', guildId: '300000000000000001', guild: 'Exo Squad', icon: null, parentId: null, lastRead: '500000000000000008', lastMessage: '500000000000000012', mentions: 1 },
+  ] }),
+  'discord.reactors': () => ({ ok: true, canRemove: true, users: mockMessages.slice(0, 3).map(m => m.author) }),
+  'discord.fileText': () => ({ ok: true, left: 0, text: 'sensitivity "0.42"\nm_yaw "0.022"\nfps_max "0"\ncl_crosshairsize "2"\ncl_crosshairgap "-2"\ncl_crosshaircolor "1"\nbind "mouse4" "+voicerecord"\nbind "f" "+lookatweapon"\nhost_writeconfig\n' }),
+  'discord.audio': () => ({ inputs: [{ id: 'mic', name: 'Microphone' }], outputs: [{ id: 'spk', name: 'Speakers' }], input: null, output: null, inputVolume: 100, outputVolume: 100, soundboardVolume: 100, soundboardMuted: false }),
+  'discord.userSettings': (params?: { changes?: Record<string, unknown> }) => ({ ok: true, values: params?.changes ?? {} }),
+  'discord.account': (params?: { action?: string }) => params?.action === 'me'
+    ? { ok: true, me: { id: '1', username: 'exo', globalName: 'Exo', avatar: null, banner: null, accentColor: null, bio: '', pronouns: '', email: 'e***@example.com', phone: null, verified: true, mfa: false, nsfwAllowed: true, premium: false } }
+    : { ok: true, data: params?.action === 'consent' ? { usageStatistics: true, personalization: true } : [] },
+  'discord.clientSettings': (params?: Record<string, unknown>) => (mockDiscordClient = { ...mockDiscordClient, ...params }),
+  'discord.micTest': mockOk,
+  'discord.voiceTune': () => ({ ok: false, message: 'Voice Tune needs Exo.' }),
+  'discord.voiceCheck': () => ({ ok: false, message: 'Voice Check needs Exo.' }),
+  'discord.sound': mockOk,
+  'discord.server': (p?: { action?: string; invite?: string }) => p?.action === 'invite'
+    ? p.invite === 'expired' ? { ok: false, invalid: true, message: 'Discord: Unknown Invite' }
+      : { ok: true, invite: p.invite === 'exo'
+        ? { guildId: '300000000000000001', channelId: '400000000000000002', name: 'Exo Squad', icon: null, verified: false, partnered: false, online: 12, members: 48, joined: true }
+        : { guildId: '300000000000000009', channelId: '400000000000000090', name: 'VALORANT', icon: 'https://cdn.discordapp.com/embed/avatars/0.png', verified: true, partnered: false, online: 182340, members: 1204512, joined: false } }
+    : p?.action === 'members'
+    ? { ok: true, roles: { '300000000000000001': { name: 'Mods', color: '#e91e63', position: 2 } }, members: { total_result_count: 1, members: [{ member: { user: { id: '100000000000000002', username: 'ada', global_name: 'Ada' }, roles: ['300000000000000001'], joined_at: '2026-09-01T12:00:00Z' }, source_invite_code: 'exo' }] } }
+    : p?.action === 'events'
+    ? { ok: true, events: [{ interested: false, event: { id: '700000000000000001', name: 'Ranked night', scheduled_start_time: '2026-10-20T01:00:00Z', status: 1, user_count: 6, entity_metadata: { location: 'Voice' } } }] }
+    : p?.action === 'guide'
+      ? { ok: true, guide: { welcome_message: { message: 'Read the rules, grab a role, say hi.' }, new_member_actions: [{ channel_id: '400000000000000001', title: 'Say hi', description: 'Introduce yourself', emoji: { name: '👋' } }], resource_channels: [] } }
+      : { ok: true },
+  'discord.profile': (p?: { mutualFriends?: boolean; note?: string }) => p?.mutualFriends ? { ok: true, friends: [{ id: '100000000000000003', username: 'kai', global_name: 'Kai' }] } : p?.note !== undefined ? mockOk() : mockProfile,
+  'discord.threads': () => ({ ok: true, threads: [{ id: '600000000000000001', name: 'Best crosshair codes?', parent_id: '400000000000000007', message_count: 42 }, { id: '600000000000000002', name: 'Patch 9.2 tier list', parent_id: '400000000000000007', message_count: 7 }] }),
+  'discord.stickers': (p?: { action?: string; stickerId?: string }) => {
+    if (p?.stickerId && p.action === 'add' && !mockFavoriteStickers.includes(p.stickerId)) mockFavoriteStickers.push(p.stickerId)
+    if (p?.stickerId && p.action === 'remove') mockFavoriteStickers.splice(mockFavoriteStickers.indexOf(p.stickerId), 1)
+    return { premium: false, favorites: [...mockFavoriteStickers], groups: [
+      { id: 'pack:847199849233514549', name: 'Wumpus Beyond', icon: null, usable: true, stickers: [{ id: '749054660769218631', name: 'Wave', format: 1 }, { id: '749052944682582036', name: 'Lurk', format: 1 }] },
+      { id: '300000000000000002', name: 'Frame Pacing Club', icon: null, usable: false, stickers: [{ id: '749043879713767424', name: 'Hi', format: 1 }] },
+    ] }
+  },
+  'discord.sticker': mockOk,
+  'discord.pins': () => ({ ok: true, messages: [] }),
+  'discord.search': (p?: { filters?: { offset?: number } }) => ({ ok: true, result: { messages: mockMessages.slice(0, 4).map(m => [m]), total_results: 87 }, places: {}, offset: p?.filters?.offset }),
+  'discord.gifs': () => ({ ok: true, gifs: [] }),
+  'discord.members': () => mockMembers,
+  'discord.mentionable': (p?: { query?: string }) => ({ users: mockMessages.map(m => m.author).filter((u, i, all) => all.findIndex(x => x.id === u.id) === i && u.username.startsWith(p?.query ?? '')) }),
+  'discord.colors': () => ({ colors: { '100000000000000002': '#e91e63', '100000000000000004': '#3498db' } }),
+  'discord.setStatus': mockOk,
+  'web.preferences.set': (p) => ({ microphone: 'ask', camera: 'ask', clipboard: 'ask', notifications: 'ask', ...p }),
+  'shell.prepare': () => ({ ok: true }),
+  'shell.painted': () => ({ ok: true }),
+  'music.playback': () => ({ ok: true, playback: null }),
+  'music.setBounds': mockOk,
+  'music.install': mockOk,
+  'music.open': mockOk,
+  'music.volume': () => ({ ok: false, message: 'Open Exo to adjust music volume.' }),
+  'music.control': () => ({ ok: false, message: 'Open Exo to control music.' }),
+  'deps.list': mockDepsList,
+  'replaced.scan': () => ({ ok: true, cleared: 2, apps: MOCK_REPLACED }),
+  'replaced.remove': (p) => {
+    const id = (p as { id?: string } | undefined)?.id
+    MOCK_REPLACED = MOCK_REPLACED.map(app => app.id === id ? { ...app, installed: false, leftovers: 0, bytes: 0, needsAdmin: false } : app)
+    return { ok: true, removed: 9, left: 0, apps: MOCK_REPLACED }
+  },
+  'deps.offerInstall': () => ({ ok: true, message: 'Mock: would open official installer page.' }),
+  'deps.cancelInstall': () => ({ ok: true, message: 'Download canceled.' }),
+  'stores.check': mockStoresCheck,
+  'stores.matrix': mockStoresMatrix,
+  'settings.get': () => ({ ...mockSettings }),
+  'settings.set': mockSettingsSet,
+  'gifts.list': () => ({ ok: true, steamSignedIn: true, gifts: MOCK_GIFTS }),
+  'gifts.answer': (params) => {
+    const id = (params as { id?: string } | undefined)?.id
+    MOCK_GIFTS = MOCK_GIFTS.filter(gift => gift.id !== id)
+    return { ok: true, message: (params as { accept?: boolean } | undefined)?.accept ? 'Added to your library.' : 'Declined.' }
+  },
+  'gifts.steamSignIn': () => ({ ok: true, message: "Signed in to Steam's website." }),
+  'gifts.steamSignOut': () => ({ ok: true, message: "Signed out of Steam's website." }),
+  'accounts.list': () => ({
+    ok: true,
+    steam: {
+      current: 'Player One',
+      accounts: [
+        { key: 'mock-steam-main', name: 'Player One', current: true, remembered: true },
+        { key: 'mock-steam-alt', name: 'Rocket alt', current: false, remembered: true },
+        { key: 'mock-steam-old', name: 'Old login', current: false, remembered: false },
+      ],
+    },
+    riot: {
+      current: 'PlayerOne#NA1',
+      accounts: [
+        { key: 'mock-riot-main', name: 'PlayerOne#NA1', current: true, saved: true, lastIn: [] },
+        { key: 'mock-riot-val', name: 'Smurf#VAL', current: false, saved: true, lastIn: ['VALORANT'] },
+      ],
+    },
+    epic: { signedIn: true, name: 'PlayerOne', launcherDiffers: true, canImport: true, added: [{ key: 'mock-epic-alt', name: 'RocketAlt' }] },
+    gog: { signedIn: true, canSignOut: true },
+    amazon: { signedIn: false, name: null },
+  }),
+  'accounts.switch': () => ({ ok: false, message: 'Mock: switching accounts needs the Exo host.' }),
+  'accounts.signOut': () => ({ ok: false, message: 'Mock: signing out needs the Exo host.' }),
+  'accounts.add': () => ({ ok: false, message: 'Mock: adding an account needs the Exo host.' }),
+  'accounts.remove': () => ({ ok: false, message: 'Mock: removing an account needs the Exo host.' }),
+  'accounts.epicImport': () => ({ ok: false, message: 'Mock: needs the Exo host.' }),
+  'accounts.epicAdd': () => ({ ok: false, message: 'Mock: needs the Exo host.' }),
+  'accounts.epicRemove': () => ({ ok: false, message: 'Mock: needs the Exo host.' }),
+  'shell.minimize': mockOk,
+  'shell.maximize': mockOk,
+  'shell.windowState': mockOk,
+  'shell.close': mockOk,
+  'shell.openUrl': mockOk,
+  'app.repairCache': mockOk,
+  'shell.showStore': mockOk,
+  'shell.setChromeLayout': mockOk,
+  'music.warm': mockOk,
+  'music.reload': mockOk,
+  'app.version': () => ({ version: '1.0.0-dev' }),
+  'app.checkUpdate': () => ({ ok: true, alreadyLatest: true, updateAvailable: false, message: 'Up to date.', current: '1.0.0-dev' }),
+  'app.log': mockOk,
+  'app.openLogs': () => ({ ok: false, message: 'No logs folder in the browser mock.' }),
+  'app.installUpdate': () => ({
+    ok: true,
+    alreadyLatest: true,
+    updateAvailable: false,
+    message: 'Already up to date.',
+    current: '1.0.0-dev',
+  }),
+  'dlss.status': mockDlssStatus,
+  'dlss.updateAll': (params) => { mockDlssUpdated.add(String(params?.id)); return { ok: true, updated: 1, failed: 0 } },
+  'dlss.restore': () => ({ ok: false, message: 'Mock: no upscaler files.' }),
+  'dlss.consent': () => ({ ok: false, message: 'Mock: no anti-cheat game.' }),
+  'dlss.indicator': (params) => ({ ok: true, available: true, on: params?.on === true }),
+  'shaders.status': mockShadersStatus,
+  lucid: (p) => ({
+    ok: true, found: true, version: '6.0.3', running: true, voiceOn: false, startWithExo: p?.action === 'set' ? p.on === true : false, devices: true,
+    settings: {
+      headphone: { id: 'lucid_iems', name: 'Lucid IEMs', chosen: true }, favorites: [], gameMode: true, keepOnAltTab: false,
+      onlyWhileGaming: false,
+      nightShift: false, nightStart: '21:00', nightEnd: '06:00', nightSync: false, notifications: false, discord: false,
+    },
+  }),
+  'lucid.update': () => ({ version: null }),
+  'lucid.headphones': () => ({
+    ok: true,
+    headphones: [
+      { id: 'lucid_iems', model: 'Lucid IEMs', brand: 'tekkusai', category: 'In-Ear Monitors', grade: 'Excellent', keywords: '' },
+      { id: 'astro_a50_x', model: 'A50 X', brand: 'Astro', category: 'Gaming Headsets', grade: 'Good', keywords: 'a50x' },
+    ],
+  }),
+  'gpu.profile': (p) => mockGpu === 'intel' || mockGpu === 'amd' ? {
+    ok: true, vendor: mockGpu, gpu: mockGpu === 'intel' ? 'Arc B580' : 'Radeon RX 9070 XT', series: 0, screen: { name: 'VG27AQ', hz: 165, vrr: true },
+    status: p?.action === 'apply' ? 'applied' : 'ready', gsync: false, canUndo: p?.action === 'apply', driverUpdated: false, items: [],
+    lowLatency: mockGpu === 'intel' ? p?.lowLatency ?? 'on' : null, antiLag: mockGpu === 'amd' ? p?.antiLag ?? 'games' : null,
+    summary: mockGpu === 'intel'
+      ? "Adaptive Sync on, frames capped at 157 fps, Low latency on, Intel's prebuilt shaders; Endurance Gaming and sharpening off"
+      : 'FreeSync on, frames capped at 157 fps, Anti-Lag while you play; Chill, Boost and Image Sharpening off',
+  } : {
+    ok: true, vendor: 'nvidia', gpu: 'RTX 3070', series: 30, screen: { name: 'VG248', hz: 165, vrr: false },
+    status: p?.action === 'apply' ? 'applied' : 'ready', gsync: p?.action === 'apply' && p.gsync === true,
+    canUndo: p?.action === 'apply', driverUpdated: false, items: [],
+  },
+  'system.health': (p) => {
+    const cpu = mockIntelCpu ? 'Core i7-14700K' : 'Ryzen 5 5600X'
+    const [label, from, to, drop] = mockIntelCpu
+      ? ['Intel chipset driver', '10.1.19867.8574', '10.1.20658.8883', 'Devices may reset']
+      : ['AMD chipset driver', '8.08.12.551', '8.09.28.1124', 'USB and sound may drop']
+    return {
+      ok: true,
+      items: [
+        p?.action === 'apply'
+          ? { key: 'power', label: 'Power plan', detail: `Exo's plan, tuned for your ${cpu}`, applied: true, canUndo: true }
+          : { key: 'power', label: 'Power plan', detail: `Your PC uses “Nexus LiteOS Power Plan”. Exo's plan is tuned for your ${cpu}.`, cpu },
+        p?.action === 'chipset'
+          ? { key: 'chipset', label, detail: `Updating to ${to}. ${drop} for a moment`, busy: true }
+          : { key: 'chipset', label, detail: `${from} installed · ${to} installs while you're away` },
+      ],
+    }
+  },
+  'system.interrupts': (p) => {
+    const applied = p?.action === 'apply'
+    return {
+      ok: true, restart: applied, result: null, canUndo: applied,
+      devices: [
+        { id: 'a1', name: 'NVIDIA GeForce RTX 3070', kind: 'graphics card', mode: 'line', plan: applied ? 'restart' : 'change', reason: applied ? 'Switches to MSI mode after a restart' : 'Uses a shared line. Exo will switch it to MSI mode', changed: applied },
+        { id: 'a2', name: 'AMD USB 3.10 eXtensible Host Controller', kind: 'USB controller', mode: 'msi', plan: 'done', reason: 'Uses MSI mode', changed: false },
+        { id: 'a3', name: 'Standard NVM Express Controller', kind: 'storage controller', mode: 'msi', plan: 'skip', reason: 'Left alone: Windows starts from the drive behind it', changed: false },
+      ],
+    }
+  },
+  'stores.quiet': () => ({ ok: true, message: null }),
+  'hdr.state': () => ({ supported: true, on: false, name: 'Mock OLED', peakNits: 1000, calibrated: false, verdict: 'great' }),
+  'hdr.game': (p) => ({ ok: true, hdr: 'true', mode: typeof p?.mode === 'string' ? p.mode : 'auto' }),
+  'gpu.display': (p) => ({
+    ok: true,
+    pending: p?.action === 'set' ? { display: 'DISPLAY1', seconds: 15 } : null,
+    displays: [{
+      id: 'DISPLAY1', name: 'VG248', main: true, hdr: false, vendor: 'nvidia', refresh: 144, refreshes: [60, 100, 120, 144],
+      color: { format: 'rgb', bpc: 8, full: true }, auto: false,
+      supported: ['rgb', '444', '422'].flatMap(format => [6, 8].flatMap(bpc =>
+        (format === 'rgb' ? [true, false] : [false]).map(full => ({ format, bpc, full })))),
+      best: { refresh: 144, color: { format: 'rgb', bpc: 8, full: true }, why: null, scaling: true, over: true },
+      isBest: false,
+      scaling: { mode: 'aspect', gpu: false, over: false },
+      adjust: {
+        nvidia: p?.action === 'adjust' && p.nvidia === true,
+        controls: [
+          { key: 'brightness', label: 'Brightness', value: 50, min: 0, max: 100, step: 1, normal: 50, unit: '%' },
+          { key: 'contrast', label: 'Contrast', value: 50, min: 0, max: 100, step: 1, normal: 50, unit: '%' },
+          { key: 'gamma', label: 'Gamma', value: 100, min: 30, max: 280, step: 1, normal: 100, unit: '' },
+          { key: 'vibrance', label: 'Digital vibrance', value: 50, min: 0, max: 100, step: 1, normal: 50, unit: '%' },
+          { key: 'hue', label: 'Hue', value: 0, min: 0, max: 359, step: 1, normal: 0, unit: '°' },
+        ],
+      },
+    }],
+  }),
+  'gpu.import': () => ({ ok: false, cancelled: true, undo: null }),
+  'gpu.sensors': () => ({ ok: false }),
+  'gpu.game': (p) => {
+    if (mockGpu === 'intel' && typeof p?.frameGen === 'string') mockFrameGen = p.frameGen
+    return mockGpu === 'intel' ? { ok: true, vendor: 'intel', supported: true, frameGen: mockFrameGen }
+      : { ok: true, vendor: 'amd', supported: mockGpu === 'amd', afmf: p?.afmf === true, amdSoftware: true }
+  },
+  'store.home': () => ({ ok: true, at: new Date().toISOString(), hero: [], shelves: [{ id: 'mock', title: 'Top sellers', items: [MOCK_STORE_TILE] }], free: [] }),
+  'store.search': () => ({ ok: true, items: [] }),
+  'store.open': () => ({ ok: true }),
+  'store.gameOffers': () => ({ ok: true, offers: [
+    { store: '25', name: 'Epic Games Store', final: 2999, initial: 5999, discount: 50, currency: 'USD', url: 'https://store.epicgames.com/' },
+    { store: '7', name: 'GOG', final: 2999, initial: 5999, discount: 50, currency: 'USD', url: 'https://www.gog.com/' },
+  ] }),
+  'store.game': mockStoreGame,
+  'store.wishlist': () => ({ ok: true, items: [] }),
+  'twitch.connect': () => ({ ok: false, message: 'Twitch sign-in is not available in the browser mock.' }),
+  'keys.preview': () => ({ ok: true, looksLikeKey: false, store: 'unknown', key: '' }),
+  'keys.activate': () => ({ ok: true, message: 'Mock key.' }),
+}
+
+export async function mockCall<T>(method: string, params?: Record<string, unknown>): Promise<T> {
+  await new Promise((r) => setTimeout(r, 40))
+  const handler = MOCK_HANDLERS[method]
+
+  if (!handler) throw new Error(`Unknown mock method: ${method}`)
+  return handler(params) as T
+}

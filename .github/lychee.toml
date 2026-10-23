@@ -1,0 +1,11 @@
+# Link check for the public docs. Local links must resolve. Web links are
+# retried, and hosts that block or rate-limit automated requests are skipped.
+max_retries = 3
+retry_wait_time = 5
+timeout = 30
+accept = ["200..=299", "429"]
+exclude = [
+  "^https://www\\.buymeacoffee\\.com/",
+  "^https://chromewebstore\\.google\\.com",
+  "^https://www\\.nuget\\.org/",
+]

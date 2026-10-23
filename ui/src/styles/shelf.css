@@ -1,0 +1,198 @@
+
+
+.exo-top-rooms {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.exo-nav-btn {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: var(--exo-type-control);
+  font-weight: 500;
+  line-height: 28px;
+  white-space: nowrap;
+  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out), scale 120ms var(--ease-out);
+}
+
+.exo-nav-btn>*,
+.exo-settings-btn>* {
+  pointer-events: none;
+}
+
+.exo-nav-btn.is-on {
+  color: var(--color-fg);
+  background: var(--exo-selected);
+}
+
+/* Gear and window controls share the tab's height and pill. */
+.exo-settings-btn,
+.exo-winbtn,
+.exo-titlebar-button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-muted);
+  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out), scale 120ms var(--ease-out);
+}
+
+.exo-settings-btn.is-on {
+  color: var(--color-fg);
+  background: var(--exo-selected);
+}
+
+/* Maximize is Windows' own region (snap layouts); the host reports its hover. */
+.exo-winbtn.is-hover {
+  color: var(--color-fg);
+  background: var(--hover-fill);
+}
+
+@media (hover: hover) and (pointer: fine) {
+
+  .exo-nav-btn:hover:not(.is-on),
+  .exo-settings-btn:hover:not(.is-on),
+  .exo-winbtn:hover,
+  .exo-titlebar-button:hover {
+    color: var(--color-fg);
+    background: var(--hover-fill);
+  }
+
+  .exo-winbtn.is-close:hover,
+  .exo-titlebar-button.is-close:hover {
+    color: var(--color-bad);
+  }
+}
+
+/* Narrow windows keep the icons and drop the names (still read by screen readers). */
+@media (max-width: 980px) {
+  .exo-nav-btn {
+    gap: 0;
+    padding: 0 9px;
+  }
+
+  .exo-nav-btn .exo-nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .exo-nav-btn .exo-discord-notification-count {
+    margin-left: 4px;
+  }
+}
+
+@media (max-width: 580px) {
+  .exo-top-rooms {
+    gap: 1px;
+  }
+
+  .exo-settings-btn,
+  .exo-winbtn,
+  .exo-titlebar-button {
+    width: 28px;
+  }
+}
+
+/* Library › Refresh covers: the + button's shape; the icon turns while every cover refreshes. */
+.exo-refresh-covers[data-state='working'] svg {
+  animation: exo-refresh-covers-spin 900ms linear infinite;
+}
+
+.exo-refresh-covers:disabled {
+  opacity: 1;
+}
+
+.exo-refresh-covers-check {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--color-good);
+  stroke-width: 1.875;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: exo-check-hold 380ms var(--ease-out) forwards;
+}
+
+@keyframes exo-refresh-covers-spin {
+  to { transform: rotate(360deg); }
+}
+
+:root[data-exo-motion='reduce'] .exo-refresh-covers[data-state='working'] svg {
+  animation: none;
+}
+
+:root[data-exo-motion='reduce'] .exo-refresh-covers-check {
+  animation: none;
+  stroke-dashoffset: 0;
+}
+
+.exo-titlebar .exo-nav-mark,
+.exo-titlebar .exo-top-rooms,
+.exo-titlebar .exo-titlebar-tools {
+  height: 36px;
+  border-radius: 999px;
+}
+
+.exo-titlebar .exo-top-rooms {
+  gap: 2px;
+  padding: 3px;
+}
+
+.exo-titlebar .exo-titlebar-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 3px;
+}
+
+.exo-titlebar .exo-titlebar-actions {
+  gap: 8px;
+}
+
+.exo-titlebar .exo-nav-btn {
+  height: 30px;
+  padding: 0 13px;
+  font-weight: 600;
+}
+
+.exo-titlebar .exo-titlebar-tools :is(.exo-settings-btn, .exo-titlebar-button) {
+  width: 34px;
+  height: 30px;
+}
+
+/* The current room: a lit capsule (the glide's pill), the selected gray, no rim. */
+.exo-titlebar .exo-top-rooms.exo-glide::before {
+  background: var(--exo-selected);
+}
+
+.exo-titlebar .exo-nav-btn.is-on {
+  background: var(--exo-selected);
+}
+
+.exo-titlebar .exo-nav-btn.is-on .exo-glyph {
+  opacity: 1;
+}

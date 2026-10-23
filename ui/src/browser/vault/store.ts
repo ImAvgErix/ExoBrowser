@@ -1,0 +1,203 @@
+import { useSyncExternalStore } from 'react'
+import { onHost, send } from '../host'
+import { sameSite, siteName, siteOfUrl } from './sites'
+
+/*
+ * Exo Vault's items while it is unlocked, and everything the vault window and the fill menu do with them. The
+ * host (main.cpp, vault.cpp) keeps the encrypted file and its keys; this page holds the opened items only until
+ * the vault locks, and sends them back whole, to be sealed again, after each change.
+ */
+
+export type ItemType = 'login' | 'card' | 'note' | 'identity'
+export type Field = { name: string; value: string; hidden?: boolean }
+export type Item = {
+  id: string
+  type: ItemType
+  name: string
+  favorite?: boolean
+  created: number
+  modified: number
+  /** When it went to the trash. */
+  trashed?: number
+  note?: string
+  fields?: Field[]
+  username?: string
+  password?: string
+  urls?: string[]
+  /** A 2FA setup key or otpauth:// link. */
+  totp?: string
+  history?: { password: string; changed: number }[]
+  cardholder?: string
+  number?: string
+  expiry?: string
+  cvv?: string
+  pin?: string
+  fullName?: string
+  email?: string
+  phone?: string
+  company?: string
+  address?: string
+  city?: string
+  region?: string
+  postal?: string
+  country?: string
+}
+export type VaultData = { version: 1; items: Item[]; never?: string[] }
+
+/** A sign-in field Exo Vault's menu sits beside. */
+export type FillTarget = { tab: number; origin: string; kind: string; x: number; y: number; w: number; h: number; signup: boolean }
+/** A sign-in the page just sent, to save or update. */
+export type Prompt = { origin: string; username: string; password: string; update?: string }
+
+export type Vault = {
+  state: 'unknown' | 'none' | 'locked' | 'unlocked'
+  hello: boolean
+  helloReady: boolean
+  busy: boolean
+  error: string
+  data: VaultData | null
+  open: boolean
+  section: string
+  selected: string | null
+  editing: Item | null
+  fill: FillTarget | null
+  prompt: Prompt | null
+  sources: [string, string, boolean][]
+  importLocked: string
+  note: string
+}
+
+let vault: Vault = {
+  state: 'unknown', hello: false, helloReady: false, busy: false, error: '', data: null, open: false, section: 'all', selected: null,
+  editing: null, fill: null, prompt: null, sources: [], importLocked: '', note: '',
+}
+const listeners = new Set<() => void>()
+export function setVault(patch: Partial<Vault>) {
+  vault = { ...vault, ...patch }
+  for (const l of listeners) l()
+}
+export const vaultNow = () => vault
+export const useVault = () => useSyncExternalStore(l => { listeners.add(l); return () => listeners.delete(l) }, () => vault)
+
+/** Text as base64 of its UTF-8 (secrets and notes may hold the tabs the host splits on). */
+export function b64(text: string) {
+  const bytes = new TextEncoder().encode(text)
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
+}
+
+const REASONS: Record<string, string> = {
+  wrong: 'That master password is not right', corrupt: "The vault file can't be read", nofile: 'There is no vault on this PC yet',
+  write: "The vault couldn't be saved", nohello: "Windows Hello isn't set up on this PC", hellofailed: "Windows Hello couldn't open the vault. Use your master password",
+  cancelled: '',
+}
+
+// ---------------------------------------------------------------- Opening and locking
+
+export function openVault(section = vault.section) {
+  setVault({ open: true, section, selected: null, editing: null, error: '' })
+  send('overlay', 1)
+  send('vaultState')
+}
+export function closeVault() {
+  setVault({ open: false, editing: null })
+  send('overlay', 0)
+}
+export function unlock(password: string) { setVault({ busy: true, error: '' }); send('vaultUnlock', b64(password)) }
+export function create(password: string) { setVault({ busy: true, error: '' }); send('vaultCreate', b64(password)) }
+export function helloUnlock() { setVault({ busy: true, error: '' }); send('vaultHello') }
+export function lock() { send('vaultLock') }
+
+// ---------------------------------------------------------------- Changes, each saved whole
+
+let saveTimer = 0
+function commit(items: Item[], extra: Partial<VaultData> = {}) {
+  if (!vault.data) return
+  const data: VaultData = { ...vault.data, ...extra, items }
+  setVault({ data })
+  clearTimeout(saveTimer)
+  saveTimer = window.setTimeout(() => { if (vault.data) send('vaultSave', b64(JSON.stringify(vault.data))) }, 150)
+}
+
+export const newItem = (type: ItemType, init: Partial<Item> = {}): Item =>
+  ({ id: crypto.randomUUID(), type, name: '', created: Date.now(), modified: Date.now(), ...init })
+
+/** Saves an item; a login's old password goes to its history. */
+export function saveItem(item: Item) {
+  const items = vault.data?.items ?? []
+  const before = items.find(i => i.id === item.id)
+  const next = { ...item, modified: Date.now() }
+  if (before?.password && item.password !== before.password)
+    next.history = [{ password: before.password, changed: Date.now() }, ...(before.history ?? [])].slice(0, 20)
+  commit(before ? items.map(i => (i.id === item.id ? next : i)) : [next, ...items])
+}
+
+const change = (id: string, patch: (i: Item) => Partial<Item>) =>
+  commit((vault.data?.items ?? []).map(i => (i.id === id ? { ...i, ...patch(i), modified: Date.now() } : i)))
+
+export const toggleFavorite = (id: string) => change(id, i => ({ favorite: !i.favorite }))
+export const trashItem = (id: string) => { change(id, () => ({ trashed: Date.now() })); setVault({ selected: null }) }
+export const restoreItem = (id: string) => change(id, () => ({ trashed: undefined }))
+export function deleteForever(id: string) { commit((vault.data?.items ?? []).filter(i => i.id !== id)); setVault({ selected: null }) }
+export const emptyTrash = () => commit((vault.data?.items ?? []).filter(i => !i.trashed))
+export function neverSave(origin: string) { commit(vault.data?.items ?? [], { never: [...new Set([...(vault.data?.never ?? []), siteOfUrl(origin)])] }) }
+export function allowSave(site: string) { commit(vault.data?.items ?? [], { never: (vault.data?.never ?? []).filter(s => s !== site) }) }
+
+/** Copies, clearing itself after 30 seconds, and out of Windows' clipboard history. */
+export function copy(text: string | undefined, what = 'Copied') {
+  if (!text) return
+  send('vaultCopy', b64(text))
+  setVault({ note: `${what}. It clears from the clipboard in 30 seconds` })
+}
+
+/** Logins on the page's site (never in the trash), best match first. */
+export function loginsFor(origin: string) {
+  return (vault.data?.items ?? [])
+    .filter(i => i.type === 'login' && !i.trashed && (i.urls ?? []).some(u => sameSite(u, origin)))
+    .sort((a, b) => Number(!!b.favorite) - Number(!!a.favorite) || b.modified - a.modified)
+}
+
+/** Brings in logins from elsewhere, leaving out any already here (same site, username and password). */
+export function addLogins(found: Partial<Item>[], source: string) {
+  const items = vault.data?.items ?? []
+  const key = (i: Partial<Item>) => `${i.type ?? 'login'}\n${siteOfUrl(i.urls?.[0] ?? '')}\n${i.username ?? ''}\n${i.password ?? ''}\n${i.number ?? ''}\n${i.note ?? ''}`
+  const seen = new Set(items.filter(i => !i.trashed).map(key))
+  const added: Item[] = []
+  for (const f of found) {
+    if (!f.password && !f.note && !f.number && !f.fullName && !f.totp) continue
+    if (seen.has(key(f))) continue
+    seen.add(key(f))
+    added.push(newItem(f.type ?? 'login', { ...f, name: f.name || siteName(f.urls?.[0] ?? '') || 'Login', created: f.created || Date.now() }))
+  }
+  if (added.length) commit([...added, ...items])
+  setVault({ note: `Brought in ${added.length} ${added.length === 1 ? 'item' : 'items'} from ${source}${found.length > added.length ? ` (${found.length - added.length} already here)` : ''}` })
+  return added.length
+}
+
+// ---------------------------------------------------------------- What the host says
+
+type Message = Record<string, unknown>
+const opened = (m: Message) => {
+  let data: VaultData = { version: 1, items: [] }
+  try { data = JSON.parse(m.json as string) as VaultData } catch { /* an empty vault */ }
+  setVault({ data: { version: 1, items: data.items ?? [], never: data.never ?? [] }, busy: false, error: '', state: 'unlocked' })
+}
+const HANDLERS: Record<string, (m: Message) => void> = {
+  state: m => setVault({ state: m.state as Vault['state'], hello: !!m.hello, helloReady: !!m.helloReady }),
+  opened,
+  locked: () => setVault({ data: null, selected: null, editing: null, fill: null, state: 'locked', error: '', busy: false }),
+  error: m => setVault({ busy: false, error: REASONS[m.reason as string] ?? 'Something went wrong' }),
+  saved: () => {},
+  passwordChanged: () => setVault({ note: 'Master password changed' }),
+  exported: () => setVault({ note: 'Exported. Keep the file and its password somewhere safe' }),
+  sources: m => setVault({ sources: (m.items as Vault['sources']) ?? [] }),
+  importLocked: m => setVault({ importLocked: m.name as string }),
+}
+export function onVaultMessage(kind: string, handler: (m: Message) => void) { HANDLERS[kind] = handler }
+
+export function startVault() {
+  const off = onHost('vault', m => HANDLERS[m.kind as string]?.(m))
+  send('vaultState')
+  return off
+}
