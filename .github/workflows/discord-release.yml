@@ -80,7 +80,8 @@ jobs:
           ROLE_ID: ${{ vars.DISCORD_RELEASE_ROLE_ID }}
         run: |
           set -euo pipefail
-          icon_url="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/$ASSET_DIR/$AVATAR_FILE"
+          # ?v= busts Discord's image-proxy cache when the avatar file changes.
+          icon_url="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/$ASSET_DIR/$AVATAR_FILE?v=${GITHUB_SHA:0:12}"
           role="${ROLE_ID:-}"
           role="${role//[[:space:]]/}"
           if [[ -n "$role" && ! "$role" =~ ^[0-9]{17,20}$ ]]; then
