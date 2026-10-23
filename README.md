@@ -2,7 +2,7 @@
 <h1 align="center">Exo Browser 1.0</h1>
 <p align="center"><strong>A private, fast browser in Exo's look.</strong></p>
 <p align="center">Ads, trackers and Twitch ad breaks gone before they load, your passwords encrypted on your own PC, and one Liquid Glass window for Windows 11.</p>
-<p align="center"><a href="https://github.com/ImAvgErix/ExoBrowser/releases/latest/download/ExoBrowser-Setup.exe"><strong>Download for Windows 11</strong></a> · <a href="https://github.com/ImAvgErix/ExoBrowser/releases/tag/v1.0.0">What's new in 1.0</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="PRIVACY.md">Privacy</a></p>
+<p align="center"><a href="https://github.com/ImAvgErix/ExoBrowser/releases/latest/download/ExoBrowser-Setup.exe"><strong>Download for Windows 11</strong></a> · <a href="https://github.com/ImAvgErix/ExoBrowser/releases/tag/v1.0.1">What's new in 1.0</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="PRIVACY.md">Privacy</a></p>
 
 ![The new tab page: your bookmarks as glass cards and the sites you visit most](docs/media/newtab.jpg)
 

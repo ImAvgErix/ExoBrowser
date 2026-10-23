@@ -923,8 +923,20 @@ export function initHostBridge() {
     pending.clear()
   })
   const wv = (window as unknown as {
-    chrome: { webview: { addEventListener: (t: string, fn: (e: MessageEvent) => void) => void } }
+    chrome: { webview: { addEventListener: (t: string, fn: (e: MessageEvent) => void) => void; releaseBuffer: (buffer: ArrayBuffer) => void } }
   }).chrome.webview
+  // Bulk data (Discord video frames) comes as shared memory with a JSON note naming its event: handed on as bytes, and
+  // released at once, as handlers copy what they keep.
+  wv.addEventListener('sharedbufferreceived', (e: MessageEvent) => {
+    const shared = e as unknown as { additionalData?: { event?: string }; getBuffer: () => ArrayBuffer }
+    const buffer = shared.getBuffer()
+    try {
+      const note = shared.additionalData
+      if (note?.event) emitHostEvent(note.event as keyof HostEventMap, { ...note, bytes: new Uint8Array(buffer) } as never)
+    } finally {
+      wv.releaseBuffer(buffer)
+    }
+  })
   wv.addEventListener('message', (e: MessageEvent) => {
     let data: HostResponse | HostEvent | null
     try {
@@ -1008,13 +1020,14 @@ export interface HostEventMap {
   /** This client's own Go Live: connecting, live or off (with why, when it ended on its own). */
   'discord.golive': { state: 'connecting' | 'live' | 'off'; title?: string | null; message?: string | null }
   /** Each second while live: the stream's picture size and what it really sends. */
-  'discord.golive.stats': { width: number; height: number; fps: number; bitrate: number; max?: number }
+  'discord.golive.stats': { width: number; height: number; fps: number; bitrate: number; max?: number; codec?: string }
   /** This client's camera: live (send frames) or off. */
   'discord.camera': { state: 'connecting' | 'live' | 'off' }
   /** Discord wants a keyframe of this client's camera (Go Live's come from Exo Capture). */
   'discord.video.keyframe': { source: 'camera' }
   /** One whole, decrypted H.264 frame (Annex B, base64) to decode. */
-  'discord.video.frame': { source: 'call' | 'stream'; userId: string; timestamp: number; keyframe: boolean; data: string; rotation?: number; flip?: boolean }
+  /** The frame comes as shared memory (bytes); data (base64) only from the dev mock. */
+  'discord.video.frame': { source: 'call' | 'stream'; userId: string; timestamp: number; keyframe: boolean; bytes?: Uint8Array; data?: string; rotation?: number; flip?: boolean; codec?: 'h264' | 'h265' }
   'discord.call': { channelId: string; ringing: boolean }
   'discord.presence': DiscordPresence
   /** The open server's member list changed, or member colors arrived. */
@@ -1479,6 +1492,8 @@ export const host = {
     rawCall<{ ok: boolean; message?: string | null }>('discord.stream', { action, ...(userId ? { userId } : {}) }),
   /** Whether the page shows call video now (on screen, with a camera or stream to draw): only then do frames come. */
   discordFrames: (on: boolean) => rawCall<{ ok: boolean; message?: string | null }>('discord.stream', { action: 'frames', on }),
+  /** Whether this page decodes H.265 in hardware, so Discord connections offer to receive it. */
+  discordVideoDecode: (hevc: boolean) => rawCall<{ ok: boolean; message?: string | null }>('discord.stream', { action: 'decode', hevc }),
   /**
    * Go Live from this client: what can be shared (screens and windows with pictures), a fresh picture of
    * one (or of the stream while live, no source), start (a source, height 0 for its own, frame rate, sound), stop.

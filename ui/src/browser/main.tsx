@@ -10,7 +10,7 @@ import '../styles/rooms.css'
 import './browser.css'
 import { installMenuFit } from '../lib/menuFit'
 import { installInputModality } from '../lib/motionPreference'
-import { browser, onHost, send, setSetting, startHost, useBrowser } from './host'
+import { holdInput, inputReleased, isFirstRun, onHost, send, setSetting, startHost, useBrowser } from './host'
 import { engineOf, hostOf } from './search'
 import { Chrome, isAutohide, isVertical, useLayoutReport, widthOf } from './Chrome'
 import { MenuLayer, MenuScrim, closeMenu, downloadsMenu, extensionsMenu, menuKind } from './menus'
@@ -95,24 +95,28 @@ function App() {
     else delete root.dataset.exoGlass
   }, [b.theme, b.settings.material])
 
-  useEffect(() => onHost('settings.open', m => { closeMenu(true); setSettings({ open: true, section: (m.section as string) || '' }); send('overlay', 1) }), [])
+  // Settings, as Ctrl+H or a page asks; not over first run.
+  useEffect(() => onHost('settings.open', m => { if (isFirstRun()) return; closeMenu(); setSettings({ open: true, section: (m.section as string) || '' }) }), [])
+  useEffect(() => holdInput('settings', settings.open), [settings.open])
   useEffect(() => onHost('downloads', () => { if (menuKind() === 'downloads') downloadsMenu(document.getElementById('exb-dl-btn')!) }), [])
-  useEffect(() => onHost('extensions.open', () => extensionsMenu(document.getElementById('exb-tools')!)), [])
+  useEffect(() => onHost('extensions.open', () => { if (!isFirstRun()) extensionsMenu(document.getElementById('exb-tools')!) }), [])
   // Exo Vault: its state from the host, and the sign-in fields pages report.
   useEffect(() => { const offs = [startVault(), startFill()]; return () => offs.forEach(off => off()) }, [])
-  const closeSettings = () => { setSettings(s => ({ ...s, open: false })); send('overlay', 0) }
-  // The host let go of the window's input (a page opened from Settings or another app): close with it. First run keeps it.
-  useEffect(() => onHost('overlay.closed', () => {
-    closeMenu(true)
-    setSettings(s => ({ ...s, open: false }))
-    const now = browser()
-    if (now.settingsLoaded && now.settings.onboarded !== '1') send('overlay', 1)
-  }), [])
+  const closeSettings = () => setSettings(s => ({ ...s, open: false }))
   // First run: once, until it's finished, over the whole window.
   const firstRun = b.settingsLoaded && b.settings.onboarded !== '1'
-  useEffect(() => { if (firstRun) send('overlay', 1) }, [firstRun])
+  // The host let go of the window's input (a page opened from Settings or another app): close with it. First run
+  // keeps it, so it asks again.
+  useEffect(() => onHost('overlay.closed', () => {
+    inputReleased()
+    closeMenu()
+    closeSettings()
+    if (isFirstRun()) holdInput('firstrun', true)
+  }), [])
+  useEffect(() => holdInput('firstrun', firstRun), [firstRun])
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && settings.open && !document.querySelector(':popover-open')) closeSettings() }
+    // Esc closes the top layer only: a menu or Search over Settings handles it first.
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.defaultPrevented && settings.open && !document.querySelector(':popover-open')) closeSettings() }
     addEventListener('keydown', onKey)
     return () => removeEventListener('keydown', onKey)
   }, [settings.open])
@@ -127,7 +131,7 @@ function App() {
       <Settings open={settings.open} section={settings.section} onClose={closeSettings} />
       <VaultSheet />
       <VaultFill />
-      {firstRun ? <Onboarding onDone={() => { setSetting('onboarded', '1'); send('overlay', 0) }} /> : null}
+      {firstRun ? <Onboarding onDone={() => setSetting('onboarded', '1')} /> : null}
       {toast ? <div className="exo-toast-stack exb-toasts"><div key={toast.key} className="exo-toast" role="status"><p className="min-w-0 flex-1 text-fg">{toast.text}</p></div></div> : null}
     </div>
   )

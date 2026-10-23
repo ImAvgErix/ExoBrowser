@@ -1,8 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { Button } from '../components/ui/Button'
 import { useGlide } from '../lib/glide'
-import { useLens } from '../lib/glass'
-import { onHost, send, setSetting, setting, useBrowser, type Settings, type Tab } from './host'
+import { onHost, send, setSetting, setting, useBrowser, useBrowserValue, type Settings, type Tab } from './host'
 import { engineOf, hostOf, isNewTab } from './search'
 import * as I from './icons'
 import { SearchBox, useSearch } from './SearchBox'
@@ -24,10 +23,9 @@ export const tabTitle = (t: Tab) => isNewTab(t.url) ? 'New tab' : t.title || hos
 
 /** The site's icon, a spinner while it loads, the grid for a new tab. */
 export function Favicon({ tab }: { tab: Tab }) {
-  const { favicons } = useBrowser()
+  const fav = useBrowserValue(b => b.favicons[tab.id])
   if (tab.loading) return <span className="exb-spin" aria-hidden="true" />
   if (isNewTab(tab.url)) return <I.Grid className="exb-fav-blank" />
-  const fav = favicons[tab.id]
   return fav ? <img className="exb-fav" src={fav} alt="" /> : <I.Globe className="exb-fav-blank" />
 }
 
@@ -78,7 +76,8 @@ export const queueGlass = () => {
 // settling (a sheet grows in from 0.98).
 if (typeof document !== 'undefined') {
   new MutationObserver(queueGlass).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] })
-  for (const type of ['toggle', 'animationend', 'transitionend']) document.addEventListener(type, queueGlass, true)
+  // A menu anchored in a scrolling list (Settings' choices) moves with it.
+  for (const type of ['toggle', 'animationend', 'transitionend', 'scroll']) document.addEventListener(type, queueGlass, true)
   addEventListener('resize', queueGlass)
 }
 
@@ -147,7 +146,7 @@ function Find({ onClose }: { onClose: () => void }) {
   const [text, setText] = useState('')
   const [result, setResult] = useState('')
   const field = useRef<HTMLInputElement>(null)
-  useEffect(() => { field.current?.focus(); send('pin', 1); return () => { send('findClose'); send('pin', 0) } }, [])
+  useEffect(() => { field.current?.focus(); send('holdBar', 1); return () => { send('findClose'); send('holdBar', 0) } }, [])
   useEffect(() => onHost('findResult', m => setResult(m.count ? `${m.index} of ${m.count}` : text ? 'No matches' : '')), [text])
   return (
     <div className="exb-find">
@@ -199,7 +198,15 @@ export function WindowButtons() {
 // Tabs, either strip: click opens, middle click or the close button closes, drag reorders, right click for more.
 function useTabDrag(axis: 'x' | 'y', offset = 0) {
   const drag = useRef<{ el: HTMLElement; id: number; at: number; moved: boolean } | null>(null)
+  // A drag cut short (Alt+Tab, the window losing the mouse) puts the tab back where it was.
+  const cancel = () => {
+    const d = drag.current
+    drag.current = null
+    if (d) { d.el.classList.remove('is-dragging'); d.el.style.transform = '' }
+  }
   return {
+    onPointerCancel: cancel,
+    onLostPointerCapture: (e: ReactPointerEvent<HTMLElement>) => { if (drag.current?.el === e.currentTarget) cancel() },
     onPointerDown(e: ReactPointerEvent<HTMLElement>, id: number) {
       if (e.button !== 0 || (e.target as Element).closest('[data-act]')) return
       drag.current = { el: e.currentTarget, id, at: axis === 'x' ? e.clientX : e.clientY, moved: false }
@@ -225,18 +232,21 @@ function useTabDrag(axis: 'x' | 'y', offset = 0) {
       const p = axis === 'x' ? e.clientX : e.clientY
       let index = others.findIndex(c => { const r = c.getBoundingClientRect(); return p < (axis === 'x' ? r.left + r.width / 2 : r.top + r.height / 2) })
       if (index < 0) index = others.length
+      // Pinned tabs lead: a pinned tab stays among them, any other after them.
+      const pinnedOthers = others.filter(c => c.classList.contains('is-pinned')).length
+      index = d.el.classList.contains('is-pinned') ? Math.min(index, pinnedOthers) : Math.max(index, pinnedOthers)
       send('move', d.id, offset + index)
     },
   }
 }
 
 function TabButton({ tab, className, drag }: { tab: Tab; className: string; drag: ReturnType<typeof useTabDrag> }) {
-  const { active } = useBrowser()
-  const on = tab.id === active
+  const on = useBrowserValue(b => b.active === tab.id)
   return (
     <div role="tab" data-tab={tab.id} aria-selected={on} aria-current={on ? 'page' : undefined}
       className={`${className}${on ? ' is-on' : ''}${tab.sleeping && !on ? ' is-sleeping' : ''}`}
       onPointerDown={e => drag.onPointerDown(e, tab.id)} onPointerMove={drag.onPointerMove} onPointerUp={drag.onPointerUp}
+      onPointerCancel={drag.onPointerCancel} onLostPointerCapture={drag.onLostPointerCapture}
       onAuxClick={e => { if (e.button === 1) send('close', tab.id) }}
       onContextMenu={e => { e.preventDefault(); tabMenu(tab.id, e.clientX, e.clientY) }}>
       <Favicon tab={tab} />
@@ -253,12 +263,28 @@ function TabButton({ tab, className, drag }: { tab: Tab; className: string; drag
   )
 }
 
+/** The tab on screen stays in view in a strip that scrolls (Ctrl+Tab, a new tab at the end). */
+function useActiveInView(strip: RefObject<HTMLElement | null>, active: number) {
+  useEffect(() => { strip.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }) }, [strip, active])
+}
+
+function useWindowWidth() {
+  const [width, setWidth] = useState(innerWidth)
+  useEffect(() => {
+    const on = () => setWidth(innerWidth)
+    addEventListener('resize', on)
+    return () => removeEventListener('resize', on)
+  }, [])
+  return width
+}
+
 function TopTabs() {
-  const { tabs } = useBrowser()
+  const { tabs, active } = useBrowser()
   const glide = useGlide<HTMLElement>()
-  useLens(glide)
   const drag = useTabDrag('x')
-  const tight = tabs.length > 0 && (innerWidth - 80) / tabs.length < 104
+  useActiveInView(glide, active)
+  const width = useWindowWidth()
+  const tight = tabs.length > 0 && (width - 80) / tabs.length < 104
   // The + follows the last tab, as in every browser, so it is always where the next tab will appear.
   return (
     <div className="exb-tabrow">
@@ -278,17 +304,26 @@ function SideTabs() {
   const pinned = tabs.filter(t => t.pinned)
   const glide = useGlide<HTMLDivElement>()
   const drag = useTabDrag('y', pinned.length)
+  useActiveInView(glide, active)
+  // Dragging the sidebar's edge: the page follows every move, the window once a frame (each one lays the window out).
   const grip = (e: ReactPointerEvent<HTMLDivElement>) => {
     const el = e.currentTarget
     el.setPointerCapture(e.pointerId)
-    let w = widthOf(settings)
+    let w = widthOf(settings), frame = 0
     const move = (ev: PointerEvent) => {
       w = Math.min(420, Math.max(180, Math.round(ev.clientX)))
       el.closest<HTMLElement>('.exb')?.style.setProperty('--exb-side-w', `${w}px`)
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; send('chrome', 52, w, autohide() ? 1 : 0) })
+    }
+    const end = () => {
+      el.removeEventListener('pointermove', move)
+      el.removeEventListener('lostpointercapture', end)
+      cancelAnimationFrame(frame)
       send('chrome', 52, w, autohide() ? 1 : 0)
+      setSetting('sidebarWidth', String(w))
     }
     el.addEventListener('pointermove', move)
-    el.addEventListener('pointerup', () => { el.removeEventListener('pointermove', move); setSetting('sidebarWidth', String(w)) }, { once: true })
+    el.addEventListener('lostpointercapture', end)
   }
   return (
     <aside id="exb-side" className="exo-glass exb-side">
@@ -316,14 +351,14 @@ export function Chrome({ settingsOpen, onSettings }: { settingsOpen: boolean; on
   const search = useSearch()
   const [finding, setFinding] = useState(false)
   const v = isVertical(b.settings)
-  // Exo's Bar: each group its own capsule of small Liquid Glass, its lens at the rim (lib/glass.ts).
+  // Exo's Bar: each group its own capsule of small Liquid Glass. (No lens at the rim: the window draws their glass,
+  // and in this page there's nothing behind them to bend.)
   const nav = useRef<HTMLDivElement>(null)
   const address = useRef<HTMLDivElement>(null)
   const tools = useRef<HTMLDivElement>(null)
-  useLens(nav)
-  useLens(address)
-  useLens(tools)
   useEffect(() => onHost('find', () => setFinding(true)), [])
+  // Find belongs to the page it was opened on: another tab puts it away.
+  useEffect(() => setFinding(false), [b.active])
   useLayoutEffect(queueGlass)
   return (
     <>

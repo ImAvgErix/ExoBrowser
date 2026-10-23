@@ -68,10 +68,31 @@ const update = (next: Partial<Browser>) => {
   store = { ...store, ...next }
   for (const listener of listeners) listener()
 }
-export const useBrowser = () => useSyncExternalStore(on => { listeners.add(on); return () => listeners.delete(on) }, () => store)
+const subscribe = (on: () => void) => { listeners.add(on); return () => { listeners.delete(on) } }
+export const useBrowser = () => useSyncExternalStore(subscribe, () => store)
+/** One value from the store (a primitive, or something the store keeps the same while unchanged): the component
+ * renders again only when that value changes, not on every message from the host. */
+export const useBrowserValue = <T,>(pick: (b: Browser) => T) => useSyncExternalStore(subscribe, () => pick(store))
 export const browser = () => store
 
 export const setting = (key: string, fallback: string) => store.settings[key] || fallback
+/** First run is showing (until it's finished): nothing else opens over it. */
+export const isFirstRun = () => store.settingsLoaded && store.settings.onboarded !== '1'
+
+// The window's input comes to this page while any of its layers is open over the page: Settings, Exo Vault, a menu,
+// Search, first run. Each layer says only whether it is open; the host hears when the first one opens and when the
+// last one closes, so closing a menu over Settings no longer hands the mouse back to the page under Settings.
+const layers = new Set<string>()
+let holding = false
+export function holdInput(layer: string, open: boolean) {
+  if (open) layers.add(layer)
+  else layers.delete(layer)
+  const want = layers.size > 0
+  if (want !== holding) {
+    holding = want
+    send('overlay', want ? 1 : 0)
+  }
+}
 export function setSetting(key: string, value: string) {
   update({ settings: { ...store.settings, [key]: value } })
   send('set', key, value)
@@ -111,9 +132,15 @@ export function iconPath(set: IconSet | undefined, size: number): string | null 
 }
 const toolbarIcon = (m: Manifest) => iconPath(m.action?.default_icon ?? m.browser_action?.default_icon ?? m.page_action?.default_icon ?? m.icons, 32)
 
+/** The host let go on its own (a page opened, full screen): nothing holds it now; each layer closes itself. */
+export function inputReleased() { holding = false }
+
 const fromHost: Record<string, (m: Message) => void> = {
   state(m) {
-    const tabs = m.tabs as Tab[]
+    // A tab that didn't change keeps its object, so its button doesn't draw again for another tab's news.
+    const before = new Map(store.tabs.map(t => [t.id, t]))
+    const same = (a: Tab, b: Tab) => (Object.keys(b) as (keyof Tab)[]).every(k => a[k] === b[k]) && Object.keys(a).length === Object.keys(b).length
+    const tabs = (m.tabs as Tab[]).map(t => { const old = before.get(t.id); return old && same(old, t) ? old : t })
     const favicons = Object.fromEntries(Object.entries(store.favicons).filter(([id]) => tabs.some(t => t.id === Number(id))))
     update({ tabs, active: m.active as number, back: !!m.back, fwd: !!m.fwd, max: !!m.max, full: !!m.full, favicons })
   },

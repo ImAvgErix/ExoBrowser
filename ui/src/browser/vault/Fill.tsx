@@ -14,7 +14,7 @@ import { sameSite, siteName, siteOfUrl } from './sites'
  * page says is only a hint: which site it is comes from the browser, and nothing reaches a page until you pick it.
  */
 
-type PageEvent = { e?: string; kind?: string; x?: number; y?: number; w?: number; h?: number; signup?: boolean; username?: string; password?: string; previous?: string }
+type PageEvent = { e?: string; kind?: string; x?: number; y?: number; w?: number; h?: number; signup?: boolean; pw?: boolean; username?: string; password?: string; previous?: string }
 const KINDS = new Set(['username', 'password', 'new-password', 'otp', 'card'])
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 const text = (v: unknown) => (typeof v === 'string' ? v.slice(0, 1024) : '')
@@ -27,7 +27,21 @@ function hideFill() {
   clearTimeout(hideTimer)
   overMenu = false
   if (vaultNow().fill) setVault({ fill: null })
-  send('vaultHot')
+}
+
+// The fill menu and the save prompt sit over the page: their places take the pointer while the page keeps the
+// keyboard. Measured a frame after they render (where they rest), sent again when they move or go.
+let hotFrame = 0
+let hotSent = ''
+export function reportHot() {
+  cancelAnimationFrame(hotFrame)
+  hotFrame = requestAnimationFrame(() => {
+    const spec = [...document.querySelectorAll('.exb-vault-fill, .exb-vault-prompt')].map(el => {
+      const r = el.getBoundingClientRect()
+      return [r.left, r.top, r.width, r.height].map(Math.round).join(',')
+    }).join(';')
+    if (spec !== hotSent) { hotSent = spec; send('vaultHot', spec) }
+  })
 }
 
 function onFocus(m: Record<string, unknown>, p: PageEvent) {
@@ -35,7 +49,7 @@ function onFocus(m: Record<string, unknown>, p: PageEvent) {
   if (!KINDS.has(kind) || vaultNow().state === 'none' || vaultNow().state === 'unknown') return
   const zoom = num(m.zoom) || 1, dx = num(m.dx), dy = num(m.dy)
   clearTimeout(hideTimer)
-  setVault({ fill: { tab: num(m.tab), origin: text(m.origin), kind, x: dx + num(p.x) * zoom, y: dy + num(p.y) * zoom, w: num(p.w) * zoom, h: num(p.h) * zoom, signup: !!p.signup } })
+  setVault({ fill: { tab: num(m.tab), origin: text(m.origin), kind, x: dx + num(p.x) * zoom, y: dy + num(p.y) * zoom, w: num(p.w) * zoom, h: num(p.h) * zoom, signup: !!p.signup, pw: !!p.pw } })
 }
 
 /** After a sign-in: offer to save it, or to update the saved password when it changed. */
@@ -110,23 +124,30 @@ function Choices({ target }: { target: FillTarget }) {
   )
 }
 
-/** The menu under the field, as wide as the field (at least a menu's width). */
+/** The menu under the field, as wide as the field (at least a menu's width); above it when there's no room below. */
 function FillMenu({ target }: { target: FillTarget }) {
   const v = useVault()
   const ref = useRef<HTMLDivElement>(null)
+  const [above, setAbove] = useState(false)
   const logins = v.state === 'unlocked' ? loginsFor(target.origin) : []
-  const offers = v.state !== 'unlocked' || target.signup || target.kind === 'new-password' ||
+  // Locked, it offers to unlock only on a sign-in (a password field, or a form that has one), not on every email field.
+  const offers = v.state !== 'unlocked' ? target.kind === 'password' || target.pw : target.signup || target.kind === 'new-password' ||
     (target.kind === 'otp' ? logins.some(i => i.totp) : target.kind === 'card' ? (v.data?.items ?? []).some(i => i.type === 'card' && !i.trashed) : logins.length > 0)
-  const style = { left: target.x, top: target.y + target.h + 6, width: Math.max(280, Math.min(target.w, 420)) } as CSSProperties
-  // Its place takes the pointer; the page keeps the keyboard.
+  const width = Math.max(280, Math.min(target.w, 420))
+  const left = Math.max(8, Math.min(target.x, innerWidth - 8 - width))
+  const style = (above ? { left, bottom: innerHeight - target.y + 6, width } : { left, top: target.y + target.h + 6, width }) as CSSProperties
+  // Placed here, not by the window's menu fitting: it would flip the menu over the field it belongs under.
   useLayoutEffect(() => {
-    const r = ref.current?.getBoundingClientRect()
-    if (r) send('vaultHot', Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height))
-    else send('vaultHot')
-  })
+    const h = ref.current?.offsetHeight ?? 0
+    const room = innerHeight - 8 - (target.y + target.h + 6)
+    setAbove(h > room && target.y - 6 - h >= 8)
+  }, [target.y, target.h, logins.length, offers])
+  useLayoutEffect(reportHot)
+  useEffect(() => reportHot, [])
   if (!offers) return null
   return (
     <div ref={ref} className="exo-shelf-sort-menu exb-menu exb-vault-fill" role="menu" aria-label="Exo Vault" style={style}
+      onAnimationEnd={reportHot}
       onPointerEnter={() => { overMenu = true; clearTimeout(hideTimer) }} onPointerLeave={() => { overMenu = false }}>
       <Choices target={target} />
       <button type="button" role="menuitem" className="exo-menu-item exb-vault-pick is-quiet" onClick={() => { hideFill(); openVault('login') }}>
@@ -148,8 +169,10 @@ function SavePrompt({ prompt }: { prompt: Prompt }) {
   // Locked: open it first (Windows Hello when it's on), then this offer comes back.
   const unlockFirst = () => { pending = prompt; if (v.hello) helloUnlock(); else openVault() }
   const action = v.state !== 'unlocked' ? 'Unlock to save' : prompt.update ? 'Update' : 'Save'
+  useLayoutEffect(reportHot)
+  useEffect(() => reportHot, [])
   return (
-    <div className="exo-toast exb-vault-prompt" role="dialog" aria-label="Save to Exo Vault">
+    <div className="exo-toast exb-vault-prompt" role="dialog" aria-label="Save to Exo Vault" onAnimationEnd={reportHot}>
       <span className="exb-vault-avatar" aria-hidden="true"><I.Vault size={14} /></span>
       <p className="min-w-0 flex-1">
         <strong>{prompt.update ? `Update the password for ${prompt.username || siteName(prompt.origin)}?` : `Save this login for ${siteOfUrl(prompt.origin)}?`}</strong>

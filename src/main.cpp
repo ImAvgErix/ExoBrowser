@@ -38,6 +38,9 @@
 #include <unordered_map>
 #include <vector>
 #include <wtsapi32.h>
+#include <wincodec.h>
+#include <deque>
+#include <mutex>
 #include "WebView2.h"
 #include "WebView2EnvironmentOptions.h"
 #include "vault.h"
@@ -78,6 +81,7 @@ struct Tab {
     ULONGLONG lastActive = 0;
     bool creating = false, loading = false, audible = false, muted = false;
     bool suspended = false, lowMemory = false, pinned = false;
+    UINT64 navId = 0;  // the navigation the tab is loading: a late "done" from one it replaced doesn't end it
 };
 
 struct ClosedTab { std::wstring url, title; size_t index; };
@@ -218,9 +222,11 @@ static void WriteFileUtf8(const std::wstring& path, const std::string& data) {
     HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
-    WriteFile(f, data.data(), (DWORD)data.size(), &written, nullptr);
+    // Only a complete copy replaces the file (a full disk writes short).
+    bool whole = WriteFile(f, data.data(), (DWORD)data.size(), &written, nullptr) && written == data.size();
     CloseHandle(f);
-    MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (whole) MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    else DeleteFileW(tmp.c_str());
 }
 
 static std::vector<std::vector<std::wstring>> ReadTable(const wchar_t* name) {
@@ -289,12 +295,16 @@ static void SaveSettings() {
 
 static void SaveSession() {
     g.sessionDirty = false;
-    std::string out = Utf8(L"active\t" + std::to_wstring(IndexOf(g.activeId))) + "\n";
+    // The active tab's place among the tabs written (a tab with no address yet isn't).
+    size_t active = 0, n = 0;
+    std::string tabs;
     for (auto& t : g.tabs) {
         if (t->url.empty()) continue;
-        out += Utf8(L"tab\t" + Field(t->url) + L"\t" + Field(t->title) + L"\t" + (t->pinned ? L"1" : L"0")) + "\n";
+        if (t->id == g.activeId) active = n;
+        n++;
+        tabs += Utf8(L"tab\t" + Field(t->url) + L"\t" + Field(t->title) + L"\t" + (t->pinned ? L"1" : L"0")) + "\n";
     }
-    WriteFileUtf8(g.dataDir + L"\\session.tsv", out);
+    WriteFileUtf8(g.dataDir + L"\\session.tsv", "active\t" + std::to_string(active) + "\n" + tabs);
 }
 
 static void SaveHistory() {
@@ -333,6 +343,9 @@ static void SaveFavicons() {
 }
 
 static void MarkSessionDirty() {
+    // Saved 1.5 s after the first change, not the last: a page that retitles itself every second (a ticker, an
+    // unread count) would otherwise push the save back forever.
+    if (g.sessionDirty) return;
     g.sessionDirty = true;
     SetTimer(g.hwnd, kTimerSave, 1500, nullptr);
 }
@@ -407,8 +420,64 @@ static void SendHistory() {
 // apple-touch-icon most sites keep at their root), fetched once and kept in icons.tsv. The tab
 // strip's small favicons stay in g.favicons.
 static const UINT WM_APP_ICON = WM_APP + 4;  // lParam: new std::pair<site, data: URL or "">*
+static const UINT kTimerIcons = 11;           // new icons: saved and shown together, a moment after the last
 static std::unordered_map<std::wstring, std::wstring> g_icons;
 static std::unordered_set<std::wstring> g_iconTried;
+static std::unordered_map<std::wstring, long long> g_iconMiss;  // site -> when none was found; asked again a week later
+static bool g_iconsDirty = false;
+// One fetch at a time, in order: an import can bring hundreds of bookmarks at once.
+static std::mutex g_iconLock;
+static std::deque<std::pair<std::wstring, std::vector<std::wstring>>> g_iconQueue;
+static bool g_iconWorking = false;
+
+// A site's icon as the cards draw it: the largest picture in the file (an .ico holds several), at most 96 px (cards
+// show it at 30 to 48), as PNG. A 512 px touch icon would otherwise ride along in every new tab page's data.
+static std::string ShrinkIcon(const std::string& bytes) {
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return {};
+    ComPtr<IStream> in;
+    in.Attach(SHCreateMemStream((const BYTE*)bytes.data(), (UINT)bytes.size()));
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (!in || FAILED(wic->CreateDecoderFromStream(in.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder))) return {};
+    UINT frames = 0, bw = 0, bh = 0;
+    decoder->GetFrameCount(&frames);
+    ComPtr<IWICBitmapFrameDecode> best;
+    for (UINT i = 0; i < frames; i++) {
+        ComPtr<IWICBitmapFrameDecode> f;
+        UINT w = 0, h = 0;
+        if (SUCCEEDED(decoder->GetFrame(i, &f)) && SUCCEEDED(f->GetSize(&w, &h)) && w * h > bw * bh) { best = f; bw = w; bh = h; }
+    }
+    if (!best || bw < 32 || bh < 32) return {};
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(best.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        return {};
+    ComPtr<IWICBitmapSource> source = converter;
+    UINT side = std::min<UINT>(96, std::max(bw, bh));
+    UINT w = bw >= bh ? side : std::max<UINT>(1, bw * side / bh), h = bh >= bw ? side : std::max<UINT>(1, bh * side / bw);
+    if (w != bw || h != bh) {
+        ComPtr<IWICBitmapScaler> scaler;
+        if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(converter.Get(), w, h, WICBitmapInterpolationModeHighQualityCubic)))
+            return {};
+        source = scaler;
+    }
+    ComPtr<IStream> out;
+    out.Attach(SHCreateMemStream(nullptr, 0));
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    if (!out || FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) ||
+        FAILED(encoder->Initialize(out.Get(), WICBitmapEncoderNoCache)) || FAILED(encoder->CreateNewFrame(&frame, nullptr)) ||
+        FAILED(frame->Initialize(nullptr)) || FAILED(frame->SetSize(w, h)) || FAILED(frame->SetPixelFormat(&format)) ||
+        FAILED(frame->WriteSource(source.Get(), nullptr)) || FAILED(frame->Commit()) || FAILED(encoder->Commit()))
+        return {};
+    ULARGE_INTEGER size{};
+    if (FAILED(IStream_Size(out.Get(), &size)) || FAILED(IStream_Reset(out.Get()))) return {};
+    std::string png((size_t)size.QuadPart, '\0');
+    if (FAILED(IStream_Read(out.Get(), png.data(), (ULONG)png.size()))) return {};
+    return png;
+}
 
 static std::wstring IconDataUrl(const std::string& b) {
     if (b.size() < 16 || b.size() > 512 * 1024) return L"";
@@ -427,26 +496,51 @@ static std::wstring IconDataUrl(const std::string& b) {
     return type ? std::wstring(L"data:") + type + L";base64," + Base64((const BYTE*)b.data(), (DWORD)b.size()) : L"";
 }
 
+static void IconWorker();
+
 static void FetchIcon(const std::wstring& site, const std::wstring& declared) {
-    // Tried once per session each way: from the page's own choice, and by guessing the address.
+    // Tried once per session each way: from the page's own choice, and by guessing the address. A site with
+    // none to guess is left alone for a week.
     if (site.empty() || g_icons.count(site) || !g_iconTried.insert(site + (declared.empty() ? L"" : L"#page")).second) return;
+    if (declared.empty())
+        if (auto miss = g_iconMiss.find(site); miss != g_iconMiss.end() && NowSeconds() - miss->second < 7 * 86400) return;
     std::vector<std::wstring> urls;
     if (declared.rfind(L"https://", 0) == 0) urls.push_back(declared);
     urls.push_back(L"https://" + site + L"/apple-touch-icon.png");
     if (site.rfind(L"www.", 0) != 0) urls.push_back(L"https://www." + site + L"/apple-touch-icon.png");
+    // Last, the site's favicon.ico: often 32 or 48 px inside, enough for a card when nothing larger exists.
+    urls.push_back(L"https://" + (site.rfind(L"www.", 0) == 0 ? site : L"www." + site) + L"/favicon.ico");
+    std::lock_guard<std::mutex> lock(g_iconLock);
+    g_iconQueue.push_back({site, urls});
+    if (!g_iconWorking) {
+        g_iconWorking = true;
+        std::thread(IconWorker).detach();
+    }
+}
+
+static void IconWorker() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     HWND hwnd = g.hwnd;
-    std::thread([hwnd, site, urls] {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    for (;;) {
+        std::pair<std::wstring, std::vector<std::wstring>> next;
+        {
+            std::lock_guard<std::mutex> lock(g_iconLock);
+            if (g_iconQueue.empty()) { g_iconWorking = false; break; }
+            next = std::move(g_iconQueue.front());
+            g_iconQueue.pop_front();
+        }
         std::wstring data;
-        for (auto& u : urls) {
+        for (auto& u : next.second) {
             wchar_t file[MAX_PATH];
             if (FAILED(URLDownloadToCacheFileW(nullptr, u.c_str(), file, MAX_PATH, 0, nullptr))) continue;
-            data = IconDataUrl(ReadFileUtf8(file));
+            std::string bytes = ReadFileUtf8(file);
+            std::string png = ShrinkIcon(bytes);
+            data = png.empty() ? IconDataUrl(bytes) : L"data:image/png;base64," + Base64((const BYTE*)png.data(), (DWORD)png.size());
             if (!data.empty()) break;
         }
-        CoUninitialize();
-        PostMessageW(hwnd, WM_APP_ICON, 0, (LPARAM)new std::pair<std::wstring, std::wstring>(site, data));
-    }).detach();
+        PostMessageW(hwnd, WM_APP_ICON, 0, (LPARAM)new std::pair<std::wstring, std::wstring>(next.first, data));
+    }
+    CoUninitialize();
 }
 
 // The page's own choice: its largest icon, an SVG one first.
@@ -458,8 +552,11 @@ static const wchar_t kIconScript[] =
     L" return all.length && score(all[0]) >= 32 ? all[0].href : ''; })()";
 
 static void SaveIcons() {
-    std::string out;
+    g_iconsDirty = false;
+    std::string out, miss;
     for (auto& [site, data] : g_icons) out += Utf8(site + L"\t" + data) + "\n";
+    for (auto& [site, when] : g_iconMiss) miss += Utf8(site) + "\t" + std::to_string(when) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\iconmiss.tsv", miss);
     WriteFileUtf8(g.dataDir + L"\\icons.tsv", out);
 }
 
@@ -519,6 +616,14 @@ static void RefreshNewTabs() {
 static void SendBookmarks() {
     UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
     RefreshNewTabs();
+}
+
+static void RemoveBookmark(const std::wstring& url) {
+    auto it = std::find_if(g.bookmarks.begin(), g.bookmarks.end(), [&](auto& b) { return b.url == url; });
+    if (it == g.bookmarks.end()) return;
+    g.bookmarks.erase(it);
+    SaveBookmarks();
+    SendBookmarks();
 }
 
 static void ToggleBookmark(const std::wstring& url, const std::wstring& title) {
@@ -648,7 +753,18 @@ static std::wstring FirefoxProfile() {
 // Every Chromium browser on this PC: the well-known ones by name, then any folder one or two levels
 // under %LOCALAPPDATA% holding "User Data\Default" with bookmarks or history (Aside, Arc, Comet,
 // Thorium and whatever comes next), and Firefox.
+static std::vector<Browser> ScanBrowsers();
+
+// Settings asks for the list every time it reloads; the scan reads two levels of %LOCALAPPDATA% and the registry,
+// so its answer is kept for half a minute.
 static std::vector<Browser> DetectBrowsers() {
+    static std::vector<Browser> cached;
+    static ULONGLONG at = 0;
+    if (!at || GetTickCount64() - at > 30000) { cached = ScanBrowsers(); at = GetTickCount64(); }
+    return cached;
+}
+
+static std::vector<Browser> ScanBrowsers() {
     static const std::pair<const wchar_t*, const wchar_t*> known[] = {
         {L"Google\\Chrome", L"Chrome"}, {L"Google\\Chrome Beta", L"Chrome Beta"}, {L"Google\\Chrome SxS", L"Chrome Canary"},
         {L"Microsoft\\Edge", L"Edge"}, {L"Microsoft\\Edge Beta", L"Edge Beta"}, {L"BraveSoftware\\Brave-Browser", L"Brave"},
@@ -1536,6 +1652,8 @@ static void SetGlass(const std::wstring& spec) {
         if (w < 1 || h < 1) continue;
         wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
         float pad = GlassBlur(kind) * 3 * k;
+        if (x + w <= g.contentRect.left || y + h <= g.contentRect.top || x >= g.contentRect.right || y >= g.contentRect.bottom)
+            continue;
         auto surface = g.compositor.CreateVisualSurface();
         surface.SourceVisual(g.content);
         surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
@@ -1750,13 +1868,21 @@ static void FocusTarget(int target) {
 
 // A part of the chrome page over the content that takes the pointer while the page keeps the keyboard
 // (Exo Vault's menu beside a sign-in field), in window pixels.
-static RECT g_uiHot{};
+// Parts of the chrome page over the page that take the mouse while the page keeps the keyboard (Exo Vault's fill
+// menu and its save prompt).
+static std::vector<RECT> g_uiHot;
+
+static bool InUiHot(POINT pt) {
+    for (auto& r : g_uiHot) if (PtInRect(&r, pt)) return true;
+    return false;
+}
 
 // What the pointer is over: the Bar and every overlay belong to the chrome page, the content
 // card to the active tab.
 static int HitTarget(POINT pt) {
-    if (g.overlay || PtInRect(&g_uiHot, pt)) return kUi;
-    if ((g.revealTop && pt.y < g.revealTop) || (g.revealLeft && pt.x < g.revealLeft)) return kUi;
+    if (g.overlay || InUiHot(pt)) return kUi;
+    // In full screen the chrome page is hidden: a reveal band left from before would swallow the page's clicks.
+    if (!g.fullscreen && ((g.revealTop && pt.y < g.revealTop) || (g.revealLeft && pt.x < g.revealLeft))) return kUi;
     if (PtInRect(&g.contentRect, pt)) {
         Tab* a = Active();
         return a && a->comp ? a->id : kUi;
@@ -1780,6 +1906,80 @@ static void SendMouse(int target, COREWEBVIEW2_MOUSE_EVENT_KIND kind, WPARAM wp,
     comp->SendMouseInput(kind, (COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS)GET_KEYSTATE_WPARAM(wp), data, pt);
 }
 
+// Files, links and text dragged onto the window go to the page under the pointer (an upload, a board's cards), as
+// in any browser: views hosted in the window's composition get no drops of their own.
+class DropTarget : public IDropTarget {
+    LONG refs = 1;
+    ComPtr<IDataObject> data;
+    ComPtr<ICoreWebView2CompositionController3> over;
+    static ComPtr<ICoreWebView2CompositionController3> At(POINTL screen, POINT* pt) {
+        POINT p{screen.x, screen.y};
+        ScreenToClient(g.hwnd, &p);
+        int target = HitTarget(p);
+        if (target != kUi) { p.x -= g.contentRect.left; p.y -= g.contentRect.top; }
+        *pt = p;
+        ComPtr<ICoreWebView2CompositionController3> c3;
+        if (ICoreWebView2CompositionController* comp = CompFor(target)) comp->QueryInterface(IID_PPV_ARGS(&c3));
+        return c3;
+    }
+    // The pointer moved onto another view: leave the old one, enter the new.
+    void Follow(const ComPtr<ICoreWebView2CompositionController3>& next, DWORD keys, POINT pt, DWORD* effect) {
+        if (next == over) return;
+        if (over) over->DragLeave();
+        over = next;
+        if (over) over->DragEnter(data.Get(), keys, pt, effect);
+    }
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) { *out = static_cast<IDropTarget*>(this); AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&refs); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* d, DWORD keys, POINTL screen, DWORD* effect) override {
+        data = d;
+        POINT pt;
+        auto next = At(screen, &pt);
+        over.Reset();
+        *effect = DROPEFFECT_NONE;
+        Follow(next, keys, pt, effect);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL screen, DWORD* effect) override {
+        POINT pt;
+        auto next = At(screen, &pt);
+        DWORD entered = *effect;
+        Follow(next, keys, pt, &entered);
+        if (!over) { *effect = DROPEFFECT_NONE; return S_OK; }
+        return over->DragOver(keys, pt, effect);
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        if (over) over->DragLeave();
+        over.Reset();
+        data.Reset();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* d, DWORD keys, POINTL screen, DWORD* effect) override {
+        data = d;
+        POINT pt;
+        auto next = At(screen, &pt);
+        DWORD entered = *effect;
+        Follow(next, keys, pt, &entered);
+        HRESULT hr = over ? over->Drop(d, keys, pt, effect) : (*effect = DROPEFFECT_NONE, S_OK);
+        over.Reset();
+        data.Reset();
+        return hr;
+    }
+};
+
+// The button that is down while the window holds the mouse, so a drag cut short (Alt+Tab, a popup taking the
+// mouse) can still be ended in the page; and when the middle button last came up (Chromium opens a middle-clicked
+// link on release, after the button state is gone).
+static UINT g_captureUp = 0;
+static POINT g_capturePt{};
+static ULONGLONG g_middleUpAt = 0;
+
 static void SendLeave(int target) {
     if (ICoreWebView2CompositionController* comp = CompFor(target))
         comp->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, {0, 0});
@@ -1795,6 +1995,8 @@ static void OnNewTabMessage(int id, const std::wstring& msg);
 static void OnVaultPage(Tab* t, const std::wstring& from, const std::wstring& raw);
 static bool HandleKey(UINT vk, bool repeat, bool fromUi);
 static void SetFullscreen(bool on);
+static void LeaveFullscreen();
+static void CloseOverlay(bool tell);
 
 static void EnsureView(Tab* t, std::function<void(Tab*)> then) {
     if (t->ctl) { if (then) then(t); return; }
@@ -1967,6 +2169,8 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
     t->comp = comp;
     comp->QueryInterface(IID_PPV_ARGS(&t->ctl));
     t->ctl->get_CoreWebView2(&t->core);
+    if (t->muted)
+        if (ComPtr<ICoreWebView2_8> c8; SUCCEEDED(t->core.As(&c8))) c8->put_IsMuted(TRUE);
     t->visual = g.compositor.CreateContainerVisual();
     t->visual.Size({(float)(g.contentRect.right - g.contentRect.left), (float)(g.contentRect.bottom - g.contentRect.top)});
     comp->put_RootVisualTarget(static_cast<::IUnknown*>(winrt::get_unknown(t->visual)));
@@ -2057,6 +2261,7 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
                     return S_OK;
                 }
                 t->loading = true;
+                a->get_NavigationId(&t->navId);
                 bool black = IsNewTab(url);
                 if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
                     c2->put_DefaultBackgroundColor(black ? COREWEBVIEW2_COLOR{255, 0, 0, 0} : COREWEBVIEW2_COLOR{255, 255, 255, 255});
@@ -2067,6 +2272,9 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
     t->core->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
         [id](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* a) -> HRESULT {
             if (Tab* t = FindTab(id)) {
+                UINT64 nav = 0;
+                a->get_NavigationId(&nav);
+                if (nav != t->navId) return S_OK;
                 t->loading = false;
                 BOOL ok = FALSE;
                 a->get_IsSuccess(&ok);
@@ -2111,7 +2319,7 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
             LPWSTR u = nullptr;
             a->get_Uri(&u);
             // Ctrl+click and middle click open behind, as every browser does.
-            bool background = GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MBUTTON) < 0;
+            bool background = GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MBUTTON) < 0 || GetTickCount64() - g_middleUpAt < 500;
             auto t = std::make_unique<Tab>();
             t->id = g.nextId++;
             t->url = Take(u);
@@ -2149,9 +2357,13 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
         [id](ICoreWebView2* core, ICoreWebView2ProcessFailedEventArgs* a) -> HRESULT {
             COREWEBVIEW2_PROCESS_FAILED_KIND kind;
             a->get_ProcessFailedKind(&kind);
-            if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ||
-                kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE)
-                core->Reload();
+            if (kind != COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED) return S_OK;
+            // At most three reloads a minute: a page that crashes as it loads would loop.
+            static std::unordered_map<int, std::pair<int, ULONGLONG>> crashes;
+            auto& [count, since] = crashes[id];
+            ULONGLONG now = GetTickCount64();
+            if (now - since > 60000) { count = 0; since = now; }
+            if (++count <= 3) core->Reload();
             return S_OK;
         }).Get(), &tok);
     comp->add_CursorChanged(Callback<ICoreWebView2CursorChangedEventHandler>(
@@ -2239,6 +2451,8 @@ static void ShowActive() {
 
 static void Activate(int id) {
     if (!FindTab(id)) return;
+    // A video's full screen belongs to its own tab: switching away leaves it.
+    if (id != g.activeId && g.elementFullscreen) LeaveFullscreen();
     if (Tab* prev = Active()) prev->lastActive = GetTickCount64();
     g.activeId = id;
     ShowActive();
@@ -2286,6 +2500,7 @@ static void CloseTab(int id) {
     if (g.capture == id) g.capture = 0;
     if (g.hover == id) g.hover = 0;
     if (g.focus == id) g.focus = 0;
+    if (id == g.activeId && g.elementFullscreen) LeaveFullscreen();
     Discard(t);
     g.tabs.erase(g.tabs.begin() + i);
     if (g.activeId == id) {
@@ -2320,11 +2535,13 @@ static void CycleTab(int step) {
 
 // Background tabs step down: lower memory priority after a minute, frozen after five,
 // closed (title, icon and address kept) after thirty. Playing tabs are never touched.
+static bool Downloading(int tabId);
+
 static void SleepTick() {
     ULONGLONG now = GetTickCount64();
     for (auto& up : g.tabs) {
         Tab* t = up.get();
-        if (t->id == g.activeId || !t->ctl || t->audible || t->creating) continue;
+        if (t->id == g.activeId || !t->ctl || t->audible || t->creating || Downloading(t->id)) continue;
         ULONGLONG idle = now - t->lastActive;
         if (idle > kDiscardAfterMs) {
             Discard(t);
@@ -2396,6 +2613,7 @@ struct Download {
     long long received = 0, total = 0, started = 0;
     ComPtr<ICoreWebView2DownloadOperation> op;
     int closeTab = 0;  // the tab that only fetched this file: closed once the file is finished
+    int tab = 0;       // the tab it came from: kept awake until the file is done
 };
 static std::vector<Download> g_downloads;
 static int g_nextDownload = 1;
@@ -2405,6 +2623,13 @@ static const UINT WM_APP_DOWNLOADS = WM_APP + 3;
 static Download* FindDownload(int id) {
     for (auto& d : g_downloads) if (d.id == id) return &d;
     return nullptr;
+}
+
+// A download still coming in needs its page: WebView2 never finishes one whose page is gone.
+static bool Downloading(int tabId) {
+    for (auto& d : g_downloads)
+        if (d.op && (d.tab == tabId || d.closeTab == tabId) && (d.state == L"progress" || d.state == L"paused")) return true;
+    return false;
 }
 
 static void SaveDownloads() {
@@ -2431,12 +2656,14 @@ static void LoadDownloads() {
     }
 }
 
-static std::wstring DownloadsJson() {
+static std::wstring DownloadsJson(bool checkFiles = false) {
     std::wstring items;
     for (auto it = g_downloads.rbegin(); it != g_downloads.rend(); ++it) {
         auto& d = *it;
         std::wstring name = d.path.substr(d.path.find_last_of(L'\\') + 1);
-        bool exists = d.state != L"done" || GetFileAttributesW(d.path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        // A finished file you deleted shows as gone; asked of the disk only when the list is opened.
+        if (checkFiles && d.state == L"done" && GetFileAttributesW(d.path.c_str()) == INVALID_FILE_ATTRIBUTES) d.state = L"gone";
+        bool exists = d.state != L"gone";
         if (!items.empty()) items += L",";
         items += L"{\"id\":" + std::to_wstring(d.id) + L",\"url\":" + Json(d.url) + L",\"name\":" + Json(name) + L",\"state\":" +
                  Json(exists ? d.state : L"gone") + L",\"received\":" + std::to_wstring(d.received) + L",\"total\":" +
@@ -2457,7 +2684,6 @@ static void QueueDownloads() {
 static void SendDownloads() {
     g_downloadsPending = false;
     UiPost(L"{\"t\":\"downloads\",\"items\":" + DownloadsJson() + L"}");
-    RefreshNewTabs();
 }
 
 static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) {
@@ -2481,6 +2707,7 @@ static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) 
     d.id = g_nextDownload++;
     d.op = op;
     d.closeTab = closeTab;
+    d.tab = tabId;
     d.state = L"progress";
     d.started = NowSeconds();
     LPWSTR uri = nullptr, path = nullptr;
@@ -2649,7 +2876,7 @@ static void ApiData(const std::wstring& path, ApiReply reply) {
     else if (path == L"/state.json") reply(Utf8(StateJson()), L"application/json", 200);
     else if (path == L"/bookmarks.json") reply(Utf8(BookmarksJson()), L"application/json", 200);
     else if (path == L"/history.json") reply(Utf8(HistoryJson()), L"application/json", 200);
-    else if (path == L"/downloads.json") reply(Utf8(DownloadsJson()), L"application/json", 200);
+    else if (path == L"/downloads.json") reply(Utf8(DownloadsJson(true)), L"application/json", 200);
     // /icon/<site>: the icon this browser already has for a site (Exo Vault's rows), never fetched for it.
     else if (path.rfind(L"/icon/", 0) == 0) reply(Utf8(Json(FavFor(L"https://" + path.substr(6) + L"/"))), L"application/json", 200);
     else if (path.rfind(L"/exticon/", 0) == 0) {
@@ -2741,6 +2968,7 @@ static void InstallStoreExtension(const std::wstring& id) {
 
 static void OpenOverlay(const wchar_t* mode, const std::wstring& text) {
     if (!g.uiReady) return;
+    LeaveFullscreen();  // search needs the Bar, which full screen hides
     bool was = g.overlay;
     g.overlay = true;
     SetRevealed(true);
@@ -2768,6 +2996,9 @@ static void SetFullscreen(bool on) {
     if (on == g.fullscreen) return;
     g.fullscreen = on;
     if (on) {
+        // The Bar and everything over the page hide in full screen: a sheet or menu left open would keep the
+        // window's input with nothing to show for it.
+        CloseOverlay(true);
         GetWindowPlacement(g.hwnd, &g.placement);
         g.savedStyle = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
         MONITORINFO mi{sizeof mi};
@@ -2784,6 +3015,18 @@ static void SetFullscreen(bool on) {
     }
     Layout();
     QueueState();
+}
+
+// Out of full screen for the window's own surfaces (a sheet, a menu, search), and out of a video's full screen
+// when its tab is no longer the one on screen.
+static void LeaveFullscreen() {
+    if (!g.fullscreen) return;
+    if (g.elementFullscreen) {
+        for (auto& t : g.tabs)
+            if (t->core) t->core->ExecuteScript(L"document.fullscreenElement && document.exitFullscreen()", nullptr);
+        g.elementFullscreen = false;
+    }
+    SetFullscreen(false);
 }
 
 static void Navigate(const std::wstring& url, bool newTab) {
@@ -2817,7 +3060,7 @@ static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
         case 'L': OpenOverlay(L"edit"); return true;
         case 'K': if (g.overlay && g.tabs.size()) UiPost(L"{\"t\":\"close\"}"); else OpenOverlay(L"palette"); return true;
         case 'W': case VK_F4: if (a) CloseTab(a->id); return true;
-        case 'F': if (!shift && a) { UiPost(L"{\"t\":\"find\"}"); FocusTarget(kUi); } return !shift;
+        case 'F': if (!shift && a) { LeaveFullscreen(); UiPost(L"{\"t\":\"find\"}"); FocusTarget(kUi); } return !shift;
         case 'R': if (fromUi && a && a->core) a->core->Reload(); return fromUi;
         }
         if (vk >= '1' && vk <= '9' && !g.tabs.empty()) {
@@ -2863,7 +3106,7 @@ static void OnNewTabMessage(int id, const std::wstring& msg) {
     } else if (v == L"palette") {
         if (id == g.activeId) OpenOverlay(L"ntp", arg(1));
     } else if (v == L"unbookmark") {
-        ToggleBookmark(arg(1), L"");
+        RemoveBookmark(arg(1));
     } else if (v == L"forget") {
         std::wstring site = SiteOf(arg(1));
         for (auto it = g.history.begin(); it != g.history.end();)
@@ -2873,7 +3116,7 @@ static void OnNewTabMessage(int id, const std::wstring& msg) {
         RefreshNewTabs();
     } else if (v == L"settings") {
         OpenSettings(arg(1));
-    } else if (v.rfind(L"vault", 0) != 0) {  // the vault answers the chrome page alone
+    } else if (v == L"bookmarkMove") {  // dragging a card; nothing else of the chrome page's is the page's to ask
         OnUiMessage(msg);
         RefreshNewTabs();
     }
@@ -2887,7 +3130,10 @@ static void OnNewTabMessage(int id, const std::wstring& msg) {
 
 static const UINT WM_APP_VAULT = WM_APP + 5;  // lParam: new VaultJob*
 static const UINT kTimerVault = 9, kTimerClipboard = 10;
-struct VaultJob { std::wstring op; vault::Opened opened; vault::Result result = vault::Ok; };
+struct VaultJob { std::wstring op; vault::Opened opened; vault::Result result = vault::Ok; unsigned epoch = 0; };
+// Each lock moves this on: an unlock that finishes after Windows locked (or the user locked) is dropped.
+static unsigned g_vaultEpoch = 0;
+static bool g_vaultOpening = false;  // an unlock, Hello or create is running (each holds 256 MiB)
 static ULONGLONG g_vaultActive = 0;
 static DWORD g_clipboardSeq = 0;
 static bool g_helloReady = false;
@@ -2933,9 +3179,11 @@ static void VaultError(const std::wstring& op, vault::Result r) {
 
 // Argon2id takes a moment: the work runs on its own thread and comes back as WM_APP_VAULT.
 static void VaultOffThread(const std::wstring& op, std::function<VaultJob()> work) {
-    std::thread([op, work] {
+    unsigned epoch = g_vaultEpoch;
+    std::thread([op, work, epoch] {
         auto* job = new VaultJob(work());
         job->op = op;
+        job->epoch = epoch;
         if (!PostMessageW(g.hwnd, WM_APP_VAULT, 0, (LPARAM)job)) { vault::Wipe(job->opened.key); vault::Wipe(job->opened.json); delete job; }
     }).detach();
 }
@@ -2953,7 +3201,12 @@ static void OnVaultJob(VaultJob* job) {
     std::unique_ptr<VaultJob> owned(job);
     vault::Opened& o = job->opened;
     if (job->op == L"create" || job->op == L"unlock" || job->op == L"hello") {
-        if (o.result == vault::Ok) VaultOpened(o);
+        g_vaultOpening = false;
+        if (job->epoch != g_vaultEpoch) {  // locked meanwhile
+            vault::Wipe(o.key);
+            vault::Wipe(o.json);
+            VaultState();
+        } else if (o.result == vault::Ok) VaultOpened(o);
         else VaultError(job->op, o.result);
     } else if (job->op == L"importExo") {
         if (o.result == vault::Ok) VaultPost(L"importJson", L",\"json\":" + Json(Wide(o.json)));
@@ -2970,6 +3223,7 @@ static void OnVaultJob(VaultJob* job) {
 }
 
 static void VaultLock() {
+    g_vaultEpoch++;
     if (!vault::Unlocked()) return;
     vault::Lock();
     VaultPost(L"locked");
@@ -3291,8 +3545,12 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
         VaultState();
     } else if (v == L"vaultCreate" || v == L"vaultUnlock") {
         bool create = v == L"vaultCreate";
-        std::string password = FromB64(arg(1));
         std::wstring file = VaultFile();
+        // Create never replaces a vault (a page that thought there was none); a second click waits for the first.
+        if (create && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) { VaultState(); return; }
+        if (g_vaultOpening) return;
+        g_vaultOpening = true;
+        std::string password = FromB64(arg(1));
         VaultOffThread(create ? L"create" : L"unlock", [create, file, password]() mutable {
             VaultJob job;
             job.opened = create ? vault::Create(file, password, "{\"version\":1,\"items\":[]}") : vault::Unlock(file, password);
@@ -3301,9 +3559,11 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
         });
         vault::Wipe(password);
     } else if (v == L"vaultHello") {
+        if (g_vaultOpening) return;
+        g_vaultOpening = true;
         std::wstring file = VaultFile();
         vault::HelloKey(false, [file](vault::Result r, std::string key) {
-            if (r != vault::Ok) { VaultError(L"hello", r); return; }
+            if (r != vault::Ok) { g_vaultOpening = false; VaultError(L"hello", r); return; }
             VaultOffThread(L"hello", [file, key]() mutable {
                 VaultJob job;
                 job.opened = vault::UnlockWithHelloKey(file, key);
@@ -3372,7 +3632,7 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
         std::wstring origin = arg(2);
         std::string payload = FromB64(arg(3));
         if (vault::Unlocked() && t && t->core && !origin.empty() && OriginOf(t->url) == origin) {
-            std::wstring script = L"window.__exoVaultFill&&window.__exoVaultFill(" + Wide(payload) + L")";
+            std::wstring script = L"location.origin===" + Json(origin) + L"&&window.__exoVaultFill&&window.__exoVaultFill(" + Wide(payload) + L")";
             t->core->ExecuteScript(script.c_str(), nullptr);
             SecureZeroMemory(script.data(), script.size() * sizeof(wchar_t));
         }
@@ -3381,10 +3641,15 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
         // Back to the page after the fill menu (a click there gave the chrome page the keyboard).
         if (FindTab(_wtoi(arg(1).c_str()))) FocusTarget(_wtoi(arg(1).c_str()));
     } else if (v == L"vaultHot") {
-        // The fill menu's place, in the chrome page's pixels; none when it closes.
+        // The fill menu's and the save prompt's places, "x,y,w,h;..." in the chrome page's pixels; none when closed.
         float k = Scale();
-        g_uiHot = p.size() < 5 ? RECT{} : RECT{(LONG)(_wtof(arg(1).c_str()) * k), (LONG)(_wtof(arg(2).c_str()) * k),
-                                               (LONG)((_wtof(arg(1).c_str()) + _wtof(arg(3).c_str())) * k), (LONG)((_wtof(arg(2).c_str()) + _wtof(arg(4).c_str())) * k)};
+        g_uiHot.clear();
+        for (auto& item : Split(arg(1), L';')) {
+            auto f = Split(item, L',');
+            if (f.size() < 4) continue;
+            float x = (float)_wtof(f[0].c_str()), y = (float)_wtof(f[1].c_str()), w = (float)_wtof(f[2].c_str()), h = (float)_wtof(f[3].c_str());
+            if (w > 0 && h > 0) g_uiHot.push_back({(LONG)(x * k), (LONG)(y * k), (LONG)((x + w) * k), (LONG)((y + h) * k)});
+        }
     }
 }
 
@@ -3431,6 +3696,7 @@ static void OnUiMessage(const std::wstring& msg) {
         // 1: a menu or sheet takes the whole window's input; 0: back to the page.
         if (arg(1) == L"0") CloseOverlay(false);
         else if (!g.overlay) {
+            LeaveFullscreen();
             g.overlay = true;
             SetRevealed(true);
             if (arg(2) == L"blur") SetBlur(true);
@@ -3533,10 +3799,10 @@ static void OnUiMessage(const std::wstring& msg) {
         }
     } else if (v == L"glass") {
         SetGlass(arg(1));
-    } else if (v == L"pin") {
-        // Something of the chrome is open (find, a menu): the Bar stays.
+    } else if (v == L"holdBar") {
+        // Something of the chrome is open (find, a menu): the Bar stays. (Its own verb: "pin" pins a tab.)
         g.pinned = arg(1) == L"1";
-        if (g.pinned) Reveal(true, true);
+        if (g.pinned) { Reveal(true, true); FocusTarget(kUi); }  // the find field types even when Search just closed
         else { POINT pt; GetCursorPos(&pt); ScreenToClient(g.hwnd, &pt); AutoHideTrack(pt, false); }
     } else if (v == L"peek") {
     } else if (v == L"bookmarkAdd") {
@@ -3561,7 +3827,7 @@ static void OnUiMessage(const std::wstring& msg) {
         }
     } else if (v == L"historyDelete") {
         for (size_t i = 1; i < p.size(); i++) g.history.erase(p[i]);
-        SaveHistory();
+        g.historyDirty = true;
         SendHistory();
         RefreshNewTabs();
     } else if (v == L"clearData") {
@@ -3593,7 +3859,7 @@ static void OnUiMessage(const std::wstring& msg) {
     } else if (v == L"bookmark") {
         if (a) ToggleBookmark(a->url, a->title);
     } else if (v == L"unbookmark") {
-        ToggleBookmark(arg(1), L"");
+        RemoveBookmark(arg(1));
     } else if (v == L"addBookmarks") {
         // Imported: url, title pairs; ones already saved are skipped.
         int added = 0;
@@ -3726,6 +3992,19 @@ static void CreateUi() {
                 if (ComPtr<ICoreWebView2Settings6> s6; SUCCEEDED(s.As(&s6))) s6->put_IsSwipeNavigationEnabled(FALSE);
                 if (ComPtr<ICoreWebView2Settings9> s9; SUCCEEDED(s.As(&s9))) s9->put_IsNonClientRegionSupportEnabled(TRUE);
                 EventRegistrationToken tok;
+                g.ui->add_ProcessFailed(Callback<ICoreWebView2ProcessFailedEventHandler>(
+                    [](ICoreWebView2* core, ICoreWebView2ProcessFailedEventArgs* a) -> HRESULT {
+                        COREWEBVIEW2_PROCESS_FAILED_KIND kind;
+                        a->get_ProcessFailedKind(&kind);
+                        if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ||
+                            kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE) {
+                            g.uiReady = false;  // until it says "ready" again
+                            g_uiHot.clear();
+                            CloseOverlay(false);
+                            core->Reload();
+                        }
+                        return S_OK;
+                    }).Get(), nullptr);
                 g.ui->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
                     [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
                         LPWSTR m = nullptr;
@@ -3827,8 +4106,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (down) {
             if (!g.capture) SetCapture(hwnd);
             g.capture = target;
+            g_captureUp = msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK ? WM_RBUTTONUP : msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK ? WM_MBUTTONUP
+                        : msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK ? WM_XBUTTONUP : WM_LBUTTONUP;
             if (g.focus != target) FocusTarget(target);
         }
+        if (g.capture) g_capturePt = pt;
+        if (msg == WM_MBUTTONUP) g_middleUpAt = GetTickCount64();
         if (target) SendMouse(target, (COREWEBVIEW2_MOUSE_EVENT_KIND)msg, wp, pt);
         if (up && !(GET_KEYSTATE_WPARAM(wp) & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2))) {
             g.capture = 0;
@@ -3857,7 +4140,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_CAPTURECHANGED:
-        if ((HWND)lp != hwnd) g.capture = 0;
+        // Something else took the mouse mid-press: end the press in the page (a drag or a selection would stay
+        // live), and its hover.
+        if ((HWND)lp != hwnd && g.capture) {
+            int target = g.capture;
+            g.capture = 0;
+            SendMouse(target, (COREWEBVIEW2_MOUSE_EVENT_KIND)g_captureUp, 0, g_capturePt);
+            SendLeave(target);
+            if (g.hover == target) g.hover = 0;
+        }
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
@@ -3869,16 +4160,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_NCCALCSIZE:
-        // The whole window is client area; when maximized, Windows hangs the frame off-screen.
+        // No title bar: the Bar is the window's top. When maximized, Windows hangs the frame off-screen; otherwise
+        // the left, right and bottom keep Windows' own frame, which Windows 11 draws invisible outside the window,
+        // so resizing grabs there and not over the page (a page's scrollbar sits at the right edge).
         if (wp && !g.fullscreen) {
-            if (IsZoomed(hwnd)) {
-                auto* p = (NCCALCSIZE_PARAMS*)lp;
-                int f = GetSystemMetricsForDpi(SM_CXFRAME, g.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, g.dpi);
-                p->rgrc[0].left += f;
-                p->rgrc[0].top += f;
-                p->rgrc[0].right -= f;
-                p->rgrc[0].bottom -= f;
-            }
+            auto* p = (NCCALCSIZE_PARAMS*)lp;
+            int f = GetSystemMetricsForDpi(SM_CXFRAME, g.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, g.dpi);
+            if (IsZoomed(hwnd)) p->rgrc[0].top += f;
+            p->rgrc[0].left += f;
+            p->rgrc[0].right -= f;
+            p->rgrc[0].bottom -= f;
             return 0;
         }
         break;
@@ -3889,8 +4180,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         if (!IsZoomed(hwnd)) {
+            // The top edge is inside the Bar; the others are Windows' frame, outside the client area.
             int b = Px(kResizeDip);
-            bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, d = pt.y >= rc.bottom - b;
+            bool t = pt.y < b, l = pt.x < (t ? b : 0), r = pt.x >= rc.right - (t ? b : 0), d = pt.y >= rc.bottom;
             if (t && l) return HTTOPLEFT;
             if (t && r) return HTTOPRIGHT;
             if (d && l) return HTBOTTOMLEFT;
@@ -3910,12 +4202,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return HTCLIENT;
     }
-    case WM_SIZE:
+    case WM_SIZE: {
         g.minimized = wp == SIZE_MINIMIZED;
         if (Tab* a = Active(); a && a->ctl) a->ctl->put_IsVisible(!g.minimized);
         if (g.uiCtl) g.uiCtl->put_IsVisible(!g.minimized);
         if (!g.minimized) Layout();
-        QueueState();
+        static WPARAM shown = SIZE_RESTORED;
+        if (wp != shown) { shown = wp; QueueState(); }  // the page shows Maximize or Restore
+        return 0;
+    }
+    case WM_MOVE:
+        // A page's own popups (a select's list, its context menu, autofill) open where WebView2 thinks the window is.
+        if (g.uiCtl) g.uiCtl->NotifyParentWindowPositionChanged();
+        for (auto& t : g.tabs) if (t->ctl) t->ctl->NotifyParentWindowPositionChanged();
+        return 0;
+    case WM_QUERYENDSESSION:
+        return TRUE;
+    case WM_ENDSESSION:
+        // Windows is signing out or restarting: WM_CLOSE never comes, so keep what it would have saved.
+        if (wp) {
+            vault::Lock();
+            SavePlacement();
+            SaveSession();
+            SaveHistory();
+            if (g.faviconsDirty) SaveFavicons();
+        }
         return 0;
     case WM_DPICHANGED: {
         g.dpi = HIWORD(wp);
@@ -3949,11 +4260,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_APP_ICON: {
         std::unique_ptr<std::pair<std::wstring, std::wstring>> icon((std::pair<std::wstring, std::wstring>*)lp);
-        if (!icon->second.empty()) {
-            g_icons[icon->first] = icon->second;
-            SaveIcons();
-            RefreshNewTabs();
-        }
+        if (icon->second.empty()) g_iconMiss[icon->first] = NowSeconds();
+        else { g_icons[icon->first] = icon->second; g_iconMiss.erase(icon->first); }
+        g_iconsDirty = true;
+        SetTimer(hwnd, kTimerIcons, 400, nullptr);
         return 0;
     }
     case WM_APP_EXT_READY: {
@@ -4011,6 +4321,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == WM_APP_DOWNLOADS) {
             KillTimer(hwnd, WM_APP_DOWNLOADS);
             SendDownloads();
+        } else if (wp == kTimerIcons) {
+            KillTimer(hwnd, kTimerIcons);
+            if (g_iconsDirty) SaveIcons();
+            RefreshNewTabs();
         } else if (wp == kTimerSave) {
             KillTimer(hwnd, kTimerSave);
             if (g.sessionDirty) SaveSession();
@@ -4080,7 +4394,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    OleInitialize(nullptr);  // COM for this thread, and drag and drop
     g.exeDir = ExeDir();
     g.dataDir = DataDir();
     for (auto& row : ReadTable(L"settings.tsv"))
@@ -4092,6 +4406,30 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (row.size() >= 2) g.favicons[row[0]] = row[1];
     for (auto& row : ReadTable(L"icons.tsv"))
         if (row.size() >= 2) g_icons[row[0]] = row[1];
+    for (auto& row : ReadTable(L"iconmiss.tsv"))
+        if (row.size() >= 2) g_iconMiss[row[0]] = _wtoi64(row[1].c_str());
+    // Icons saved full size by an earlier version shrink once, off the UI thread.
+    {
+        std::vector<std::pair<std::wstring, std::wstring>> large;
+        for (auto& [site, data] : g_icons)
+            if (data.size() > 24 * 1024 && data.rfind(L"data:image/svg", 0) != 0) large.push_back({site, data});
+        if (!large.empty()) {
+            std::thread([large] {
+                // After startup has settled (and the window exists to hear the results).
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                HWND hwnd = g.hwnd;
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                for (auto& [site, data] : large) {
+                    size_t comma = data.find(L',');
+                    std::string png = comma == std::wstring::npos ? std::string() : ShrinkIcon(FromB64(data.substr(comma + 1)));
+                    if (!png.empty())
+                        PostMessageW(hwnd, WM_APP_ICON, 0, (LPARAM)new std::pair<std::wstring, std::wstring>(
+                            site, L"data:image/png;base64," + Base64((const BYTE*)png.data(), (DWORD)png.size())));
+                }
+                CoUninitialize();
+            }).detach();
+        }
+    }
     for (auto& row : ReadTable(L"extensions.tsv"))
         if (row.size() >= 2) g_extFolders[row[0]] = row[1];
     LoadDownloads();
@@ -4129,6 +4467,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.dpi = GetDpiForWindow(g.hwnd);
     ApplyTheme();
     InitComposition();
+    RegisterDragDrop(g.hwnd, new DropTarget());
     SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     ShowWindow(g.hwnd, maximized ? SW_SHOWMAXIMIZED : show);
     Layout();
@@ -4143,7 +4482,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
-    CoUninitialize();
+    RevokeDragDrop(g.hwnd);
+    OleUninitialize();
     if (mutex) CloseHandle(mutex);
     return 0;
 }

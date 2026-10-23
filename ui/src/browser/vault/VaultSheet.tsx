@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { useGlide } from '../../lib/glide'
 import * as I from '../icons'
-import { closeVault, lock, setVault, useVault } from './store'
+import { closeVault, lock, setVault, useVault, vaultNow } from './store'
 import { Gate } from './Gate'
 import { Items, LISTS } from './Items'
 import { HealthView, Prefs } from './Prefs'
@@ -36,12 +36,14 @@ function Sheet() {
     return () => clearTimeout(t)
   }, [v.note])
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !document.querySelector(':popover-open')) closeVault() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented && !vaultNow().editing && !document.querySelector(':popover-open')) closeVault()
+    }
     addEventListener('keydown', onKey)
     return () => removeEventListener('keydown', onKey)
   }, [])
   return (
-    <div className="exo-set-room exb-set-room" onPointerDown={e => { if (e.target === e.currentTarget) closeVault() }}>
+    <div className="exo-set-room exb-set-room" onPointerDown={e => { if (e.target === e.currentTarget && !vaultNow().editing) closeVault() }}>
       <main className="exo-settings exb-vault" aria-label="Exo Vault">
         <span className="exo-glass is-panel exo-sheet-glass" aria-hidden="true" />
         <nav className="exo-settings-nav" aria-label="Exo Vault sections">

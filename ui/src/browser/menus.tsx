@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useSyncExternalStore, type KeyboardEvent } from 'react'
-import { browser, manifestOf, send, type Extension } from './host'
+import { browser, holdInput, isFirstRun, manifestOf, send, type Extension } from './host'
 import { openSettingsAt } from './SearchBox'
 import * as I from './icons'
 
@@ -20,13 +20,14 @@ const listeners = new Set<() => void>()
 const set = (next: Open | null) => { current = next; for (const l of listeners) l() }
 
 export function openMenu(items: Item[], x: number, y: number, right = false, kind = '') {
+  if (isFirstRun()) return
   set({ items, x, y, right, kind })
-  send('overlay', 1)
+  holdInput('menu', true)
 }
-export function closeMenu(silent = false) {
+export function closeMenu() {
   if (!current) return
   set(null)
-  if (!silent) send('overlay', 0)
+  holdInput('menu', false)
 }
 export const menuKind = () => current?.kind ?? ''
 
@@ -102,7 +103,7 @@ export function MenuLayer() {
     menu.style.left = `${Math.max(8, Math.min(left, innerWidth - w - 8))}px`
     menu.style.top = `${Math.max(8, Math.min(open.y + 4, innerHeight - h - 8))}px`
     menu.style.transformOrigin = open.right ? 'top right' : 'top left'
-    menu.querySelector<HTMLElement>('[role="menuitem"]')?.focus({ preventScroll: true })
+    if (!menu.contains(document.activeElement)) menu.querySelector<HTMLElement>('[role="menuitem"]')?.focus({ preventScroll: true })
   }, [open])
   if (!open) return null
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {

@@ -72,14 +72,15 @@ function pickQuote() {
 const hue = (site: string) => { let h = 0; for (const c of site) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360 }
 const siteName = (url: string) => { const raw = hostOf(url).split('.').slice(-2, -1)[0] || hostOf(url); return raw.charAt(0).toUpperCase() + raw.slice(1) }
 
-/** A card: the site's colors under Liquid Glass, its sharp icon (or its letter until one is found) and its name. */
+/** A card: the site's colors under Liquid Glass, its icon (or its letter until one is found) and its name. */
 function Card({ url, title, icon, sharp, index, onRemove }: { url: string; title: string; icon: string; sharp?: boolean; index: number; onRemove: () => void }) {
   const h = hue(hostOf(url))
   const tint = icon ? `url("${icon}")` : `linear-gradient(135deg, hsl(${h} 70% 45%), hsl(${(h + 50) % 360} 70% 30%))`
   return (
     <a className="exb-card" href={url} data-url={url} draggable={false} style={{ '--i': index, '--tint': tint } as CSSProperties}>
       <span className="exb-card-wash" />
-      <span className="exb-card-face">{icon && sharp ? <img src={icon} alt="" draggable={false} /> : siteName(url).charAt(0)}</span>
+      {/* The site's large icon; else its small one, drawn at its own size (not blown up); else its letter. */}
+      <span className="exb-card-face">{icon ? <img className={sharp ? undefined : 'is-small'} src={icon} alt="" draggable={false} /> : siteName(url).charAt(0)}</span>
       <span className="exb-card-name exo-glass">{title || siteName(url)}</span>
       <button type="button" className="exb-card-x exo-glass" aria-label="Remove" onClick={e => { e.preventDefault(); onRemove() }}><I.Close size={12} /></button>
     </a>
@@ -158,14 +159,21 @@ function Marks({ data, onMove }: { data: Data; onMove: (from: number, to: number
 function Page() {
   const [data, setData] = useState<Data | null>(null)
   const [quote] = useState(pickQuote)
-  const [menu, setMenu] = useState<{ url: string; x: number; y: number } | null>(null)
+  const [menu, setMenu] = useState<{ url: string; x: number; y: number; tile: boolean } | null>(null)
   useEffect(() => {
+    // Only the newest answer counts (two loads can cross), and a page in a tab you can't see waits until it's shown.
+    let asked = 0
     const load = async () => {
-      try { setData(await (await fetch('https://api.newtab.exo/ntp.json', { cache: 'no-store' })).json()) } catch { /* the host isn't there */ }
+      const n = ++asked
+      try {
+        const next = await (await fetch('https://api.newtab.exo/ntp.json', { cache: 'no-store' })).json() as Data
+        if (n === asked) setData(next)
+      } catch { /* the host isn't there */ }
     }
     void load()
-    webview?.addEventListener('message', e => { if (e.data === 'refresh') void load() })
-    const onShow = () => { if (!document.hidden) void load() }
+    let stale = false
+    webview?.addEventListener('message', e => { if (e.data !== 'refresh') return; if (document.hidden) stale = true; else void load() })
+    const onShow = () => { if (!document.hidden && stale) { stale = false; void load() } }
     document.addEventListener('visibilitychange', onShow)
     return () => document.removeEventListener('visibilitychange', onShow)
   }, [])
@@ -178,8 +186,10 @@ function Page() {
   }, [theme, material])
   useEffect(() => {
     const close = (e: PointerEvent) => { if (!(e.target as Element).closest('.exb-ntp-menu')) setMenu(null) }
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(null) }
     addEventListener('pointerdown', close)
-    return () => removeEventListener('pointerdown', close)
+    addEventListener('keydown', esc)
+    return () => { removeEventListener('pointerdown', close); removeEventListener('keydown', esc) }
   }, [])
 
   const inset = { '--exb-inset-top': `${data?.insetTop ?? 0}px`, '--exb-inset-left': `${data?.insetLeft ?? 0}px` } as CSSProperties
@@ -188,7 +198,7 @@ function Page() {
       const item = (e.target as Element).closest<HTMLElement>('.exb-ntp-marks [data-url]')
       if (!item) return
       e.preventDefault()
-      setMenu({ url: item.dataset.url!, x: Math.min(e.clientX, innerWidth - 230), y: Math.min(e.clientY + 4, innerHeight - 140) })
+      setMenu({ url: item.dataset.url!, x: Math.min(e.clientX, innerWidth - 230), y: Math.min(e.clientY + 4, innerHeight - 140), tile: !!item.closest('.is-tiles') })
     }}>
       <img className="exb-ntp-mark" src="exo-browser.svg" alt="" />
       <figure className="exb-ntp-quote"><blockquote>{quote[0]}</blockquote><figcaption>{quote[1]}</figcaption></figure>
@@ -207,8 +217,9 @@ function Page() {
       {menu ? (
         <div className="exb-ntp-menu exo-shelf-sort-menu" role="menu" style={{ left: menu.x, top: menu.y }}>
           <div role="menuitem" tabIndex={-1} className="exo-menu-item" onClick={() => { send('open', menu.url, 'new'); setMenu(null) }}><I.ExternalLink />Open in new tab</div>
-          <div role="menuitem" tabIndex={-1} className="exo-menu-item" onClick={() => { send('settings', 'bookmarks'); setMenu(null) }}><I.Star />Edit bookmarks</div>
-          <div role="menuitem" tabIndex={-1} className="exo-menu-item" onClick={() => { send('unbookmark', menu.url); setMenu(null) }}><I.Trash />Remove</div>
+          {menu.tile ? null : <div role="menuitem" tabIndex={-1} className="exo-menu-item" onClick={() => { send('settings', 'bookmarks'); setMenu(null) }}><I.Star />Edit bookmarks</div>}
+          {/* A most-visited site is forgotten (its history goes); a bookmark is removed. */}
+          <div role="menuitem" tabIndex={-1} className="exo-menu-item" onClick={() => { send(menu.tile ? 'forget' : 'unbookmark', menu.url); setMenu(null) }}><I.Trash />Remove</div>
         </div>
       ) : null}
     </main>

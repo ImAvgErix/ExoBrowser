@@ -152,9 +152,9 @@
   transition: background-color 120ms var(--ease-out), scale 120ms var(--ease-out);
 }
 
+/* Starting…: busy, not unavailable, so it stays solid (at 60% the white pill and its words went see-through over the art). */
 .exo-continue-play:disabled {
-  cursor: default;
-  opacity: 0.6;
+  cursor: progress;
 }
 
 @media (hover: hover) and (pointer: fine) {

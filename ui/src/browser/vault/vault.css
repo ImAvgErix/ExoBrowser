@@ -85,7 +85,7 @@
 .exb-vault-pick-copy > span, .exb-vault-pick-copy > small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .exb-vault-pick-copy > small { color: var(--color-muted); font-size: calc(12px * var(--exo-scale, 1)); }
 
-/* After a sign-in: save it? A toast's glass, under the Bar at the right. */
+/* After a sign-in: save it? A toast's glass, under the Bar (and the tabs across the top) at the right. */
 .exb-vault-prompt.exo-toast {
   position: fixed;
   top: calc(var(--exb-bar-h) + 8px);
@@ -97,5 +97,6 @@
   gap: 10px;
   animation: exb-vault-drop var(--dur-base) var(--ease-out);
 }
+.is-horizontal:not(.is-autohide) .exb-vault-prompt.exo-toast { top: calc(var(--exb-bar-h) + var(--exb-row-h) + 8px); }
 .exb-vault-prompt p { margin: 0; display: flex; flex-direction: column; }
 .exb-vault-prompt p span { color: var(--color-muted); font-size: calc(12px * var(--exo-scale, 1)); }

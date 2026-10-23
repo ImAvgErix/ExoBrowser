@@ -14,9 +14,10 @@ body { overflow-x: hidden; scrollbar-width: none; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 48px 24px;
-  /* In the window's middle, not just the space beside the Bar and side tabs. */
-  translate: calc(var(--exb-inset-left, 0px) / -2) calc(var(--exb-inset-top, 0px) / -2);
+  /* In the window's middle, not just the space beside the Bar and side tabs: the Bar's and side tabs' size again on
+     the far sides moves the centered column back by half of each. Padding, not a shift, so a short window that
+     can't fit it all scrolls instead of pushing the mark under the Bar. */
+  padding: 48px calc(24px + var(--exb-inset-left, 0px)) calc(48px + var(--exb-inset-top, 0px)) 24px;
 }
 .exb-ntp-mark { width: 72px; height: 72px; margin-bottom: 18px; animation: exb-arrive 280ms var(--ease-out) backwards; }
 
@@ -126,6 +127,7 @@ body { overflow-x: hidden; scrollbar-width: none; }
 .is-tiles .exb-card { width: 108px; height: 96px; gap: 10px; border-radius: var(--exo-card-radius, 14px); }
 .is-tiles .exb-card-face { width: 40px; height: 40px; border-radius: 12px; }
 .is-tiles .exb-card-face img { width: 26px; height: 26px; }
+.exb-card-face img.is-small { width: 18px; height: 18px; border-radius: 4px; }
 .is-tiles .exb-card-wash { opacity: 0.6; }
 
 /* Bookmarks as a bar, or icons only: Exo's capsules. */

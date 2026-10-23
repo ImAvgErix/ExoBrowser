@@ -163,6 +163,7 @@ button.exo-glass:hover {
   .exo-dc-audio,
   .exo-dc-sound,
   .exo-dc-delete-quote,
+  .exo-dc-stream-sound,
   .exo-game-status,
   .exo-badge,
   .exo-friend-pill-go,
@@ -221,7 +222,7 @@ button.exo-glass:hover {
    name, Watch Stream, a stream's name and buttons): a deeper dim than a control on the page, so their small words and
    glyphs keep 4.5:1 over the brightest art or a white page shared. Light's glass is a white frost already. */
 :root:not([data-exo-theme="light"]) :is(.exo-badge, .exo-store-badge, .exo-sgp-pill, .exo-dc-voice-tile-name, .exo-dc-watch,
-  .exo-dc-stream-bar :is(.exo-dc-voice-btn, .exo-dc-stream-name)) {
+  .exo-dc-stream-bar :is(.exo-dc-stream-tools > .exo-dc-voice-btn, .exo-dc-stream-name, .exo-dc-stream-sound)) {
   --exo-control-glass: blur(10px) brightness(0.34) contrast(0.9) saturate(1.6);
 }
 

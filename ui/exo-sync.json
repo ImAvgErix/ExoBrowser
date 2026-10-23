@@ -1,6 +1,6 @@
 {
   "note": "Written by scripts/sync-exo.mjs: these files are Exo Launcher's, copied; change them in Exo.",
-  "exo": "143ce23c",
+  "exo": "746e1034",
   "files": [
     "css-design.config.mjs",
     "eslint.config.js",
@@ -22,7 +22,6 @@
     "src/lib/discordPrefs.ts",
     "src/lib/entitlementActions.ts",
     "src/lib/exoTheme.ts",
-    "src/lib/glass.ts",
     "src/lib/glide.ts",
     "src/lib/host.ts",
     "src/lib/hostContract.ts",

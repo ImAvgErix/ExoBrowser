@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { browser, local, onHost, send, setSetting, useBrowser, type Tab } from './host'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { browser, holdInput, isFirstRun, local, onHost, send, setSetting, useBrowser, type Tab } from './host'
 import { engineOf, hostOf, isNewTab, looksLikeUrl, toUrl } from './search'
 import * as I from './icons'
 import { openVault } from './vault/store'
@@ -105,21 +105,23 @@ export function useSearch() {
   const controller = {
     mode,
     seed,
-    open(next: Mode, text = '', fromHost = false) {
+    open(next: Mode, text = '') {
+      if (isFirstRun()) return
       setSeed(text)
       setMode(next)
-      if (!fromHost) send('overlay', 1)
+      holdInput('search', true)
     },
-    close(silent = false) {
+    close() {
       setMode(null)
-      if (!silent) send('overlay', 0)
+      holdInput('search', false)
     },
   }
   const ref = useRef(controller)
   ref.current = controller
-  useEffect(() => onHost('overlay', m => ref.current.open(m.mode as Mode, (m.text as string) || '', true)), [])
-  useEffect(() => onHost('close', () => ref.current.close()), [])
-  useEffect(() => onHost('overlay.closed', () => ref.current.close(true)), [])
+  useEffect(() => onHost('overlay', m => ref.current.open(m.mode as Mode, (m.text as string) || '')), [])
+  // Ctrl+K again closes Search; with Settings or a menu open instead, it leaves them be.
+  useEffect(() => onHost('close', () => { if (ref.current.mode) ref.current.close() }), [])
+  useEffect(() => onHost('overlay.closed', () => ref.current.close()), [])
   return controller
 }
 
@@ -152,16 +154,22 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
     requestAnimationFrame(() => { field.current?.focus(); if (mode === 'ntp') field.current?.setSelectionRange(9e9, 9e9); else field.current?.select() })
     return () => removeEventListener('resize', place)
   }, [mode, seed])
+  // The selected row stays in view as the arrows move it.
+  useEffect(() => { list.current?.querySelector('.is-selected')?.scrollIntoView({ block: 'nearest' }) }, [sel, mode])
+  // Scored again only when what it searches changes, not on every message from the host while it's open.
+  const rows = useMemo(() => (mode ? rowsFor(text.trim(), mode, b) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- b changes identity on every host message
+    [text, mode, b.history, b.tabs, b.bookmarks, b.favicons, b.settings])
 
   if (!mode) return null
-  const rows = rowsFor(text.trim(), mode, b)
   const picks = rows.filter((r): r is Exclude<Row, { group: string }> => !('group' in r))
+  const current = Math.min(sel, Math.max(0, picks.length - 1))
   const choose = (i: number, newTab = false) => {
     const r = picks[i]
     if (!r) return
     if (r.kind === 'tab') { send('activate', r.id); controller.close(); return }
     if (r.kind === 'cmd') { controller.close(); r.run(); return }
-    controller.close(true)
+    controller.close()
     send('navigate', r.url, newTab || mode === 'palette' || mode === 'new' ? 'new' : 'current')
   }
   // Typing the start of a site you visit fills in the rest, selected.
@@ -195,9 +203,9 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
           <input ref={field} value={text} spellCheck={false} autoComplete="off" placeholder={`Search ${engineOf(b.settings.engine).short} or type an address`}
             onChange={e => { setText(e.target.value); setSel(0); complete(e.target.value, (e.nativeEvent as InputEvent).inputType?.startsWith('delete')) }}
             onKeyDown={e => {
-              if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => (s + 1) % Math.max(1, picks.length)) }
-              else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => (s - 1 + picks.length) % Math.max(1, picks.length)) }
-              else if (e.key === 'Enter') { e.preventDefault(); choose(sel, e.altKey || e.shiftKey) }
+              if (e.key === 'ArrowDown') { e.preventDefault(); setSel((current + 1) % Math.max(1, picks.length)) }
+              else if (e.key === 'ArrowUp') { e.preventDefault(); setSel((current - 1 + picks.length) % Math.max(1, picks.length)) }
+              else if (e.key === 'Enter') { e.preventDefault(); choose(current, e.altKey || e.shiftKey) }
               else if (e.key === 'Escape') { e.preventDefault(); controller.close() }
             }} />
         </div>
@@ -207,9 +215,9 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
               if ('group' in r) return <div key={'g' + k} className="exb-search-group">{r.group}</div>
               const i = ++n
               return (
-                <div key={k} role="option" aria-selected={i === sel} className={`exb-search-row${i === sel ? ' is-selected' : ''}`}
-                  onPointerMove={() => { if (i !== sel) setSel(i) }}
-                  onPointerDown={e => { e.preventDefault(); choose(i, e.button === 1) }}>
+                <div key={k} role="option" aria-selected={i === current} className={`exb-search-row${i === current ? ' is-selected' : ''}`}
+                  onPointerMove={() => { if (i !== current) setSel(i) }}
+                  onPointerDown={e => { e.preventDefault(); if (e.button !== 2) choose(i, e.button === 1) }}>
                   {'fav' in r && r.fav ? <img className="exb-search-fav" src={r.fav} alt="" /> : <r.Icon className="exb-search-lead" />}
                   <span className="exb-search-text">
                     <span className="exb-search-main">{r.main}</span>

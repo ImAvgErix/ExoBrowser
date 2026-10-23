@@ -247,11 +247,17 @@ body,
 .is-autohide .exb-side { opacity: 0; translate: -14px 0; transition: opacity 140ms var(--ease-out), translate 140ms var(--ease-out); }
 .is-autohide.reveal-side .exb-side { opacity: 1; translate: none; transition: opacity 180ms var(--ease-out), translate 260ms var(--ease-out); }
 
+/* The Bar's and the sidebar's glass is drawn by the window from the page under it; in this page there's nothing behind
+   them to frost, so their own backdrop filter (a GPU pass every frame something in the Bar animates) is off. */
+:is(#exb-bar, #exb-side) .exo-glass, #exb-side.exo-glass { backdrop-filter: none; }
+
 /* ---------------------------------------------------------------- Search, opened in the address */
 
 .exb-search-layer { position: fixed; inset: 0; z-index: 60; }
-/* Search takes the address's place: the capsule (its glass too) steps aside while it is open, so there is one surface. */
-:root:has(.exb-search-layer) .exb-address { visibility: hidden; }
+/* Search takes the address's place: the capsule (its glass too) steps aside while it is open, so there is one surface.
+   The tabs under it step aside too: the list opens over their row, and the page's glass can't frost the page's own
+   tabs, so they would show through it sharp. */
+:root:has(.exb-search-layer) :is(.exb-address, .exb-tabrow) { visibility: hidden; }
 .exb-search {
   position: absolute;
   display: flex;
@@ -279,6 +285,12 @@ body,
 .exb-search-sub { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: calc(12px * var(--exo-scale, 1)); color: var(--color-muted); }
 
 /* ---------------------------------------------------------------- Menus at a point or under a button */
+
+/* Over a web page the window's blur can't see every layer of it (a site's sticky header or banner shows through
+   sharp), so the Bar's floating surfaces carry a denser tint than Exo's: their words stay readable over any page. */
+:is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(0 0 0 / 0.66); }
+:root[data-exo-theme="dark"] :is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(36 36 38 / 0.8); }
+:root[data-exo-theme="light"] :is(.exb-search.exo-glass.is-panel, .exb-menu.exo-shelf-sort-menu, .exb-vault-fill.exo-shelf-sort-menu) { --glassy-overlay: rgb(255 255 255 / 0.9); }
 
 .exb-menu-scrim { position: fixed; inset: 0; z-index: 70; }
 .exb-menu.exo-shelf-sort-menu { position: fixed; inset: auto; margin: 0; min-width: 220px; max-width: 360px; }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Section, Row, State } from '../components/settings/parts'
 import { Menu } from '../components/ui/Menu'
 import { Switch } from '../components/Switch'
@@ -34,6 +34,8 @@ type Data = {
   bookmarks: Mark[]
   history: { items: Visit[]; favicons: Record<string, string> }
   downloads: Download[]
+  /** The first answers are in: until then nothing says "none yet". */
+  loaded: boolean
 }
 
 /** Exo's dropdown for a setting with choices (components/settings/Choice.tsx): its Menu and trigger, this chevron. */
@@ -48,36 +50,69 @@ export function Choice({ label, value, choices, onChange }: { label: string; val
 
 const size = (n: number) => n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : n >= 1e3 ? Math.round(n / 1e3) + ' KB' : n + ' B'
 
+// An extension's icon, read once per extension and file.
+const extIcons = new Map<string, Promise<string | null>>()
+const extIcon = (x: Extension) => {
+  const m = manifestOf(x)
+  const path = iconPath(m.icons ?? m.action?.default_icon, 48)
+  if (!path) return Promise.resolve(null)
+  const key = `${x.id}/${path.replace(/^\//, '')}`
+  if (!extIcons.has(key)) extIcons.set(key, api<string>(`/exticon/${key}`))
+  return extIcons.get(key)!
+}
+
+/**
+ * What Settings shows, each part read again only when the host says that part changed (a download's progress
+ * no longer reloads the whole history). Downloads come with their own message. A part's newest answer wins.
+ */
 function useData(open: boolean) {
-  const [data, setData] = useState<Data>({ state: null, extensions: [], bookmarks: [], history: { items: [], favicons: {} }, downloads: [] })
-  const load = useCallback(async () => {
-    const [state, extensions, bookmarks, history, downloads] = await Promise.all([
-      api<Data['state']>('/state.json'), api<Extension[]>('/extensions.json'), api<Mark[]>('/bookmarks.json'),
-      api<Data['history']>('/history.json'), api<Download[]>('/downloads.json'),
-    ])
-    const icons = await Promise.all((extensions ?? []).map(async x => {
-      const m = manifestOf(x)
-      const path = iconPath(m.icons ?? m.action?.default_icon, 48)
-      return path ? api<string>(`/exticon/${x.id}/${path.replace(/^\//, '')}`) : null
-    }))
-    setData({
-      state, extensions: (extensions ?? []).map((x, i) => ({ ...x, icon: icons[i] })), bookmarks: bookmarks ?? [],
-      history: history ?? { items: [], favicons: {} }, downloads: downloads ?? [],
-    })
+  const [data, setData] = useState<Data>({ state: null, extensions: [], bookmarks: [], history: { items: [], favicons: {} }, downloads: [], loaded: false })
+  const loaders = useMemo(() => {
+    const asked: Record<string, number> = {}
+    const part = <K extends keyof Data>(key: K, read: () => Promise<Data[K]>) => async () => {
+      const n = asked[key] = (asked[key] ?? 0) + 1
+      const value = await read()
+      if (asked[key] === n) setData(d => ({ ...d, [key]: value }))
+    }
+    return {
+      state: part('state', () => api<Data['state']>('/state.json')),
+      extensions: part('extensions', async () => {
+        const list = (await api<Extension[]>('/extensions.json')) ?? []
+        const icons = await Promise.all(list.map(extIcon))
+        return list.map((x, i) => ({ ...x, icon: icons[i] }))
+      }),
+      bookmarks: part('bookmarks', async () => (await api<Mark[]>('/bookmarks.json')) ?? []),
+      history: part('history', async () => (await api<Data['history']>('/history.json')) ?? { items: [], favicons: {} }),
+      downloads: part('downloads', async () => (await api<Download[]>('/downloads.json')) ?? []),
+    }
   }, [])
+  const load = useCallback(async () => {
+    await Promise.all(Object.values(loaders).map(l => l()))
+    setData(d => ({ ...d, loaded: true }))
+  }, [loaders])
   useEffect(() => { if (open) void load() }, [open, load])
   useEffect(() => {
     if (!open) return
-    const offs = ['refresh', 'bookmarks', 'downloads', 'extensions', 'history', 'importSources'].map(t => onHost(t, () => void load()))
-    return () => offs.forEach(off => off())
-  }, [open, load])
+    // History and bookmarks change in bursts (an import, a page's icon): read once the burst is over.
+    let later = 0
+    const soon = () => { clearTimeout(later); later = window.setTimeout(() => { void loaders.bookmarks(); void loaders.history() }, 300) }
+    const offs = [
+      onHost('downloads', m => setData(d => ({ ...d, downloads: (m.items as Download[]) ?? d.downloads }))),
+      onHost('bookmarks', () => void loaders.bookmarks()),
+      onHost('history', soon),
+      onHost('refresh', soon),
+      onHost('extensions', () => void loaders.extensions()),
+      onHost('importSources', () => void loaders.state()),
+    ]
+    return () => { clearTimeout(later); offs.forEach(off => off()) }
+  }, [open, loaders])
   return { data, reload: load }
 }
 
 const Lead = ({ src, Icon = I.Globe }: { src?: string | null; Icon?: I.Icon }) =>
   src ? <img className="exb-set-lead" src={src} alt="" /> : <Icon className="exb-set-lead is-blank" />
 
-function Bookmarks({ marks }: { marks: Mark[] }) {
+function Bookmarks({ marks, loaded }: { marks: Mark[]; loaded: boolean }) {
   const [url, setUrl] = useState('')
   const [name, setName] = useState('')
   const list = useRef<HTMLDivElement>(null)
@@ -148,13 +183,13 @@ function Bookmarks({ marks }: { marks: Mark[] }) {
               </div>
             </div>
           </div>
-        )) : <Row label="No bookmarks yet" detail="Star a page, or import from another browser" />}
+        )) : loaded ? <Row label="No bookmarks yet" detail="Star a page, or import from another browser" /> : null}
       </div>
     </Section>
   )
 }
 
-function History({ history }: { history: Data['history'] }) {
+function History({ history, loaded }: { history: Data['history']; loaded: boolean }) {
   const [query, setQuery] = useState('')
   const q = query.trim().toLowerCase()
   const items = history.items.filter(([u, t]) => !q || u.toLowerCase().includes(q) || (t || '').toLowerCase().includes(q)).slice(0, q ? 50 : 8)
@@ -170,7 +205,7 @@ function History({ history }: { history: Data['history'] }) {
           <Button variant="ghost" size="sm" isIconOnly className="exo-titlebar-button" aria-label="Open" onPress={() => send('navigate', u, 'new')}><I.ExternalLink /></Button>
           <Button variant="ghost" size="sm" isIconOnly className="exo-titlebar-button" aria-label="Remove" onPress={() => send('historyDelete', u)}><I.Trash /></Button>
         </Row>
-      )) : <Row label={q ? `Nothing matches “${query}”` : 'No history'} />}
+      )) : loaded ? <Row label={q ? `Nothing matches “${query}”` : 'No history'} /> : null}
     </Section>
   )
 }
@@ -206,7 +241,7 @@ function Extensions({ list }: { list: Data['extensions'] }) {
   )
 }
 
-function Downloads({ items }: { items: Download[] }) {
+function Downloads({ items, loaded }: { items: Download[]; loaded: boolean }) {
   return (
     <Section id="downloads" title="Downloads" action={items.length ? <Button size="sm" className="exo-set-btn" onPress={() => send('dlClear')}>Clear finished</Button> : undefined}>
       {items.length ? items.map(d => {
@@ -230,13 +265,23 @@ function Downloads({ items }: { items: Download[] }) {
             </>}
           </Row>
         )
-      }) : <Row label="No downloads" />}
+      }) : loaded ? <Row label="No downloads" /> : null}
     </Section>
   )
 }
 
 function Import({ sources }: { sources: [string, string, boolean][] }) {
   const [busy, setBusy] = useState('')
+  // Done (or not): the button comes back either way.
+  useEffect(() => {
+    const offs = ['importData', 'importSources'].map(t => onHost(t, () => setBusy('')))
+    return () => offs.forEach(off => off())
+  }, [])
+  useEffect(() => {
+    if (!busy) return
+    const t = setTimeout(() => setBusy(''), 120000)
+    return () => clearTimeout(t)
+  }, [busy])
   return (
     <Section id="import" title="Import">
       {sources.length ? sources.map(([key, name, firefox]) => (
@@ -283,6 +328,8 @@ function Sheet({ open, section, onClose }: { open: boolean; section: string; onC
     scroll.current?.querySelector(`#set-${id}`)?.scrollIntoView({ block: 'start', behavior: smooth ? 'smooth' : 'auto' })
   }
   useEffect(() => { if (open) requestAnimationFrame(() => jump(section || 'general', false)) }, [open, section])
+  // The lists arrive a moment later and push what's below them down: land on the section asked for again.
+  useEffect(() => { if (open && data.loaded && section) requestAnimationFrame(() => jump(section, false)) }, [data.loaded, open, section])
   // The list follows the scroll (not while a jump it started is still moving).
   const onScroll = () => {
     const el = scroll.current
@@ -315,8 +362,8 @@ function Sheet({ open, section, onClose }: { open: boolean; section: string; onC
           <div className="exo-settings-layout">
             <div className="exo-settings-column">
               <Section id="general" title="General">
-                <Row label="Default browser" detail={data.state?.isDefault ? 'Links from your other apps open in Exo Browser' : data.state?.registered ? 'Windows opens its Default apps page: choose Set default there' : 'Install Exo Browser with its Setup first, so Windows lists it'}>
-                  {data.state?.isDefault ? <State on>Default</State> : <Button size="sm" className="exo-set-btn" isDisabled={!data.state?.registered} onPress={() => send('makeDefault')}>Make default</Button>}
+                <Row label="Default browser" detail={!data.state ? '' : data.state.isDefault ? 'Links from your other apps open in Exo Browser' : data.state.registered ? 'Windows opens its Default apps page: choose Set default there' : 'Install Exo Browser with its Setup first, so Windows lists it'}>
+                  {!data.state ? null : data.state.isDefault ? <State on>Default</State> : <Button size="sm" className="exo-set-btn" isDisabled={!data.state.registered} onPress={() => send('makeDefault')}>Make default</Button>}
                 </Row>
                 {choice('appearance', 'Appearance', 'void', [['match', 'Match Windows'], ['light', 'Light'], ['dark', 'Dark'], ['void', 'Void']], 'Void is pure black, for OLED screens')}
                 {choice('material', 'Material', 'glass', [['glass', 'Glass'], ['solid', 'Solid']], 'Liquid Glass, or solid surfaces with nothing showing through')}
@@ -337,9 +384,9 @@ function Sheet({ open, section, onClose }: { open: boolean; section: string; onC
                 <Row label="Passwords" detail="Exo Vault keeps them, encrypted on this PC and nowhere else"><Button size="sm" className="exo-set-btn" onPress={() => { onClose(); openVault() }}>Exo Vault</Button></Row>
               </Section>
               <Extensions list={data.extensions} />
-              <Bookmarks marks={data.bookmarks} />
-              <History history={data.history} />
-              <Downloads items={data.downloads} />
+              <Bookmarks marks={data.bookmarks} loaded={data.loaded} />
+              <History history={data.history} loaded={data.loaded} />
+              <Downloads items={data.downloads} loaded={data.loaded} />
               <Import sources={data.state?.sources ?? []} />
               <Section id="about" title="About">
                 <Row label={`Exo Browser ${data.state?.version ?? ''}`} detail={`Engine ${data.state?.engine ?? ''} · Microsoft Edge WebView2`} />

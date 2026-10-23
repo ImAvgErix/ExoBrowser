@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react'
-import { onHost, send } from '../host'
+import { holdInput, isFirstRun, onHost, send } from '../host'
 import { sameSite, siteName, siteOfUrl } from './sites'
 
 /*
@@ -45,7 +45,7 @@ export type Item = {
 export type VaultData = { version: 1; items: Item[]; never?: string[] }
 
 /** A sign-in field Exo Vault's menu sits beside. */
-export type FillTarget = { tab: number; origin: string; kind: string; x: number; y: number; w: number; h: number; signup: boolean }
+export type FillTarget = { tab: number; origin: string; kind: string; x: number; y: number; w: number; h: number; signup: boolean; pw: boolean }
 /** A sign-in the page just sent, to save or update. */
 export type Prompt = { origin: string; username: string; password: string; update?: string }
 
@@ -96,18 +96,20 @@ const REASONS: Record<string, string> = {
 // ---------------------------------------------------------------- Opening and locking
 
 export function openVault(section = vault.section) {
+  if (isFirstRun()) return
   setVault({ open: true, section, selected: null, editing: null, error: '' })
-  send('overlay', 1)
+  holdInput('vault', true)
   send('vaultState')
 }
 export function closeVault() {
+  if (!vault.open) return
   setVault({ open: false, editing: null })
-  send('overlay', 0)
+  holdInput('vault', false)
 }
 export function unlock(password: string) { setVault({ busy: true, error: '' }); send('vaultUnlock', b64(password)) }
 export function create(password: string) { setVault({ busy: true, error: '' }); send('vaultCreate', b64(password)) }
 export function helloUnlock() { setVault({ busy: true, error: '' }); send('vaultHello') }
-export function lock() { send('vaultLock') }
+export function lock() { flushSave(); send('vaultLock') }
 
 // ---------------------------------------------------------------- Changes, each saved whole
 
@@ -117,8 +119,16 @@ function commit(items: Item[], extra: Partial<VaultData> = {}) {
   const data: VaultData = { ...vault.data, ...extra, items }
   setVault({ data })
   clearTimeout(saveTimer)
-  saveTimer = window.setTimeout(() => { if (vault.data) send('vaultSave', b64(JSON.stringify(vault.data))) }, 150)
+  saveTimer = window.setTimeout(flushSave, 150)
 }
+/** A change waiting to be saved goes now: before a lock (the items are gone after it) and when the page closes. */
+export function flushSave() {
+  if (!saveTimer) return
+  clearTimeout(saveTimer)
+  saveTimer = 0
+  if (vault.data) send('vaultSave', b64(JSON.stringify(vault.data)))
+}
+if (typeof window !== 'undefined') addEventListener('pagehide', flushSave)
 
 export const newItem = (type: ItemType, init: Partial<Item> = {}): Item =>
   ({ id: crypto.randomUUID(), type, name: '', created: Date.now(), modified: Date.now(), ...init })
@@ -168,7 +178,8 @@ export function addLogins(found: Partial<Item>[], source: string) {
     if (!f.password && !f.note && !f.number && !f.fullName && !f.totp) continue
     if (seen.has(key(f))) continue
     seen.add(key(f))
-    added.push(newItem(f.type ?? 'login', { ...f, name: f.name || siteName(f.urls?.[0] ?? '') || 'Login', created: f.created || Date.now() }))
+    const { id: _id, trashed: _trashed, ...fields } = f
+    added.push(newItem(f.type ?? 'login', { ...fields, name: f.name || siteName(f.urls?.[0] ?? '') || 'Login', created: f.created || Date.now() }))
   }
   if (added.length) commit([...added, ...items])
   setVault({ note: `Brought in ${added.length} ${added.length === 1 ? 'item' : 'items'} from ${source}${found.length > added.length ? ` (${found.length - added.length} already here)` : ''}` })
@@ -197,7 +208,11 @@ const HANDLERS: Record<string, (m: Message) => void> = {
 export function onVaultMessage(kind: string, handler: (m: Message) => void) { HANDLERS[kind] = handler }
 
 export function startVault() {
-  const off = onHost('vault', m => HANDLERS[m.kind as string]?.(m))
+  const offs = [
+    onHost('vault', m => HANDLERS[m.kind as string]?.(m)),
+    // The host let go of the window's input (a website opened from the vault, full screen): the sheet closes with it.
+    onHost('overlay.closed', closeVault),
+  ]
   send('vaultState')
-  return off
+  return () => offs.forEach(off => off())
 }

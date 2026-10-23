@@ -43,18 +43,20 @@ function PasswordInput({ item, edit }: { item: Item; edit: Edit }) {
 }
 
 function LoginFields({ item, edit }: { item: Item; edit: Edit }) {
-  const otpBad = !!item.totp && !parseOtp(item.totp)
+  const otpBad = !!item.totp?.trim() && !parseOtp(item.totp.trim())
+  // What you type stays as typed (a trailing comma, spaces in a key); it's read as a list and trimmed on save.
+  const [sites, setSites] = useState(() => (item.urls ?? []).join(', '))
   return (
     <>
       <Input item={item} edit={edit} field="username" label="Username or email" />
       <PasswordInput item={item} edit={edit} />
       <Row label="Websites" detail="Separate more than one with commas. Exo Vault fills this login on these sites only">
-        <input className="exo-field exb-field is-wide" aria-label="Websites" placeholder="example.com" spellCheck={false} value={(item.urls ?? []).join(', ')}
-          onChange={e => edit({ urls: e.target.value.split(/\s*,\s*/).filter((u, n, all) => u || n === all.length - 1) })} />
+        <input className="exo-field exb-field is-wide" aria-label="Websites" placeholder="example.com" spellCheck={false} value={sites}
+          onChange={e => { setSites(e.target.value); edit({ urls: e.target.value.split(',').map(u => u.trim()).filter(Boolean) }) }} />
       </Row>
       <Row label="2FA setup key" detail={otpBad ? "That isn't a setup key or an otpauth:// link" : 'The key or otpauth:// link a site shows when you turn on an authenticator app'}>
         <input className="exo-field exb-field is-wide exb-vault-mono" aria-label="2FA setup key" spellCheck={false} autoComplete="off" value={item.totp ?? ''}
-          onChange={e => edit({ totp: e.target.value.trim() })} />
+          onChange={e => edit({ totp: e.target.value })} />
       </Row>
     </>
   )
@@ -122,7 +124,7 @@ export function ItemEditor({ item: start }: { item: Item }) {
   const save = () => {
     const urls = (item.urls ?? []).map(u => u.trim()).filter(Boolean)
     const name = item.name.trim() || (urls[0] ? siteName(urls[0]) : '') || `New ${TITLES[item.type]}`
-    saveItem({ ...item, name, urls })
+    saveItem({ ...item, name, urls, ...(item.totp !== undefined ? { totp: item.totp.trim() } : {}) })
     setVault({ editing: null, selected: item.id })
   }
   return (

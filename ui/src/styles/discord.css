@@ -6796,6 +6796,22 @@ button.exo-dc-poll-answer:hover:not(:disabled) {
   align-items: center;
   gap: 8px;
   width: 180px;
+  padding-right: 14px;
+  border-radius: 999px;
+  background: var(--exo-fill);
+  box-shadow: var(--exo-rim);
+}
+
+/* One glass pill over the video holds both, so the slider reads in every look (Light's dark track vanished on the
+   video): Mute Stream is a plain glyph in it. */
+.exo-dc-stream-sound .exo-dc-voice-btn:not(.is-off) {
+  --exo-control-glass: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+.exo-dc-stream-sound .exo-dc-voice-btn:not(.is-off):hover {
+  background: var(--hover-fill);
 }
 
 /* Blocked or ignored people's messages, folded into one line as Discord does. */
