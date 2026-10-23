@@ -1,0 +1,164 @@
+name: Discord release announcement
+
+# Announces published releases (stable and pre-release) in the Exo Discord
+# server with the shared branded embed. Run manually with dry_run=true to
+# preview the payload built from the latest release without posting.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build the payload from the latest release and print it instead of posting
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-release-${{ github.event.release.tag_name || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  PRODUCT: ExoBrowser
+  BANNER_FILE: browser-release.png
+  ICON_FILE: exo-browser-icon.png
+  ASSET_DIR: .github/discord
+
+jobs:
+  announce:
+    name: Announce release on Discord
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out brand assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/discord
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release.json"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            jq '.release' "$GITHUB_EVENT_PATH" > "$out"
+          else
+            api() {
+              curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -w '\n%{http_code}' "$API_URL/repos/$REPO/$1"
+            }
+            resp="$(api releases/latest)"
+            code="${resp##*$'\n'}"
+            if [[ "$code" == "200" ]]; then
+              printf '%s' "${resp%$'\n'*}" > "$out"
+            else
+              echo "No latest stable release (HTTP $code); falling back to the most recent release incl. pre-releases."
+              resp="$(api 'releases?per_page=20')"
+              code="${resp##*$'\n'}"
+              if [[ "$code" != "200" ]]; then
+                echo "::error::Failed to list releases (HTTP $code)."
+                exit 1
+              fi
+              printf '%s' "${resp%$'\n'*}" | jq 'map(select(.draft | not)) | first // empty' > "$out"
+            fi
+          fi
+          if ! jq -e 'type == "object" and has("tag_name")' "$out" > /dev/null; then
+            echo "::error::Could not resolve a published release for $REPO."
+            exit 1
+          fi
+          jq -r '"Release: \(.tag_name) (prerelease=\(.prerelease)) \(.html_url)"' "$out"
+
+      - name: Build payload
+        run: |
+          set -euo pipefail
+          banner_path="$ASSET_DIR/$BANNER_FILE"
+          if [[ ! -f "$banner_path" ]]; then
+            echo "::error::Banner $banner_path not found in checkout."
+            exit 1
+          fi
+          icon_url="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/$ASSET_DIR/$ICON_FILE"
+          jq -n \
+            --arg product "$PRODUCT" \
+            --arg icon "$icon_url" \
+            --arg banner "$BANNER_FILE" \
+            --slurpfile rel "$RUNNER_TEMP/release.json" '
+            $rel[0] as $r
+            | ([$r.assets[]? | select(.name | test("\\.(exe|msix|msixbundle|zip)$"; "i"))] | first) as $asset
+            | ($r.prerelease == true) as $pre
+            | {
+                username: "\($product) Releases",
+                avatar_url: $icon,
+                allowed_mentions: { parse: [] },
+                embeds: [
+                  {
+                    color: 1118740,
+                    title: ("\($product) \($r.tag_name)" + (if $pre then " (Pre-release)" else "" end))[0:256],
+                    url: $r.html_url,
+                    description: "A new version of \($product) is out. The full changelog is built into the app.",
+                    fields: [
+                      {
+                        name: "Download",
+                        value: (if $asset
+                                then "[\($asset.name | gsub("[\\[\\]]"; ""))](\($asset.browser_download_url))"
+                                else "[Release page](\($r.html_url))" end),
+                        inline: true
+                      },
+                      {
+                        name: "Channel",
+                        value: (if $pre then "Pre-release" else "Stable" end),
+                        inline: true
+                      }
+                    ],
+                    image: { url: "attachment://\($banner)" },
+                    footer: { text: "Exo", icon_url: $icon },
+                    timestamp: ($r.published_at // $r.created_at)
+                  }
+                ],
+                attachments: [ { id: 0, filename: $banner } ]
+              }' > "$RUNNER_TEMP/payload.json"
+          jq -e '.embeds | length == 1' "$RUNNER_TEMP/payload.json" > /dev/null
+
+      - name: Post to Discord (or print in dry run)
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          WEBHOOK_URL: ${{ secrets.DISCORD_RELEASES_WEBHOOK }}
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/payload.json"
+          banner_path="$ASSET_DIR/$BANNER_FILE"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run: not posting. Payload (multipart payload_json, files[0]=$banner_path):"
+            jq . "$payload"
+            if [[ -z "${WEBHOOK_URL:-}" ]]; then
+              echo "::warning::Secret DISCORD_RELEASES_WEBHOOK is not set; a real run would fail."
+            fi
+            exit 0
+          fi
+          if [[ -z "${WEBHOOK_URL:-}" ]]; then
+            echo "::error::Repository secret DISCORD_RELEASES_WEBHOOK is missing or empty. Add the Discord webhook URL under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          sep='?'
+          [[ "$WEBHOOK_URL" == *\?* ]] && sep='&'
+          # URL is passed via curl config on stdin so it never appears in argv or logs.
+          code="$(printf 'url = "%s%swait=true"\n' "$WEBHOOK_URL" "$sep" | curl -sS -K - \
+            -o "$RUNNER_TEMP/discord-response.json" -w '%{http_code}' \
+            -F "payload_json=<$payload;type=application/json" \
+            -F "files[0]=@$banner_path;type=image/png;filename=$BANNER_FILE")"
+          if [[ "$code" != 2* ]]; then
+            echo "::error::Discord webhook returned HTTP $code."
+            jq -c '{code, message, errors}' "$RUNNER_TEMP/discord-response.json" 2>/dev/null || true
+            exit 1
+          fi
+          echo "Posted release announcement to Discord (HTTP $code, message id $(jq -r '.id // "?"' "$RUNNER_TEMP/discord-response.json"))."
