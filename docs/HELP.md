@@ -6,7 +6,7 @@
 2. Run it, choose Install, then Launch Exo Browser. **Options** under Install has the desktop shortcut switch.
 3. First run walks you through Exo Vault, bringing your things from your other browsers, your look and your default browser. Every step can be skipped and found later in Settings.
 
-To update, download the new Setup and run it: it closes Exo Browser, swaps in the new version and keeps your tabs, history, sign-ins and vault. Exo Browser doesn't check for updates by itself; new versions are on the [releases page](https://github.com/ImAvgErix/ExoBrowser/releases).
+Exo Browser looks for a new version when it starts and twice a day, and tells you when one is ready. **Settings > About** shows your version with **Check for updates**; when a new one is out, **Install update** downloads it, checks it, then closes Exo Browser, installs it and opens it again with your tabs, history, sign-ins and vault as they were. **Check for updates automatically** turns the automatic check off. New versions are also on the [releases page](https://github.com/ImAvgErix/ExoBrowser/releases): running a newer Setup does the same.
 
 Exo Browser needs **Windows 11 x64** and installs for your Windows user only, in `%LOCALAPPDATA%\ExoBrowser\app`. The installer isn't code-signed yet, so SmartScreen may warn the first time: choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256.
 
@@ -50,6 +50,8 @@ Twitch: a stream can take a second longer to start, since its playlist comes thr
 **Settings > Import** lists the browsers on this PC. **Import** brings bookmarks, history, sign-ins (so you stay signed in), site icons, the search engine and Chrome Web Store extensions; Firefox brings bookmarks, history and sign-ins. Close that browser first so its sign-ins can be read. Nothing is removed from it. Passwords go into Exo Vault from its own **Import and export**.
 
 Bookmarks from any browser: export them as an HTML file there, then **Settings > Bookmarks > Import file**.
+
+Password managers' extensions (Proton Pass, Bitwarden, 1Password and others) aren't brought over: Exo Vault keeps your passwords, and two managers would both answer every sign-in field. Bring your passwords into Exo Vault instead. One you add from the Chrome Web Store yourself stays.
 
 ## Extensions
 

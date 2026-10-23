@@ -2,7 +2,7 @@
 <h1 align="center">Exo Browser 1.0</h1>
 <p align="center"><strong>A private, fast browser in Exo's look.</strong></p>
 <p align="center">Ads, trackers and Twitch ad breaks gone before they load, your passwords encrypted on your own PC, and one Liquid Glass window for Windows 11.</p>
-<p align="center"><a href="https://github.com/ImAvgErix/ExoBrowser/releases/latest/download/ExoBrowser-Setup.exe"><strong>Download for Windows 11</strong></a> · <a href="https://github.com/ImAvgErix/ExoBrowser/releases/tag/v1.0.1">What's new in 1.0</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="PRIVACY.md">Privacy</a></p>
+<p align="center"><a href="https://github.com/ImAvgErix/ExoBrowser/releases/latest/download/ExoBrowser-Setup.exe"><strong>Download for Windows 11</strong></a> · <a href="https://github.com/ImAvgErix/ExoBrowser/releases/tag/v1.0.2">What's new in 1.0</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="PRIVACY.md">Privacy</a></p>
 
 ![The new tab page: your bookmarks as glass cards and the sites you visit most](docs/media/newtab.jpg)
 
@@ -61,14 +61,14 @@ The first time it opens, Exo Browser walks you through making your vault, bringi
 ## Privacy and safety
 
 - **No Exo account, no ads, no analytics, no telemetry.** Exo Browser has no server of its own. Your history, bookmarks, settings and vault stay in `%LocalAppData%\ExoBrowser`.
-- **What leaves your PC** is what browsing needs: the sites you open, your address lookups (to Cloudflare), your searches (to the search engine you pick), the Twitch playlist requests Exo Shield routes, and Chrome Web Store downloads when you add an extension. The [privacy policy](PRIVACY.md) lists every destination and what is sent.
+- **What leaves your PC** is what browsing needs: the sites you open, your address lookups (to Cloudflare), your searches (to the search engine you pick), the Twitch playlist requests Exo Shield routes, Chrome Web Store downloads when you add an extension, and the update check to GitHub. The [privacy policy](PRIVACY.md) lists every destination and what is sent.
 - **Your passwords never leave this PC** unless you export them yourself, and an export is encrypted with a password you choose.
 
 ## Install
 
 1. Download **[ExoBrowser-Setup.exe](https://github.com/ImAvgErix/ExoBrowser/releases/latest/download/ExoBrowser-Setup.exe)**.
 2. Run it and choose Install, then Launch Exo Browser. First run sets up Exo Vault, brings your things over and offers to make Exo Browser your default browser.
-3. A new version installs the same way, over the one you have: your tabs, history, sign-ins and vault stay.
+3. New versions show in **Settings > About**: **Install update** downloads it, checks it and installs it over the one you have, and your tabs, history, sign-ins and vault stay.
 
 **Requirements:** Windows 11 x64 with WebView2 (built into Windows 11; Setup installs it if it's missing). Exo Browser installs for your Windows user only, in `%LOCALAPPDATA%\ExoBrowser\app`, and needs no administrator rights. The installer isn't code-signed yet, so Windows SmartScreen may warn the first time; choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256 so you can check your download.
 

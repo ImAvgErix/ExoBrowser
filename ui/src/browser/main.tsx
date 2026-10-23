@@ -41,8 +41,20 @@ type ExtensionEntry = { from_webstore?: boolean; location?: number; disable_reas
 type Prefs = { default_search_provider_data?: { template_url_data?: { url?: string } }; extensions?: { settings?: Record<string, ExtensionEntry> } }
 const parse = <T,>(text: unknown): T | null => { try { return JSON.parse((text as string) || 'null') as T } catch { return null } }
 const ENGINE_SITES: Record<string, string> = { 'google.com': 'google', 'bing.com': 'bing', 'duckduckgo.com': 'duckduckgo', 'search.brave.com': 'brave', 'kagi.com': 'kagi', 'startpage.com': 'startpage' }
-// Chrome's own built-ins (Web Store, Chrome PDF viewer) are never installed again.
-const SKIP = ['ghbmnnjooekpmoecnnnilnnbdlolhkhi', 'nmmhkkegccagdldgiimedpiccmgmieda']
+// Chrome's own built-ins (Web Store, Chrome PDF viewer) are never installed again, nor password managers: Exo Vault
+// keeps the passwords (they come in from the same import), and two managers would fight over every sign-in field.
+const SKIP = ['ghbmnnjooekpmoecnnnilnnbdlolhkhi', 'nmmhkkegccagdldgiimedpiccmgmieda',
+  'ghmbeldphafepmbegfdlkpapadhbakde', // Proton Pass
+  'nngceckbapebfimnlniiiahkandclblb', // Bitwarden
+  'aeblfdkhhhdcdjpifhhbdiojplfjncoa', // 1Password
+  'hdokiejnpimakedhajhdlcegeplioahd', // LastPass
+  'fdjamakpfbbddfjaooikfcpapjohcfmg', // Dashlane
+  'bfogiafebfohielmmehodmfbbebbbpei', // Keeper
+  'eiaeiblijfjekdanodkjadfinkhbfgcd', // NordPass
+  'pnlccmojcmeohlpggmfnbbiapkmbliob', // RoboForm
+  'kmcfomidfpdkfieipokbalgegidffkal', // Enpass
+  'oboonakemofpalcgghocfoadofidjkkk', // KeePassXC-Browser
+]
 
 function importBookmarks(text: unknown) {
   const out: string[] = []

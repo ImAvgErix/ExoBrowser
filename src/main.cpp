@@ -39,6 +39,7 @@
 #include <vector>
 #include <wtsapi32.h>
 #include <wincodec.h>
+#include <winhttp.h>
 #include <deque>
 #include <mutex>
 #include "WebView2.h"
@@ -755,6 +756,20 @@ static std::wstring FirefoxProfile() {
 // Thorium and whatever comes next), and Firefox.
 static std::vector<Browser> ScanBrowsers();
 
+// Password managers' extensions, by Chrome Web Store id or name: Exo Vault does their job.
+static bool IsPasswordManager(const std::wstring& id, const std::wstring& name) {
+    static const wchar_t* ids[] = {
+        L"ghmbeldphafepmbegfdlkpapadhbakde", L"nngceckbapebfimnlniiiahkandclblb", L"aeblfdkhhhdcdjpifhhbdiojplfjncoa",
+        L"hdokiejnpimakedhajhdlcegeplioahd", L"fdjamakpfbbddfjaooikfcpapjohcfmg", L"bfogiafebfohielmmehodmfbbebbbpei",
+        L"eiaeiblijfjekdanodkjadfinkhbfgcd", L"pnlccmojcmeohlpggmfnbbiapkmbliob", L"kmcfomidfpdkfieipokbalgegidffkal",
+        L"oboonakemofpalcgghocfoadofidjkkk"};
+    for (auto known : ids) if (id == known) return true;
+    static const wchar_t* names[] = {L"Proton Pass", L"Bitwarden", L"1Password", L"LastPass", L"Dashlane", L"Keeper", L"NordPass",
+                                     L"RoboForm", L"Enpass", L"KeePassXC"};
+    for (auto known : names) if (name.rfind(known, 0) == 0) return true;
+    return false;
+}
+
 // Settings asks for the list every time it reloads; the scan reads two levels of %LOCALAPPDATA% and the registry,
 // so its answer is kept for half a minute.
 static std::vector<Browser> DetectBrowsers() {
@@ -1239,7 +1254,13 @@ static void SendExtensionIcon(const std::wstring& id, const std::wstring& rel) {
     UiPost(L"{\"t\":\"extIcon\",\"id\":" + Json(id) + L",\"icon\":" + Json(FileDataUrl(path)) + L"}");
 }
 
-static void Toast(const std::wstring& text) { UiPost(L"{\"t\":\"toast\",\"text\":" + Json(text) + L"}"); }
+// Said as soon as the chrome page can show it: one from startup waits until the page is ready.
+static std::vector<std::wstring> g_pendingToasts;
+static void Toast(const std::wstring& text) {
+    std::wstring json = L"{\"t\":\"toast\",\"text\":" + Json(text) + L"}";
+    if (g.uiReady) UiPost(json);
+    else g_pendingToasts.push_back(json);
+}
 
 static void AddExtensionFolder(const std::wstring& folder) {
     ComPtr<ICoreWebView2Profile7> p7 = TabProfile();
@@ -2091,6 +2112,7 @@ static void ConfigureProfile(ICoreWebView2* core) {
         [p7](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
             auto stale = std::make_shared<std::vector<ComPtr<ICoreWebView2BrowserExtension>>>();
             auto missing = std::make_shared<std::vector<std::wstring>>();
+            auto removedManagers = std::make_shared<std::vector<std::wstring>>();
             std::vector<std::wstring> present;
             UINT count = 0;
             if (SUCCEEDED(hr) && list && SUCCEEDED(list->get_Count(&count))) {
@@ -2104,6 +2126,13 @@ static void ConfigureProfile(ICoreWebView2* core) {
                         stale->push_back(ext);
                         continue;
                     }
+                    // A password manager an earlier import brought along (Exo Vault has the passwords now): gone once.
+                    // One you add from the Chrome Web Store yourself afterwards stays.
+                    if (Setting(L"passwordManagersGone", L"") != L"1" && IsPasswordManager(sid, sname)) {
+                        stale->push_back(ext);
+                        removedManagers->push_back(sname.substr(0, sname.find(L':')));
+                        continue;
+                    }
                     for (auto& s : shipped) {
                         if (sname.rfind(s.name, 0) != 0) continue;
                         auto it = g_extFolders.find(sid);
@@ -2113,6 +2142,15 @@ static void ConfigureProfile(ICoreWebView2* core) {
                             present.push_back(s.folder);
                         else stale->push_back(ext);
                     }
+                }
+            }
+            if (SUCCEEDED(hr) && list && Setting(L"passwordManagersGone", L"") != L"1") {
+                g.settings[L"passwordManagersGone"] = L"1";
+                SaveSettings();
+                if (!removedManagers->empty()) {
+                    std::wstring names;
+                    for (auto& n : *removedManagers) names += (names.empty() ? L"" : L", ") + n;
+                    Toast(names + L" was removed: Exo Vault keeps your passwords now");
                 }
             }
             for (auto& s : shipped) {
@@ -3123,6 +3161,274 @@ static void OnNewTabMessage(int id, const std::wstring& msg) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Updates: the newest release of Exo Browser on GitHub, asked when the browser starts and twice a day (unless turned
+// off in Settings > About), and installed when you choose. Its Setup is downloaded, checked against the SHA-256 the
+// release publishes beside it, then run silently: it closes this window (which saves your tabs), swaps the app and
+// opens it again. GitHub sees the address it's asked from and "ExoBrowser/<version>"; nothing else is sent.
+
+static const wchar_t kReleases[] = L"https://github.com/ImAvgErix/ExoBrowser/releases";
+static const UINT WM_APP_UPDATE = WM_APP + 6;  // lParam: new UpdateNews*
+static const UINT kTimerUpdate = 12;
+static const UINT kUpdateEveryMs = 12 * 60 * 60 * 1000;
+
+// What the page shows: idle, checking, current, available, downloading, installing or error.
+struct UpdateNews { std::wstring state, latest, message, file; int percent = -1; bool quiet = false; };
+static UpdateNews g_update{L"idle"};
+static bool g_updateBusy = false;
+
+static std::vector<int> VersionParts(const std::wstring& v) {
+    std::vector<int> parts;
+    for (auto& p : Split(v, L'.')) parts.push_back(_wtoi(p.c_str()));
+    while (parts.size() < 3) parts.push_back(0);
+    return parts;
+}
+static bool Newer(const std::wstring& latest) { return VersionParts(latest) > VersionParts(EXO_VERSION_W); }
+
+// Installing replaces the copy Setup put in %LOCALAPPDATA%\ExoBrowser\app; a copy run from anywhere else (a build)
+// can see an update but not install it over itself. EXO_UPDATE_ANYWHERE lets a test build try the whole path.
+static bool InstalledCopy() {
+    if (GetEnvironmentVariableW(L"EXO_UPDATE_ANYWHERE", nullptr, 0) > 0) return true;
+    return _wcsicmp(g.exeDir.c_str(), (KnownFolder(FOLDERID_LocalAppData) + L"\\ExoBrowser\\app").c_str()) == 0;
+}
+
+static void SendUpdate() {
+    UiPost(L"{\"t\":\"update\",\"state\":" + Json(g_update.state) + L",\"version\":" + Json(EXO_VERSION_W) + L",\"latest\":" +
+           Json(g_update.latest) + L",\"message\":" + Json(g_update.message) + L",\"percent\":" + std::to_wstring(g_update.percent) +
+           L",\"checked\":" + std::to_wstring(_wtoi64(Setting(L"updateChecked", L"0").c_str())) + L",\"installable\":" +
+           (InstalledCopy() ? L"true" : L"false") + L"}");
+}
+
+static void PostUpdate(HWND hwnd, UpdateNews news) { PostMessageW(hwnd, WM_APP_UPDATE, 0, (LPARAM)new UpdateNews(std::move(news))); }
+
+// One HTTPS GET, off the UI thread: the body, or into a file with progress, or (follow off) a redirect's Location.
+static bool HttpGet(const std::wstring& url, std::string* body, std::wstring* location = nullptr, HANDLE file = nullptr,
+                    const std::function<void(int)>& progress = nullptr) {
+    wchar_t host[256] = {}, path[2048] = {};
+    URL_COMPONENTS u{sizeof u};
+    u.lpszHostName = host;
+    u.dwHostNameLength = ARRAYSIZE(host);
+    u.lpszUrlPath = path;
+    u.dwUrlPathLength = ARRAYSIZE(path);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &u)) return false;
+    std::wstring agent = std::wstring(L"ExoBrowser/") + EXO_VERSION_W;
+    HINTERNET session = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 10000, 10000, 15000, 30000);
+    HINTERNET connect = WinHttpConnect(session, host, u.nPort, 0);
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    bool ok = false;
+    if (request) {
+        if (location) {
+            DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof never);
+        }
+        DWORD status = 0, size = sizeof status;
+        if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr) &&
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX)) {
+            if (location) {
+                wchar_t where[2048] = {};
+                DWORD bytes = sizeof where;
+                ok = status / 100 == 3 && WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, where, &bytes, WINHTTP_NO_HEADER_INDEX);
+                if (ok) *location = where;
+            } else if (status == 200) {
+                DWORD total = 0;
+                size = sizeof total;
+                WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &total, &size, WINHTTP_NO_HEADER_INDEX);
+                ok = true;
+                unsigned long long got = 0;
+                int shown = -1;
+                std::vector<char> buffer(64 * 1024);
+                for (;;) {
+                    DWORD read = 0;
+                    if (!WinHttpReadData(request, buffer.data(), (DWORD)buffer.size(), &read)) { ok = false; break; }
+                    if (!read) break;
+                    if (file) {
+                        DWORD written = 0;
+                        if (!WriteFile(file, buffer.data(), read, &written, nullptr) || written != read) { ok = false; break; }
+                    } else if (body) {
+                        body->append(buffer.data(), read);
+                        if (body->size() > 1024 * 1024) { ok = false; break; }  // a page, not a release note: not what was asked
+                    }
+                    got += read;
+                    if (progress && total) {
+                        int percent = (int)(got * 100 / total);
+                        if (percent != shown) progress(shown = percent);
+                    }
+                }
+                if (ok && total && got != total) ok = false;
+            }
+        }
+        WinHttpCloseHandle(request);
+    }
+    if (connect) WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+static std::string Sha256File(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::string hex;
+    if (BCRYPT_SUCCESS(BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &hash, nullptr, 0, nullptr, 0, 0))) {
+        std::vector<BYTE> buffer(1 << 20);
+        DWORD read = 0;
+        bool ok = true;
+        while (ok && ReadFile(f, buffer.data(), (DWORD)buffer.size(), &read, nullptr) && read)
+            ok = BCRYPT_SUCCESS(BCryptHashData(hash, buffer.data(), read, 0));
+        BYTE digest[32];
+        if (ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof digest, 0)))
+            for (BYTE b : digest) { char h[3]; sprintf_s(h, "%02x", b); hex += h; }
+        BCryptDestroyHash(hash);
+    }
+    CloseHandle(f);
+    return hex;
+}
+
+// Asks GitHub which release is the newest (the address "latest" redirects to names its tag). quiet: the automatic
+// check, which shows nothing while it runs.
+static void UpdateCheck(bool quiet) {
+    if (g_updateBusy) return;
+    g_updateBusy = true;
+    if (!quiet) {
+        g_update = {L"checking"};
+        SendUpdate();
+    }
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd, quiet] {
+        UpdateNews news;
+        news.quiet = quiet;
+        std::wstring where;
+        if (!HttpGet(std::wstring(kReleases) + L"/latest", nullptr, &where)) {
+            news.state = L"error";
+            news.message = L"Couldn't reach GitHub to check. Try again in a moment.";
+        } else {
+            size_t at = where.rfind(L"/tag/");
+            std::wstring tag = at == std::wstring::npos ? L"" : where.substr(at + 5);
+            if (!tag.empty() && (tag[0] == L'v' || tag[0] == L'V')) tag.erase(0, 1);
+            if (tag.empty() || !iswdigit(tag[0])) {
+                news.state = L"error";
+                news.message = L"GitHub answered with something unexpected. Try again later.";
+            } else {
+                news.latest = tag;
+                news.state = Newer(tag) ? L"available" : L"current";
+            }
+        }
+        PostUpdate(hwnd, std::move(news));
+    }).detach();
+}
+
+// Downloads the release's Setup and its SHA-256, checks one against the other, and has it run.
+static void UpdateInstall() {
+    if (g_updateBusy || g_update.state != L"available" || g_update.latest.empty()) return;
+    if (!InstalledCopy()) {
+        g_update.state = L"error";
+        g_update.message = L"This copy of Exo Browser wasn't installed by its Setup, so it can't update itself.";
+        SendUpdate();
+        return;
+    }
+    g_updateBusy = true;
+    std::wstring version = g_update.latest;
+    g_update = {L"downloading", version};
+    g_update.percent = 0;
+    SendUpdate();
+    std::wstring dir = g.dataDir + L"\\Updates";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd, version, dir] {
+        std::wstring base = std::wstring(kReleases) + L"/download/v" + version + L"/ExoBrowser-Setup.exe";
+        std::wstring file = dir + L"\\ExoBrowser-Setup-" + version + L".exe", part = file + L".part";
+        UpdateNews news{L"error", version};
+        std::string sum;
+        if (!HttpGet(base + L".sha256", &sum) || sum.size() < 64) {
+            news.message = L"Couldn't get the update's checksum from GitHub. Try again in a moment.";
+            PostUpdate(hwnd, std::move(news));
+            return;
+        }
+        std::string expected = sum.substr(0, 64);
+        for (auto& c : expected) c = (char)tolower((unsigned char)c);
+        HANDLE f = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        bool got = f != INVALID_HANDLE_VALUE && HttpGet(base, nullptr, nullptr, f, [hwnd, version](int percent) {
+            UpdateNews step{L"downloading", version};
+            step.percent = percent;
+            PostUpdate(hwnd, std::move(step));
+        });
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        if (!got) {
+            DeleteFileW(part.c_str());
+            news.message = L"The download didn't finish. Try again.";
+        } else if (Sha256File(part) != expected) {
+            DeleteFileW(part.c_str());
+            news.message = L"The download didn't match its checksum, so it wasn't installed. Try again.";
+        } else if (!MoveFileExW(part.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            news.message = L"The update couldn't be saved. Try again.";
+        } else {
+            news.state = L"installing";
+            news.file = file;
+        }
+        PostUpdate(hwnd, std::move(news));
+    }).detach();
+}
+
+static void OnUpdateNews(UpdateNews* raw) {
+    std::unique_ptr<UpdateNews> news(raw);
+    if (news->state == L"downloading") {  // progress
+        if (g_update.state == L"downloading") { g_update.percent = news->percent; SendUpdate(); }
+        return;
+    }
+    g_updateBusy = false;
+    if (news->state == L"current" || news->state == L"available") {
+        g.settings[L"updateChecked"] = std::to_wstring(NowSeconds());
+        SaveSettings();
+    }
+    // A quiet check that failed leaves what was shown before (no network on the train is no news).
+    if (news->quiet && news->state == L"error") return;
+    // Found by the automatic check: said once per version, then waiting in Settings > About.
+    if (news->quiet && news->state == L"available" && Setting(L"updateToldOf", L"") != news->latest) {
+        g.settings[L"updateToldOf"] = news->latest;
+        SaveSettings();
+        Toast(L"Exo Browser " + news->latest + L" is ready to install. Settings \x203A About");
+    }
+    g_update = *news;
+    // EXO_UPDATE_DRYRUN: a test build stops here, with Setup downloaded and checked but not run.
+    if (news->state == L"installing" && GetEnvironmentVariableW(L"EXO_UPDATE_DRYRUN", nullptr, 0) > 0) {
+        SendUpdate();
+        return;
+    }
+    if (news->state == L"installing") {
+        // Setup runs silently: it closes this window (saving your tabs), installs and opens Exo Browser again.
+        STARTUPINFOW si{sizeof si};
+        PROCESS_INFORMATION pi{};
+        std::wstring line = L"\"" + news->file + L"\" /S";
+        if (CreateProcessW(news->file.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        } else {
+            g_update = {L"error", news->latest, L"Setup couldn't be started. Try again."};
+        }
+    }
+    SendUpdate();
+}
+
+// The automatic check, unless turned off: shortly after start, then every twelve hours.
+static void UpdateTick() {
+    SetTimer(g.hwnd, kTimerUpdate, kUpdateEveryMs, nullptr);
+    if (Setting(L"updates", L"auto") != L"off") UpdateCheck(true);
+}
+
+// Earlier updates' Setups, once they're done with (a Setup still running is in use and stays).
+static void CleanUpdates() {
+    std::wstring dir = g.dataDir + L"\\Updates";
+    WIN32_FIND_DATAW d;
+    HANDLE find = FindFirstFileW((dir + L"\\*").c_str(), &d);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((dir + L"\\" + d.cFileName).c_str());
+    } while (FindNextFileW(find, &d));
+    FindClose(find);
+}
+
+// ---------------------------------------------------------------------------------------
 // Exo Vault. The file and its keys are vault.cpp's; here are its messages, auto-lock, the clipboard,
 // passwords from other browsers and sign-in forms. The vault window (the chrome page) holds the unlocked
 // items and picks what to fill; a page only ever receives the login you chose for it, and only while it
@@ -3685,6 +3991,9 @@ static void OnUiMessage(const std::wstring& msg) {
         UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
         SendImportSources();
         SendExtensions();
+        SendUpdate();
+        for (auto& t : g_pendingToasts) UiPost(t);
+        g_pendingToasts.clear();
     } else if (v == L"activate") {
         Activate(argId(1));
     } else if (v == L"close") {
@@ -3702,6 +4011,10 @@ static void OnUiMessage(const std::wstring& msg) {
             if (arg(2) == L"blur") SetBlur(true);
             FocusTarget(kUi);
         }
+    } else if (v == L"updateCheck") {
+        UpdateCheck(false);
+    } else if (v == L"updateInstall") {
+        UpdateInstall();
     } else if (v == L"makeDefault") {
         // Only you can choose the default browser: Windows' Default apps, open at Exo Browser once Setup registered it.
         ShellExecuteW(nullptr, L"open", IsRegistered() ? L"ms-settings:defaultapps?registeredAppUser=Exo%20Browser" : L"ms-settings:defaultapps",
@@ -4258,6 +4571,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_POWERBROADCAST:
         if (wp == PBT_APMSUSPEND) VaultLock();
         break;
+    case WM_APP_UPDATE:
+        OnUpdateNews((UpdateNews*)lp);
+        return 0;
     case WM_APP_ICON: {
         std::unique_ptr<std::pair<std::wstring, std::wstring>> icon((std::pair<std::wstring, std::wstring>*)lp);
         if (icon->second.empty()) g_iconMiss[icon->first] = NowSeconds();
@@ -4321,6 +4637,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == WM_APP_DOWNLOADS) {
             KillTimer(hwnd, WM_APP_DOWNLOADS);
             SendDownloads();
+        } else if (wp == kTimerUpdate) {
+            UpdateTick();
         } else if (wp == kTimerIcons) {
             KillTimer(hwnd, kTimerIcons);
             if (g_iconsDirty) SaveIcons();
@@ -4473,6 +4791,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     Layout();
     InitBrowser();
     SetTimer(g.hwnd, kTimerSleep, 30 * 1000, nullptr);
+    SetTimer(g.hwnd, kTimerUpdate, 20 * 1000, nullptr);  // the first update check, once startup has settled
+    CleanUpdates();
     SetTimer(g.hwnd, kTimerVault, 20 * 1000, nullptr);
     WTSRegisterSessionNotification(g.hwnd, NOTIFY_FOR_THIS_SESSION);
     vault::HelloAvailable([](bool yes) { g_helloReady = yes; if (g.uiReady) VaultState(); });

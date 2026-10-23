@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2 — October 23, 2026
+
+Exo Browser now updates itself, and leaves password managers to Exo Vault.
+
+- **Updates in Settings.** Settings › About shows your version with Check for updates. When a new version is out, Install update downloads it with its progress on the button, checks it against the SHA-256 the release publishes, then closes Exo Browser, installs it and opens it again with your tabs as they were. _Verified: end-to-end, the last step (Setup closing, installing and reopening) on a test install._
+- **Checks by itself.** Exo Browser asks GitHub for the newest version when it starts and twice a day, and says once when one is ready to install. Check for updates automatically turns it off. _Checked in code only; it runs the same check as the button, verified end-to-end._
+- **Password managers stay out.** Importing from another browser no longer brings Proton Pass, Bitwarden, 1Password, LastPass and other password managers' extensions: Exo Vault keeps your passwords. One an earlier import brought in is removed once, the first time Exo Browser starts after this update, and one you add from the Chrome Web Store yourself stays. _Verified: end-to-end for the removal; the import checked in code only._
+- **Startup notices show.** A notice from the moment Exo Browser opens (like the one above) waits until the window can show it, instead of being lost. _Checked in code only._
+
 ## 1.0.1 — October 23, 2026
 
 This update fixes glitches all over the browser and makes it lighter while you use it.

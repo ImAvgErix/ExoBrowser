@@ -8,7 +8,7 @@ Exo Browser has no server of its own. Nothing you do in it is sent to Exo or its
 
 Exo Browser keeps its data in `%LocalAppData%\ExoBrowser`, beside the app (in `app`), never inside it, so updates never touch it:
 
-- your settings, open tabs, history, bookmarks, site icons, downloads list and the extensions you added (`settings.tsv`, `session.tsv`, `history.tsv`, `bookmarks.tsv`, `favicons.tsv`, `icons.tsv`, `downloads.tsv`, `extensions.tsv`);
+- your settings, open tabs, history, bookmarks, site icons, downloads list and the extensions you added (`settings.tsv`, `session.tsv`, `history.tsv`, `bookmarks.tsv`, `favicons.tsv`, `icons.tsv`, `iconmiss.tsv`, `downloads.tsv`, `extensions.tsv`);
 - the browser profile (`Profile`): cookies and sign-ins, site data, the cache, and your extensions' own data, kept by Microsoft Edge WebView2 as Edge keeps them;
 - Exo Vault (`vault.exovault`, and `vault.exovault.bak` from the save before): your logins, cards, notes and identities, encrypted (see **Exo Vault**);
 - a working copy of Exo Shield (`Builtin`).
@@ -65,7 +65,9 @@ Exo Shield's filter lists are built into each release. It downloads no lists and
 
 ## Updates
 
-Exo Browser doesn't check for updates by itself. New versions are on [the releases page](https://github.com/ImAvgErix/ExoBrowser/releases); the installer installs over the version you have and keeps your data.
+When Exo Browser starts, and every twelve hours while it runs, it asks GitHub which release is the newest (`github.com/ImAvgErix/ExoBrowser/releases/latest`). Settings > About > Check for updates asks the same at once, and **Check for updates automatically** turns the automatic check off. GitHub sees your IP address and "ExoBrowser/" with the version you run; nothing else is sent.
+
+When you choose **Install update**, Exo Browser downloads that release's Setup and its SHA-256 from GitHub (`github.com`, which hands the files over from its own download host), checks the file against that checksum, keeps it in `%LocalAppData%\ExoBrowser\Updates` and runs it. Setup installs over the version you have and keeps your data; the downloaded Setup is deleted the next time Exo Browser starts.
 
 ## Questions
 

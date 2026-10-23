@@ -20,6 +20,8 @@ export type Mark = [url: string, title: string, icon: string, sharp?: boolean]
 export type Extension = { id: string; name: string; enabled: boolean; builtIn?: boolean; manifest?: string }
 export type Download = { id: number; name: string; url: string; state: string; received: number; total: number }
 export type Settings = Record<string, string>
+/** Updates, as the host tells them: checking, current, available, downloading (percent), installing, error. */
+export type Update = { state: string; version: string; latest: string; message: string; percent: number; checked: number; installable: boolean }
 
 type IconSet = string | Record<string, string>
 type Action = { default_icon?: IconSet; default_popup?: string }
@@ -57,11 +59,12 @@ export type Browser = {
   theme: 'void' | 'dark' | 'light'
   revealTop: boolean
   revealSide: boolean
+  update: Update | null
 }
 
 let store: Browser = {
   tabs: [], active: 0, back: false, fwd: false, max: false, full: false, favicons: {}, extIcons: {}, history: [], bookmarks: [],
-  extensions: [], downloads: [], downloaded: false, settings: {}, settingsLoaded: false, theme: 'void', revealTop: true, revealSide: true,
+  extensions: [], downloads: [], downloaded: false, settings: {}, settingsLoaded: false, theme: 'void', revealTop: true, revealSide: true, update: null,
 }
 const listeners = new Set<() => void>()
 const update = (next: Partial<Browser>) => {
@@ -150,6 +153,7 @@ const fromHost: Record<string, (m: Message) => void> = {
     update({ favicons })
   },
   history: m => update({ history: m.items as Visit[] }),
+  update: m => update({ update: m as unknown as Update }),
   visit(m) {
     const item = m.item as Visit
     update({ history: [item, ...store.history.filter(h => h[0] !== item[0])] })

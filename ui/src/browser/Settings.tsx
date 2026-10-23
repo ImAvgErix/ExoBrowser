@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { Section, Row, State } from '../components/settings/parts'
 import { Menu } from '../components/ui/Menu'
 import { Switch } from '../components/Switch'
 import { Button } from '../components/ui/Button'
 import { openVault } from './vault/store'
 import { useGlide } from '../lib/glide'
-import { api, iconPath, onHost, send, setSetting, useBrowser, manifestOf, type Download, type Extension, type Mark, type Visit } from './host'
+import { api, iconPath, onHost, send, setSetting, useBrowser, manifestOf, type Download, type Extension, type Mark, type Update, type Visit } from './host'
 import { ENGINES, hostOf } from './search'
 import { extName } from './menus'
 import * as I from './icons'
@@ -298,6 +298,51 @@ function Import({ sources }: { sources: [string, string, boolean][] }) {
   )
 }
 
+const ago = (seconds: number) => {
+  const s = Date.now() / 1000 - seconds
+  return s < 90 ? 'just now' : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : new Date(seconds * 1000).toLocaleDateString()
+}
+
+// What the version row says about updates.
+function updateDetail(u: Update | null) {
+  const state = u?.state ?? 'idle'
+  if (!u || state === 'idle') return u?.checked ? `Checked ${ago(u.checked)}` : 'Updates come from GitHub'
+  if (state === 'checking') return 'Checking for updates'
+  if (state === 'available') return u.installable ? `Version ${u.latest} is ready to install. Exo Browser closes and opens again` : `Version ${u.latest} is out. Install it with its Setup`
+  if (state === 'downloading') return `Downloading ${u.latest}`
+  if (state === 'installing') return `Installing ${u.latest}. Exo Browser closes and opens again`
+  if (state === 'current') return `Up to date · checked ${ago(u.checked || Date.now() / 1000)}`
+  return u.checked ? `Checked ${ago(u.checked)}` : ''
+}
+
+/** Install, with the download's progress filling the button (Exo Launcher's), or Check for updates. */
+function UpdateButton({ u }: { u: Update | null }) {
+  const state = u?.state ?? 'idle'
+  if (u && (state === 'available' || state === 'downloading' || state === 'installing')) {
+    const percent = state === 'installing' ? 100 : state === 'downloading' ? Math.max(0, u.percent) : 0
+    return (
+      <button type="button" className="exo-set-btn is-primary exo-set-progress" disabled={state !== 'available' || !u.installable}
+        onClick={() => send('updateInstall')} style={{ '--progress': percent / 100 } as CSSProperties}>
+        <span>{state === 'downloading' ? `Downloading ${percent}%` : state === 'installing' ? 'Installing' : 'Install update'}</span>
+      </button>
+    )
+  }
+  return <Button size="sm" className="exo-set-btn" isDisabled={state === 'checking'} onPress={() => send('updateCheck')}>{state === 'checking' ? 'Checking' : 'Check for updates'}</Button>
+}
+
+/** Exo Browser's version and its updates: check, then install (Setup runs and opens it again), as in Exo Launcher. */
+function UpdateRow() {
+  const { update: u } = useBrowser()
+  return (
+    <Row label={`Exo Browser ${u?.version ?? ''}`} detail={updateDetail(u)} error={u?.state === 'error' ? u.message : null}>
+      {u?.state === 'available' && u.latest ? (
+        <Button size="sm" className="exo-set-btn" onPress={() => send('navigate', `https://github.com/ImAvgErix/ExoBrowser/releases/tag/v${u.latest}`, 'new')}>What's new</Button>
+      ) : null}
+      <UpdateButton u={u} />
+    </Row>
+  )
+}
+
 /** The sheet exists only while open, so its parts (the section list's glide) measure what is on screen. */
 export function Settings({ open, section, onClose }: { open: boolean; section: string; onClose: () => void }) {
   return open ? <Sheet open section={section} onClose={onClose} /> : null
@@ -389,7 +434,9 @@ function Sheet({ open, section, onClose }: { open: boolean; section: string; onC
               <Downloads items={data.downloads} loaded={data.loaded} />
               <Import sources={data.state?.sources ?? []} />
               <Section id="about" title="About">
-                <Row label={`Exo Browser ${data.state?.version ?? ''}`} detail={`Engine ${data.state?.engine ?? ''} · Microsoft Edge WebView2`} />
+                <UpdateRow />
+                {toggle('updates', 'Check for updates automatically', 'When Exo Browser starts and twice a day, it asks GitHub for the newest version', 'auto', 'auto', 'off')}
+                <Row label="Engine" detail={`Microsoft Edge WebView2 ${data.state?.engine ?? ''}`} />
                 <Row label="Exo Shield" detail={shield
                   ? `uBlock Origin Lite ${shield.ubol} by Raymond Hill, HaGeZi's Multi PRO (${shield.hagezi.toLocaleString()} sites), TTV LOL PRO ${shield.ttv} by Younes Aassila (all GPL-3.0). Lists from ${new Date(shield.built).toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })}`
                   : "uBlock Origin Lite by Raymond Hill, HaGeZi's DNS blocklists, TTV LOL PRO by Younes Aassila (all GPL-3.0)"} />
