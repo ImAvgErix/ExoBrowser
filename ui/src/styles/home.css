@@ -443,9 +443,15 @@
   transition: transform var(--dur-move) var(--ease-spring);
 }
 
-/* Over a picture the front is shorter, so more of the picture shows and the name still sits on glass. */
-[data-art] .exo-folder-flap {
-  height: 34%;
+/* Over a picture the front is the same, its tint the picture's own: the glass shows the picture through it, as the front
+   over covers shows the folder's back, with no folder color laid on top (a blue box over a warm picture), and its words
+   take the glass's ink in every color. */
+[data-art] .exo-folder-flap::before {
+  content: none;
+}
+
+[data-color][data-art] {
+  --folder-ink: #ffffff;
 }
 
 /* The front is part of a cover, so its edge is the cover's: only its top is lit, where it meets the covers in it. The
@@ -547,6 +553,31 @@
    and no click until it lands. LibraryPane refuses an open from the keyboard too. */
 :root[data-exo-refreshing] :is(.exo-game-grid .exo-tile-hit, .exo-continue-open, .exo-friend-pill-text) {
   pointer-events: none;
+}
+
+/* Dragging a folder: where it lands is a bar in the gap before or after the folder under the pointer, and the folder
+   being dragged sinks a little (by its size, never its opacity: its front is glass). */
+.exo-folder-tile.is-dragging .exo-folder-frame {
+  scale: 0.94;
+}
+
+.exo-folder-tile:is(.is-drop-before, .is-drop-after)::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--color-fg);
+  content: '';
+  pointer-events: none;
+}
+
+.exo-folder-tile.is-drop-before::after {
+  left: calc(var(--exo-grid-column-gap) / -2 - 1.5px);
+}
+
+.exo-folder-tile.is-drop-after::after {
+  right: calc(var(--exo-grid-column-gap) / -2 - 1.5px);
 }
 
 .exo-folder-tile:is(:hover, :focus-within) {

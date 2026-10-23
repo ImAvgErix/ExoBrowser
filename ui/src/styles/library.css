@@ -403,3 +403,85 @@
   pointer-events: none;
 }
 
+
+/* Select mode (LibraryPane.tsx): a ring on each cover's corner, filled with a check on the picked ones, which also take
+   the ring outside their art that focus does. Folders sit back: they can't be picked. */
+.exo-tile-check {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1.5px solid var(--color-fg);
+  border-radius: 999px;
+  background: var(--glassy-still-control);
+  color: var(--color-bg);
+  transition: background-color var(--dur-quick) var(--ease-out), border-color var(--dur-quick) var(--ease-out);
+}
+
+.exo-tile.is-picked .exo-tile-check {
+  border-color: var(--color-fg);
+  background: var(--color-fg);
+}
+
+.exo-tile.is-picked .exo-tile-frame {
+  outline: 2px solid var(--color-fg);
+}
+
+.exo-library-pane.is-selecting .exo-folder-tile {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* The bar floats over the grid's foot, so the last row can scroll clear of it. */
+.exo-library-pane.is-selecting::after {
+  content: "";
+  display: block;
+  height: 72px;
+}
+
+/* Select mode's bar: glass at the foot of the Library, as Discord's call bar is in a call. */
+.exo-select-bar {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 52px;
+  padding: 0 10px 0 20px;
+  border-radius: 999px;
+  transform: translateX(-50%);
+  transition: translate var(--dur-base) var(--ease-spring), opacity var(--dur-quick) var(--ease-out);
+}
+
+@starting-style {
+  .exo-select-bar {
+    translate: 0 16px;
+    opacity: 0;
+  }
+}
+
+:root[data-exo-motion="reduce"] .exo-select-bar {
+  transition: none;
+}
+
+.exo-select-count {
+  min-width: 96px;
+  margin-right: 6px;
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.exo-select-rule {
+  width: 1px;
+  height: 20px;
+  margin: 0 4px;
+  background: var(--exo-float-line);
+}

@@ -2,7 +2,7 @@
 rem Builds out\ExoBrowser.exe: one static, whole-program-optimized binary plus the ui and extension folders.
 setlocal
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
-set WV2=%USERPROFILE%\.nuget\packages\microsoft.web.webview2\1.0.4312-prerelease\build\native
+set WV2=%USERPROFILE%\.nuget\packages\microsoft.web.webview2\1.0.4314.35\build\native
 if not exist out mkdir out
 rem The version, from VERSION, for the exe's version info and About.
 set /p EXO_VERSION=<VERSION

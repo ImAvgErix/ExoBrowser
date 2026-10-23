@@ -1084,6 +1084,35 @@ const COALESCE_READS = new Set([
   'shell.windowState',
 ])
 
+// Calls on their way to the host, so a room opened the first time can show once what it asked for has come back
+// (hostQuiet); a room never waits past its cap for a slow one. The Shaders engine's reads take seconds while it scans
+// and fill a page below System's first screen, so they never hold a room back.
+let inflight = 0
+const UNGATED = new Set(['shaders.call'])
+const quietWaiters = new Set<() => void>()
+function settled() {
+  if (--inflight > 0) return
+  for (const wake of quietWaiters) wake()
+}
+
+/** Resolves once no host call has been on its way for `quietMs`, or at `until` (a performance.now() time) at the latest. */
+export function hostQuiet(quietMs: number, until: number): Promise<void> {
+  return new Promise(resolve => {
+    let timer = 0
+    const finish = () => { window.clearTimeout(timer); quietWaiters.delete(check); resolve() }
+    // Armed for the cap while calls are out, for the quiet time once the last comes back; a call made in the quiet
+    // time arms the cap again.
+    const check = () => {
+      window.clearTimeout(timer)
+      const left = until - performance.now()
+      if (left <= 0) { finish(); return }
+      timer = window.setTimeout(() => { if (inflight === 0 || performance.now() >= until) finish(); else check() }, inflight > 0 ? left : Math.min(quietMs, left))
+    }
+    quietWaiters.add(check)
+    check()
+  })
+}
+
 async function rawCall<T>(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<T> {
   if (!isHost()) {
     if (!import.meta.env.DEV && import.meta.env.MODE !== 'test') throw new Error('Exo is not responding. Restart Exo.');
@@ -1123,6 +1152,10 @@ async function rawCall<T>(method: string, params?: Record<string, unknown>, time
     try { post(req) }
     catch (error) { clear(); pending.delete(id); reject(error) }
   })
+  if (!UNGATED.has(method)) {
+    inflight++
+    void work.then(settled, settled)
+  }
   if (coalesce) {
     inflightReads.set(key, work)
     const clearInflight = () => {

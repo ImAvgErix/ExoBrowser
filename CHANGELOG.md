@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.4 — October 23, 2026
+
+The glass no longer fades in or drops out on its own: the window's frost follows the page frame for frame. New tabs show up sooner, and the window starts faster.
+
+- **The hidden Bar arrives and leaves in one piece.** With Hide the toolbar on, the Bar's frost came in three frames before the Bar, as gray capsules with nothing on them, and when it hid, its frost went first and left its words on the bare page. The frost now moves with the Bar, both ways. _Verified: on screen, frame by frame._
+- **The side tabs too.** Hidden side tabs come and go the same way as the Bar, by the same code. _Checked in code only._
+- **Notices keep their glass under a hidden Bar.** A notice shown while the hidden Bar was away had no frost at all, its words over the sharp page, and got it back only when the Bar came in. _Verified: on screen, frame by frame._
+- **Exo Vault's save prompt and sign-in menu too.** They sit on the same layer as notices, which no longer hides with the Bar. _Checked in code only._
+- **Menus opened from the keyboard are glass at once.** A menu the keyboard opens is there at once, but its frost faded in over 160 ms, clear glass frosting over. Each piece's frost now takes exactly the time the piece itself takes. _Verified: on screen, frame by frame._
+- **A new look in step.** Switching between Light, Dark and Void, the glass's frost and the band under the Bar changed about four frames before the rest, so Settings flashed gray. They now change in the same frame as the page. _Verified: on screen, frame by frame._
+- **Menus leave with their glass, and maximizing moves it with the Bar.** A menu's frost went a frame before the menu, and when the window was maximized the Bar's frost reached its new place two frames before the Bar. _Verified: on screen, frame by frame._
+- **New tabs show up at once.** The new tab page stayed black for about a third of a second and then appeared almost done arriving: WebView2 holds a new page's first frames until something on it can be seen, and everything on it starts invisible. It now starts at 1%, so it fades in from its first frame. _Verified: on screen, frame by frame._
+- **New tabs open light in Light.** In Light, a new tab showed black for about a tenth of a second before its page drew; it's light from its first frame. _Verified: on screen, frame by frame._
+- **A faster start.** The Bar draws its tabs about 45 ms sooner: the edge lens of Exo Launcher's glass, which bends what the page draws behind the glass and here changed no pixel (the window draws the frost), no longer builds its maps before the first paint, and Inter is asked for as the page loads instead of after its first layout. The window no longer searches AppData for other browsers to import from at every start (120 ms on a PC with 3,800 folders there); Settings and first run still find them. With the new tab fix above, the new tab page you start on shows up about a quarter of a second sooner. _Verified: end-to-end._
+- **Built on stable parts.** The stable WebView2 SDK 1.0.4314.35 and stable tools throughout, with no previews. _Verified: end-to-end._
+
 ## 1.0.3 — October 23, 2026
 
 Menus, Search and Settings come in as one piece of Exo Launcher's newest Liquid Glass, without a flash.

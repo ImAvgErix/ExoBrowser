@@ -41,7 +41,7 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw 'Visual Studio C++ tools (x64) are not installed.' }
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-$wv2 = Join-Path $env:USERPROFILE '.nuget\packages\microsoft.web.webview2\1.0.4312-prerelease\build\native'
+$wv2 = Join-Path $env:USERPROFILE '.nuget\packages\microsoft.web.webview2\1.0.4314.35\build\native'
 if (-not (Test-Path (Join-Path $wv2 'x64\WebView2LoaderStatic.lib'))) { throw "WebView2 SDK not found in $wv2 (the package build.cmd uses)." }
 $comma = ($version -replace '\.', ',') + ',0'
 $obj = Join-Path $build 'obj'

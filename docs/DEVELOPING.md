@@ -14,7 +14,7 @@ Reading the source is welcome; see the [terms](../LICENSE) for what else is allo
 
 ## Build
 
-You need Visual Studio's C++ build tools (x64), the WebView2 SDK from NuGet (`Microsoft.Web.WebView2` 1.0.4312-prerelease, in `%USERPROFILE%\.nuget\packages`) and Node.
+You need Visual Studio's C++ build tools (x64), the WebView2 SDK from NuGet (`Microsoft.Web.WebView2` 1.0.4314.35, in `%USERPROFILE%\.nuget\packages`) and Node.
 
 ```bat
 build.cmd

@@ -1,7 +1,8 @@
 // winrec <window class | #handle> <out-prefix> <milliseconds> [x y w h]: every frame Windows composes for a window
 // during that time (Windows.Graphics.Capture hands over a frame only when something on it changed), cropped to the
 // given client rectangle, as <out-prefix>-NNN-<ms>.png. For checking a transition frame by frame (a menu opening,
-// glass coming in) where one screenshot can't show what happens between.
+// glass coming in) where one screenshot can't show what happens between. It ends by printing when it started, in Unix
+// milliseconds, so a frame's time can be lined up with a page's own clock (performance.timeOrigin + performance.now()).
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -50,6 +51,8 @@ static int Record(int argc, wchar_t** argv) {
     auto session = pool.CreateCaptureSession(item);
     session.IsCursorCaptureEnabled(false);
     try { session.IsBorderRequired(false); } catch (...) {}
+    // Every frame the screen shows, not Windows' default of at most 60 a second (Windows 11 24H2 and later).
+    try { session.MinUpdateInterval(std::chrono::milliseconds(1)); } catch (...) {}
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = cw;
@@ -68,6 +71,8 @@ static int Record(int argc, wchar_t** argv) {
     LARGE_INTEGER freq, start;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
+    FILETIME startedAt;
+    GetSystemTimePreciseAsFileTime(&startedAt);
     pool.FrameArrived([&](Direct3D11CaptureFramePool const& p, auto&&) {
         auto f = p.TryGetNextFrame();
         if (!f || shots.size() >= 400) return;
@@ -117,7 +122,8 @@ static int Record(int argc, wchar_t** argv) {
         check_hresult(out->Commit());
         check_hresult(encoder->Commit());
     }
-    wprintf(L"%zu frames in %d ms\n", shots.size(), duration);
+    ULARGE_INTEGER t{startedAt.dwLowDateTime, startedAt.dwHighDateTime};
+    wprintf(L"%zu frames in %d ms, started at %.1f\n", shots.size(), duration, (double)(t.QuadPart - 116444736000000000ULL) / 10000.0);
     return 0;
 }
 

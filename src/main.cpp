@@ -98,8 +98,9 @@ struct App {
     winrt::Windows::UI::Composition::Compositor compositor{nullptr};
     winrt::Windows::UI::Composition::Desktop::DesktopWindowTarget target{nullptr};
     winrt::Windows::UI::Composition::ContainerVisual root{nullptr}, chromeLayer{nullptr}, glassLayer{nullptr}, chromeVisual{nullptr};
-    winrt::Windows::UI::Composition::ContainerVisual glassTop{nullptr}, glassSide{nullptr};
+    winrt::Windows::UI::Composition::ContainerVisual glassTop{nullptr}, glassSide{nullptr}, glassFree{nullptr};
     bool revealedTop = true, revealedSide = true;
+    bool glassTopIn = true, glassSideIn = true;  // the Bar's and sidebar's frost, as the page last showed them
     winrt::Windows::UI::Composition::LayerVisual content{nullptr};
     winrt::Windows::UI::Composition::CompositionEffectBrush blur{nullptr};
     bool revealed = true, pinned = false;
@@ -646,17 +647,24 @@ static bool WindowsUsesLight() {
     return light != 0;
 }
 
-static void ApplyTheme() {
-    std::wstring a = Setting(L"appearance", L"void");
-    g.theme = a == L"match" ? (WindowsUsesLight() ? L"light" : L"dark") : (a == L"light" || a == L"dark") ? a : L"void";
-    g.page = g.theme == L"light" ? RGB(245, 245, 245) : g.theme == L"dark" ? RGB(18, 18, 18) : RGB(0, 0, 0);
+// The window's own colors under the Bar and sidebar, and its frame, in a theme.
+static void PaintTheme(const std::wstring& theme) {
+    g.page = theme == L"light" ? RGB(245, 245, 245) : theme == L"dark" ? RGB(18, 18, 18) : RGB(0, 0, 0);
     if (g.hwnd) {
-        BOOL dark = g.theme != L"light";
+        BOOL dark = theme != L"light";
         DwmSetWindowAttribute(g.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
         COLORREF caption = g.page;
         DwmSetWindowAttribute(g.hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof caption);
         InvalidateRect(g.hwnd, nullptr, TRUE);
     }
+}
+
+// Once the chrome page is up, the window takes a new theme's colors when the page shows it (SetGlass): taken at once,
+// the band under the Bar turned light about 30 ms before the Bar did.
+static void ApplyTheme() {
+    std::wstring a = Setting(L"appearance", L"void");
+    g.theme = a == L"match" ? (WindowsUsesLight() ? L"light" : L"dark") : (a == L"light" || a == L"dark") ? a : L"void";
+    if (!g.uiReady) PaintTheme(g.theme);
 }
 
 static std::wstring NewTabJson() {
@@ -1631,9 +1639,8 @@ static float Scale() { return g.dpi / 96.f; }
 // `dim` is a scrim the page lays over the content under this glass (Settings' room), which in Exo the glass sees.
 static float GlassBlur(wchar_t kind) { return kind == L'p' ? 24.f : kind == L'l' ? 12.f : 8.f; }
 
-static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const wuc::CompositionBrush& backdrop) {
+static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const std::wstring& theme, const wuc::CompositionBrush& backdrop) {
     static std::unordered_map<std::wstring, wuc::CompositionEffectFactory> factories;
-    const std::wstring& theme = g.theme;
     float k = Scale();
     std::wstring key = std::wstring(1, kind) + theme + std::to_wstring((int)(dim * 100)) + L"@" + std::to_wstring((int)(k * 100));
     auto it = factories.find(key);
@@ -1652,25 +1659,28 @@ static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const wuc
     return brush;
 }
 
-// The page lists its glass: "kind,x,y,w,h,radius,place,key,in,out;..." in CSS pixels (kind s: small, l: large, p: a
-// sheet; place d: the sidebar, else the Bar; key: the piece's own, while it's on the page; in and out: how long, in ms,
-// the piece itself fades in and out on the page, so its frost fades with it). A backdrop brush cannot see a tab
-// (its pixels come from the browser's own process), so each piece's backdrop is a live surface of the tab layer
-// itself, cut to the piece plus a margin for the blur to draw from, then blurred and toned.
+// The page lists its glass: "@,theme,material,bar,sidebar;kind,x,y,w,h,radius,place,key,in,out;..." in CSS pixels. The
+// first item is how the page looks right now: its theme, glass or solid, and whether the auto-hidden Bar and sidebar
+// are in (1) or out (0); the frost follows the page's own frames that way instead of running ahead of them. Then each
+// piece: kind s: small, l: large, p: a sheet; place t: the Bar, d: the sidebar, f: anything else (menus, Search,
+// toasts, sheets), which stays when they hide; key: the piece's own, while it's on the page; in: how long, in ms, a
+// new piece fades in on the page, out: how long one has left as it fades away, so its frost fades with it. A backdrop
+// brush cannot see a tab (its pixels come from the browser's own process), so each piece's backdrop is a live surface
+// of the tab layer itself, cut to the piece plus a margin for the blur to draw from, then blurred and toned.
 //
 // Each piece keeps its sprite while it's on the page: when it moves or resizes, its sprite is changed in place.
 // (Rebuilding every sprite on each change left all the glass unfrosted for a frame: a menu opening over Settings
 // blinked the whole sheet.) A new piece's frost fades in as the piece does (a menu grows in from nothing over 160 ms:
 // frost at full strength from the first frame showed as a gray box before the menu), and one that fades away takes
-// its frost with it. A new theme or scale rebuilds them all, since their filters differ.
+// its frost with it. A new theme or scale gives each its new filters in place.
 static std::wstring g_glassSpec;
 struct GlassPiece {
     wuc::SpriteVisual sprite{nullptr};
     wuc::CompositionVisualSurface surface{nullptr};
+    wuc::CompositionSurfaceBrush backdrop{nullptr};
     wuc::CompositionRoundedRectangleGeometry shape{nullptr};
     wuc::ContainerVisual parent{nullptr};
-    int fadeOut = 0;
-    bool seen = false;
+    bool seen = false, leaving = false;
 };
 
 static wuc::CompositionEasingFunction EaseOut();
@@ -1683,23 +1693,33 @@ static void FadeGlass(const wuc::SpriteVisual& sprite, float to, int ms) {
 }
 static std::unordered_map<std::wstring, GlassPiece> g_glassPieces;
 static std::wstring g_glassLook;  // the theme and scale the pieces' filters were made for
+static void AnimateGlass(const wuc::ContainerVisual& layer, bool on, bool side);
 
 static void SetGlass(const std::wstring& spec) {
     g_glassSpec = spec;
     if (!g.glassTop) return;
     float k = Scale();
-    bool solid = Setting(L"material", L"glass") == L"solid";
-    std::wstring look = g.theme + L"@" + std::to_wstring((int)(k * 100));
-    if (look != g_glassLook || solid) {
+    auto items = Split(spec, L';');
+    auto page = items.empty() ? std::vector<std::wstring>{} : Split(items[0], L',');
+    bool told = page.size() >= 5 && page[0] == L"@";
+    std::wstring theme = told ? page[1] : g.theme;
+    bool solid = told && page[2] == L"solid";
+    if (told && (page[3] == L"1") != g.glassTopIn) AnimateGlass(g.glassTop, g.glassTopIn = page[3] == L"1", false);
+    if (told && (page[4] == L"1") != g.glassSideIn) AnimateGlass(g.glassSide, g.glassSideIn = page[4] == L"1", true);
+    if (told && theme != g_glassLook.substr(0, g_glassLook.find(L'@'))) PaintTheme(theme);
+    std::wstring look = theme + L"@" + std::to_wstring((int)(k * 100));
+    bool relook = look != g_glassLook;
+    g_glassLook = look;
+    if (solid) {
         for (auto& [_, piece] : g_glassPieces) piece.parent.Children().Remove(piece.sprite);
         g_glassPieces.clear();
-        g_glassLook = look;
+        return;
     }
     for (auto& [_, piece] : g_glassPieces) piece.seen = false;
     int n = 0;
-    for (auto& item : solid ? std::vector<std::wstring>{} : Split(spec, L';')) {
+    for (auto& item : items) {
         auto f = Split(item, L',');
-        if (f.size() < 6) continue;
+        if (f.size() < 6 || f[0] == L"@") continue;
         n++;
         float x = (float)_wtof(f[1].c_str()) * k, y = (float)_wtof(f[2].c_str()) * k;
         float w = (float)_wtof(f[3].c_str()) * k, h = (float)_wtof(f[4].c_str()) * k, r = (float)_wtof(f[5].c_str()) * k;
@@ -1709,21 +1729,22 @@ static void SetGlass(const std::wstring& spec) {
             continue;
         wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
         float pad = GlassBlur(kind) * 3 * k;
-        auto parent = f.size() > 6 && f[6] == L"d" ? g.glassSide : g.glassTop;
-        std::wstring key = (f.size() > 7 && !f[7].empty() ? f[7] : L"#" + std::to_wstring(n)) + kind + (f.size() > 6 ? f[6] : L"");
+        std::wstring place = f.size() > 6 ? f[6] : L"";
+        auto parent = place == L"d" ? g.glassSide : place == L"t" ? g.glassTop : g.glassFree;
+        std::wstring key = (f.size() > 7 && !f[7].empty() ? f[7] : L"#" + std::to_wstring(n)) + kind + place;
         GlassPiece& piece = g_glassPieces[key];
         int fadeIn = f.size() > 8 ? _wtoi(f[8].c_str()) : 0;
-        piece.fadeOut = f.size() > 9 ? _wtoi(f[9].c_str()) : 0;
+        int fadeOut = f.size() > 9 ? _wtoi(f[9].c_str()) : 0;
         if (!piece.sprite) {
             piece.surface = g.compositor.CreateVisualSurface();
             piece.surface.SourceVisual(g.content);
-            auto backdrop = g.compositor.CreateSurfaceBrush(piece.surface);
-            backdrop.Stretch(wuc::CompositionStretch::None);
-            backdrop.HorizontalAlignmentRatio(0);
-            backdrop.VerticalAlignmentRatio(0);
-            backdrop.Offset({-pad, -pad});
+            piece.backdrop = g.compositor.CreateSurfaceBrush(piece.surface);
+            piece.backdrop.Stretch(wuc::CompositionStretch::None);
+            piece.backdrop.HorizontalAlignmentRatio(0);
+            piece.backdrop.VerticalAlignmentRatio(0);
+            piece.backdrop.Offset({-pad, -pad});
             piece.sprite = g.compositor.CreateSpriteVisual();
-            piece.sprite.Brush(GlassBrush(kind, 0.f, backdrop));
+            piece.sprite.Brush(GlassBrush(kind, 0.f, theme, piece.backdrop));
             piece.shape = g.compositor.CreateRoundedRectangleGeometry();
             piece.sprite.Clip(g.compositor.CreateGeometricClip(piece.shape));
             piece.parent = parent;
@@ -1732,7 +1753,14 @@ static void SetGlass(const std::wstring& spec) {
                 piece.sprite.Opacity(0.f);
                 FadeGlass(piece.sprite, 1.f, fadeIn);
             }
+        } else if (relook) {
+            piece.backdrop.Offset({-pad, -pad});
+            piece.sprite.Brush(GlassBrush(kind, 0.f, theme, piece.backdrop));
         }
+        // Fading away on the page (Exo's own menus do), its frost goes with it; opened again on the way, it comes back.
+        if (fadeOut > 0 && !piece.leaving) FadeGlass(piece.sprite, 0.f, fadeOut);
+        else if (fadeOut == 0 && piece.leaving) FadeGlass(piece.sprite, 1.f, std::max(fadeIn, 1));
+        piece.leaving = fadeOut > 0;
         piece.seen = true;
         piece.surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
         piece.surface.SourceSize({w + 2 * pad, h + 2 * pad});
@@ -1741,18 +1769,10 @@ static void SetGlass(const std::wstring& spec) {
         piece.shape.Size({w, h});
         piece.shape.CornerRadius({std::min(r, h / 2), std::min(r, h / 2)});
     }
+    // Gone from the page (one that faded away is gone once its fade ended): its frost goes now.
     for (auto it = g_glassPieces.begin(); it != g_glassPieces.end();) {
-        GlassPiece& piece = it->second;
-        if (piece.seen) { ++it; continue; }
-        if (piece.fadeOut > 0) {
-            // It fades away on the page: its frost goes with it, then the sprite.
-            auto batch = g.compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-            FadeGlass(piece.sprite, 0.f, piece.fadeOut);
-            batch.End();
-            batch.Completed([parent = piece.parent, sprite = piece.sprite](auto&&, auto&&) { parent.Children().Remove(sprite); });
-        } else {
-            piece.parent.Children().Remove(piece.sprite);
-        }
+        if (it->second.seen) { ++it; continue; }
+        it->second.parent.Children().Remove(it->second.sprite);
         it = g_glassPieces.erase(it);
     }
 }
@@ -1781,8 +1801,11 @@ static void InitComposition() {
     g.glassTop.RelativeSizeAdjustment({1, 1});
     g.glassSide = g.compositor.CreateContainerVisual();
     g.glassSide.RelativeSizeAdjustment({1, 1});
+    g.glassFree = g.compositor.CreateContainerVisual();
+    g.glassFree.RelativeSizeAdjustment({1, 1});
     g.glassLayer.Children().InsertAtTop(g.glassSide);
     g.glassLayer.Children().InsertAtTop(g.glassTop);
+    g.glassLayer.Children().InsertAtTop(g.glassFree);
     g.chromeVisual = g.compositor.CreateContainerVisual();
     g.chromeVisual.RelativeSizeAdjustment({1, 1});
     g.chromeLayer.Children().InsertAtTop(g.glassLayer);
@@ -1815,19 +1838,15 @@ static void SetBlur(bool on) {
 // the chrome (Search, a menu, Settings, find) holds them.
 
 // The Bar and the sidebar are separate: the top edge brings the Bar, the left edge the sidebar.
-// The chrome page slides and fades each in CSS; the window moves its glass the same way, at once.
+// The chrome page slides and fades each in CSS; the window moves its glass the same way once the page says it has
+// (SetGlass), so the two arrive and leave together.
 
 static const UINT kTimerHide = 3, kTimerHideSide = 4;
 static bool g_hideTopPending = false, g_hideSidePending = false;
 
-static void AnimateGlass(const wuc::ContainerVisual& layer, bool on, bool side, bool instant = false) {
+static void AnimateGlass(const wuc::ContainerVisual& layer, bool on, bool side) {
     float k = Scale();
     wf::Numerics::float3 away = side ? wf::Numerics::float3{-14.f * k, 0, 0} : wf::Numerics::float3{0, -10.f * k, 0};
-    if (instant) {
-        layer.Opacity(on ? 1.f : 0.f);
-        layer.Offset(on ? wf::Numerics::float3{0, 0, 0} : away);
-        return;
-    }
     auto opacity = g.compositor.CreateScalarKeyFrameAnimation();
     opacity.InsertKeyFrame(1.f, on ? 1.f : 0.f, EaseOut());
     opacity.Duration(std::chrono::milliseconds(on ? 180 : 140));
@@ -1848,7 +1867,7 @@ static bool OnNewTab() {
     return a && IsNewTab(a->url.empty() ? a->pendingNav : a->url);
 }
 
-static void Reveal(bool top, bool on, bool instant = false) {
+static void Reveal(bool top, bool on, bool tell = false) {
     if (!g.glassTop) return;
     if (!g.autohide || g.fullscreen || OnNewTab()) on = true;
     bool& state = top ? g.revealedTop : g.revealedSide;
@@ -1856,8 +1875,7 @@ static void Reveal(bool top, bool on, bool instant = false) {
     state = on;
     g.revealTop = g.autohide && g.revealedTop ? Px(g.chromeTopDip) : 0;
     g.revealLeft = g.autohide && g.revealedSide ? Px(g.sidebarDip) : 0;
-    if (!changed && !instant) return;
-    AnimateGlass(top ? g.glassTop : g.glassSide, on, !top, instant);
+    if (!changed && !tell) return;
     SendRevealed();
 }
 
@@ -2261,6 +2279,13 @@ static void OnUiMessage(const std::wstring& msg);
 static void InstallStoreExtension(const std::wstring& id);
 extern const wchar_t kStoreScriptRef[];
 
+// A new tab page's color until it draws: its own background (var(--color-bg) in the Appearance's theme), so it doesn't
+// open black in Light.
+static COREWEBVIEW2_COLOR NewTabColor() {
+    return g.theme == L"light" ? COREWEBVIEW2_COLOR{255, 245, 245, 245} : g.theme == L"dark" ? COREWEBVIEW2_COLOR{255, 18, 18, 18}
+                               : COREWEBVIEW2_COLOR{255, 0, 0, 0};
+}
+
 static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
     int id = t->id;
     t->comp = comp;
@@ -2273,8 +2298,7 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
     comp->put_RootVisualTarget(static_cast<::IUnknown*>(winrt::get_unknown(t->visual)));
 
     if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
-        c2->put_DefaultBackgroundColor(t->pendingNav.empty() || IsNewTab(t->pendingNav) ? COREWEBVIEW2_COLOR{255, 0, 0, 0}
-                                                                                        : COREWEBVIEW2_COLOR{255, 255, 255, 255});
+        c2->put_DefaultBackgroundColor(t->pendingNav.empty() || IsNewTab(t->pendingNav) ? NewTabColor() : COREWEBVIEW2_COLOR{255, 255, 255, 255});
     ComPtr<ICoreWebView2Settings> s;
     t->core->get_Settings(&s);
     s->put_IsStatusBarEnabled(TRUE);
@@ -2359,9 +2383,8 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
                 }
                 t->loading = true;
                 a->get_NavigationId(&t->navId);
-                bool black = IsNewTab(url);
                 if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
-                    c2->put_DefaultBackgroundColor(black ? COREWEBVIEW2_COLOR{255, 0, 0, 0} : COREWEBVIEW2_COLOR{255, 255, 255, 255});
+                    c2->put_DefaultBackgroundColor(IsNewTab(url) ? NewTabColor() : COREWEBVIEW2_COLOR{255, 255, 255, 255});
                 QueueState();
             }
             return S_OK;
@@ -4043,12 +4066,14 @@ static void OnUiMessage(const std::wstring& msg) {
     Tab* a = Active();
     if (v == L"ready") {
         g.uiReady = true;
+        // The tabs first, then history (up to 4000 visits for Search to suggest from), so the Bar draws its tabs
+        // without waiting for it. Other browsers to import from are looked for when Settings or first run asks: the
+        // search walks two levels of AppData (3,800 folders, 120 ms on the PC it was measured on) and held up every start.
         SendSettings();
-        SendHistory();
         SendState();
         for (auto& t : g.tabs) if (!t->favicon.empty()) SendFavicon(t.get());
+        SendHistory();
         UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
-        SendImportSources();
         SendExtensions();
         SendUpdate();
         for (auto& t : g_pendingToasts) UiPost(t);
@@ -4161,7 +4186,8 @@ static void OnUiMessage(const std::wstring& msg) {
         g.autohide = arg(3) == L"1";
         Layout();
         RefreshNewTabs();
-        // Turning auto-hide on or off settles both at once, without animating.
+        // Turning auto-hide on or off settles both at once, and the page hears it either way (it slides them, and
+        // their glass follows it).
         if (!g.autohide || !was) {
             Reveal(true, !g.autohide, true);
             Reveal(false, !g.autohide, true);
@@ -4285,7 +4311,6 @@ static void OnUiMessage(const std::wstring& msg) {
             g.profileReady = false;
             if (Tab* t = Active(); t && t->core) ConfigureProfile(t->core.Get());
         }
-        if (arg(1) == L"material" || arg(1) == L"appearance") SetGlass(g_glassSpec);
         SendSettings();
         RefreshNewTabs();
     } else if (v == L"key") {

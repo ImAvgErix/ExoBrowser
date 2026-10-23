@@ -25,7 +25,7 @@ type Data = {
   insetLeft?: number
 }
 
-const webview = (window as unknown as { chrome?: { webview?: { postMessage: (m: string) => void; addEventListener: (t: 'message', f: (e: MessageEvent) => void) => void } } }).chrome?.webview
+const webview = (window as unknown as { chrome?: { webview?: { postMessage: (m: string) => void; addEventListener: (t: 'message', f: (e: MessageEvent) => void) => void; removeEventListener: (t: 'message', f: (e: MessageEvent) => void) => void } } }).chrome?.webview
 const send = (...parts: string[]) => webview?.postMessage(parts.join('\t'))
 
 const QUOTES: [string, string][] = [
@@ -172,10 +172,11 @@ function Page() {
     }
     void load()
     let stale = false
-    webview?.addEventListener('message', e => { if (e.data !== 'refresh') return; if (document.hidden) stale = true; else void load() })
+    const onMessage = (e: MessageEvent) => { if (e.data !== 'refresh') return; if (document.hidden) stale = true; else void load() }
+    webview?.addEventListener('message', onMessage)
     const onShow = () => { if (!document.hidden && stale) { stale = false; void load() } }
     document.addEventListener('visibilitychange', onShow)
-    return () => document.removeEventListener('visibilitychange', onShow)
+    return () => { webview?.removeEventListener('message', onMessage); document.removeEventListener('visibilitychange', onShow) }
   }, [])
   const theme = data?.theme, material = data?.material
   useEffect(() => {

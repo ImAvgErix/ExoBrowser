@@ -196,3 +196,22 @@
 .exo-titlebar .exo-nav-btn.is-on .exo-glyph {
   opacity: 1;
 }
+
+/* A room opened the first time is built out of sight until it's whole (LauncherApp › roomReady): its tab breathes
+   meanwhile, so the press is seen. Its words and glyph, never the capsule: that is glass. */
+.exo-titlebar .exo-nav-btn.is-opening {
+  cursor: progress;
+}
+
+.exo-titlebar .exo-nav-btn.is-opening > * {
+  animation: exo-nav-opening 900ms var(--ease-out) infinite alternate;
+}
+
+@keyframes exo-nav-opening {
+  to { opacity: 0.45; }
+}
+
+:root[data-exo-motion='reduce'] .exo-titlebar .exo-nav-btn.is-opening > * {
+  animation: none;
+  opacity: 0.6;
+}

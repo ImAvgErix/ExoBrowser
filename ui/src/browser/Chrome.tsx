@@ -36,9 +36,9 @@ export function Favicon({ tab }: { tab: Tab }) {
  * draws that blur under each piece with Exo's own filters (small or large glass), and the page draws Exo's tint,
  * rim and words over it. Each is reported where it rests once shown (an auto-hidden Bar or sidebar slides its glass
  * itself). A scrim under a piece (Settings' room) is drawn by this page over the window's blur, so it dims it just as
- * Exo's glass sees it dimmed.
+ * Exo's glass sees it dimmed. A menu fading away (Exo's own close that way) is reported until it's gone.
  */
-const GLASS = '.exo-glass, .exo-shelf-sort-menu:popover-open, .exb-vault-fill, .exo-toast'
+const GLASS = '.exo-glass, .exo-shelf-sort-menu, .exb-vault-fill, .exo-toast'
 const LARGE = '.is-panel, .exo-shelf-sort-menu, .exo-toast'
 
 function slideOf(el: Element): [number, number] {
@@ -68,15 +68,39 @@ function restingRect(el: HTMLElement, style: CSSStyleDeclaration) {
   return { left: r.left - ox * (1 - r.width / w), top: r.top - oy * (1 - r.height / h), width: w, height: h }
 }
 
-// How a piece comes and goes on the page, so the window's frost fades with it: Exo's menus, Search and the sign-in menu
-// grow in over the base time and toasts over the move time; a menu of Exo's own (Settings' choices) fades away over
-// the quick time, while the browser's menus and Search go at once. The rest (the Bar, sheets) are just there.
-const FADES_IN: [string, number][] = [['.exb-vault-prompt', 160], ['.exo-toast', 220], ['.exo-shelf-sort-menu, .exb-search, .exb-vault-fill', 160]]
-const fadeIn = (el: Element) => FADES_IN.find(([selector]) => el.matches(selector))?.[1] ?? 0
-const fadeOut = (el: Element) => (el.matches('.exo-shelf-sort-menu:not(.exb-menu, .exb-vault-fill)') ? 120 : 0)
+// The pieces that come and go on the page by fading (Exo's menus and the sign-in menu, Search, toasts, Exo Vault's
+// prompt), so the window's frost fades with them: [ms to come in, ms left to go], read from the fade their CSS runs
+// right now. A menu the keyboard opens or closes is there or gone at once, and the browser's own menus and Search
+// close at once. (Fixed times faded a keyboard-opened menu's frost in under a menu already there: clear glass that
+// frosted over 160 ms.) The rest (the Bar, sheets) are just there.
+const FADES = '.exo-shelf-sort-menu, .exb-search, .exb-vault-fill, .exb-vault-prompt, .exo-toast'
+function fades(el: Element): [number, number] {
+  let fadeIn = 0, fadeOut = 0
+  if (!el.matches(FADES)) return [0, 0]
+  for (const a of el.getAnimations()) {
+    const effect = a.effect as KeyframeEffect | null
+    const frames = effect?.getKeyframes() ?? []
+    if (!effect || a.playState !== 'running' || !frames.some(k => 'opacity' in k)) continue
+    const timing = effect.getComputedTiming()
+    const left = Math.max(0, Number(timing.endTime ?? 0) - Number(timing.localTime ?? 0))
+    if (Number(frames[0].opacity ?? 1) < 0.5) fadeIn = Math.max(fadeIn, left)
+    else if (Number(frames.at(-1)?.opacity ?? 1) < 0.5) fadeOut = Math.max(fadeOut, left)
+  }
+  return [Math.round(fadeIn), Math.round(fadeOut)]
+}
+
+// What the window's frost follows besides the pieces, as the page shows it: its theme and material, and whether the
+// auto-hidden Bar and sidebar are in. (The window used to switch these itself, ahead of the page: the Bar's frost came
+// in three frames before the Bar, as gray capsules with nothing on them, and went first, leaving its words on the bare
+// page; a new theme's frost showed for four frames under the old theme's glass.)
+function lookOf() {
+  const root = document.documentElement, exb = document.querySelector('.exb')
+  return ['@', root.dataset.exoTheme ?? 'void', root.dataset.exoGlass === 'solid' ? 'solid' : 'glass',
+    exb?.matches('.is-autohide:not(.reveal-top)') ? 0 : 1, exb?.matches('.is-autohide:not(.reveal-side)') ? 0 : 1].join(',')
+}
 
 function glassSpec() {
-  const items: string[] = []
+  const items = [lookOf()]
   for (const el of document.querySelectorAll<HTMLElement>(GLASS)) {
     const style = getComputedStyle(el)
     if (!el.getClientRects().length || style.visibility === 'hidden') continue
@@ -84,8 +108,11 @@ function glassSpec() {
     if (r.width < 1 || r.height < 1) continue
     const [dx, dy] = slideOf(el)
     const radius = Math.min(parseFloat(style.borderTopLeftRadius) || 0, r.height / 2)
+    // The Bar's and the sidebar's own glass come and go with them; the rest (menus, Search, toasts, sheets) stays put
+    // when they hide: a toast under a hidden Bar lost its frost.
+    const place = el.closest('#exb-side') ? 'd' : el.closest('#exb-bar') ? 't' : 'f'
     items.push([el.matches('.exo-glass.is-panel') ? 'p' : el.matches(LARGE) ? 'l' : 's', (r.left - dx).toFixed(1), (r.top - dy).toFixed(1), r.width.toFixed(1), r.height.toFixed(1),
-      radius.toFixed(1), el.closest('#exb-side') ? 'd' : 't', keyOf(el), fadeIn(el), fadeOut(el)].join(','))
+      radius.toFixed(1), place, keyOf(el), ...fades(el)].join(','))
   }
   return items.join(';')
 }
@@ -93,29 +120,37 @@ let glassFrame = 0
 let glassHeld = 0
 let glassSent: string | null = null
 let glassNext = ''
-const keysIn = (spec: string) => new Set(spec ? spec.split(';').map(item => item.split(',')[7]) : [])
-const sendGlass = () => {
-  glassHeld = 0
+let glassSize = ''
+// Sends the newest measure now, or once `frames` more frames have begun.
+const sendGlassIn = (frames: number): number => {
+  if (frames > 0) return requestAnimationFrame(() => { glassHeld = sendGlassIn(frames - 1) })
   if (glassNext !== glassSent) { glassSent = glassNext; send('glass', glassNext) }
+  return 0
 }
-/** Measured on the next frame (before it paints) and sent only when it changed. A spec with a new piece is held one
- *  frame more: the window shows its own layer a frame before this page's, so a menu's frost came in a frame ahead
- *  of the menu, a gray box where it was about to be. While it's held, newer measures replace it, never delay it
- *  (Settings changes on every frame while it loads, and its frost waited for it to settle). */
+/** Measured on the next frame (before it paints) and sent a frame later, only when it changed: the window shows its
+ *  own layer a frame before this page's, so a menu's frost came in a frame ahead of the menu (a gray box where it
+ *  was about to be) and went a frame before it. When the window changed size it waits three frames: this page draws
+ *  all of itself again then, and the Bar's frost moved to its new place two frames ahead of the Bar when the window
+ *  was maximized. While it's held, newer measures replace it, never delay it (Settings changes on every frame while
+ *  it loads, and its frost waited for it to settle). */
 export const queueGlass = () => {
   cancelAnimationFrame(glassFrame)
   glassFrame = requestAnimationFrame(() => {
     glassNext = glassSpec()
     if (glassHeld || glassNext === glassSent) return
-    const sent = keysIn(glassSent ?? '')
-    if ([...keysIn(glassNext)].some(key => !sent.has(key))) glassHeld = requestAnimationFrame(sendGlass)
-    else sendGlass()
+    const size = `${innerWidth}x${innerHeight}`
+    // Only pieces leaving, the rest as they were (a menu closing): sent at once, or the frost stayed a frame after the
+    // menu, a gray box where it had been.
+    const was = new Set((glassSent ?? '').split(';'))
+    glassHeld = sendGlassIn(size !== glassSize ? 3 : glassNext.split(';').every(item => was.has(item)) ? 0 : 1)
+    glassSize = size
   })
 }
 // Glass comes and goes with what the page shows: a panel opening, a menu (a popover: its toggle), an animation
-// settling (a sheet grows in from 0.98).
+// settling (a sheet grows in from 0.98), a new theme or material.
 if (typeof document !== 'undefined') {
-  new MutationObserver(queueGlass).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] })
+  new MutationObserver(queueGlass).observe(document.documentElement, { subtree: true, childList: true, attributes: true,
+    attributeFilter: ['class', 'style', 'hidden', 'data-exo-theme', 'data-exo-glass'] })
   // A menu anchored in a scrolling list (Settings' choices) moves with it.
   for (const type of ['toggle', 'animationend', 'transitionend', 'scroll']) document.addEventListener(type, queueGlass, true)
   addEventListener('resize', queueGlass)
@@ -321,7 +356,6 @@ function useWindowWidth() {
 function TopTabs() {
   const { tabs, active } = useBrowser()
   const glide = useGlide<HTMLElement>()
-  useLens(glide)
   const drag = useTabDrag('x')
   useActiveInView(glide, active)
   const width = useWindowWidth()
@@ -392,14 +426,12 @@ export function Chrome({ settingsOpen, onSettings }: { settingsOpen: boolean; on
   const search = useSearch()
   const [finding, setFinding] = useState(false)
   const v = isVertical(b.settings)
-  // Exo's Bar: each group its own capsule of small Liquid Glass, its lens at the rim and its light where it's
-  // pressed (lib/glass.ts), as in Exo Launcher.
+  // Exo's Bar: each group its own capsule of small Liquid Glass, with its light where it's pressed (lib/glass.ts), as
+  // in Exo Launcher. Not its lens: the lens bends what this page draws behind the glass, which here is nothing (the
+  // window draws the frost), so it changed no pixel on screen, yet building its maps held the Bar's first paint back
+  // 70 ms at every start, and again after every resize.
   const nav = useRef<HTMLDivElement>(null)
-  const address = useRef<HTMLDivElement>(null)
-  const tools = useRef<HTMLDivElement>(null)
-  useLens(nav)
-  useLens(address)
-  useLens(tools)
+  useLens(nav, false)
   useEffect(() => onHost('find', () => setFinding(true)), [])
   // Find belongs to the page it was opened on: another tab puts it away.
   useEffect(() => setFinding(false), [b.active])
@@ -418,12 +450,12 @@ export function Chrome({ settingsOpen, onSettings }: { settingsOpen: boolean; on
             <Button variant="ghost" size="sm" isIconOnly className="exo-titlebar-button" aria-label="Back" isDisabled={!b.back} onPress={() => send('back')}><I.Back /></Button>
             <Button variant="ghost" size="sm" isIconOnly className="exo-titlebar-button" aria-label="Forward" isDisabled={!b.fwd} onPress={() => send('forward')}><I.Forward /></Button>
           </div>
-          <div ref={address} id="exb-address" className="exo-glass exb-address">
+          <div id="exb-address" className="exo-glass exb-address">
             {finding ? <Find onClose={() => setFinding(false)} /> : <Address onEdit={() => search.open('edit')} />}
           </div>
           {/* The window's own buttons; a download in progress joins them while there is one. Extensions open with
               Ctrl+Shift+E (their menu hangs from here) and are managed in Settings. */}
-          <div ref={tools} id="exb-tools" className="exo-glass exo-titlebar-tools exb-pill is-end">
+          <div id="exb-tools" className="exo-glass exo-titlebar-tools exb-pill is-end">
             {b.downloaded ? <><DownloadsButton /><span className="exo-titlebar-divider" aria-hidden="true" /></> : null}
             <WindowButtons />
           </div>

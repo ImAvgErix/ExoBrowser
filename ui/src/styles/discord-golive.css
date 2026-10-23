@@ -271,6 +271,33 @@
   gap: 6px;
 }
 
+/* A small tile (under a watched stream, or in a full call) had its buttons over LIVE and its numbers cut off: there it
+   shows LIVE and the name, the buttons in its middle while the pointer is on it, and the numbers in the Share menu. */
+.exo-dc-my-stream {
+  container-type: inline-size;
+}
+
+@container (max-width: 420px) {
+  .exo-dc-my-stream .exo-dc-voice-tile-name small {
+    display: none;
+  }
+
+  .exo-dc-my-stream-actions {
+    top: 50%;
+    right: auto;
+    left: 50%;
+    flex-direction: column;
+    align-items: stretch;
+    opacity: 0;
+    transition: opacity var(--dur-quick) var(--ease-out);
+    translate: -50% -50%;
+  }
+
+  .exo-dc-my-stream:is(:hover, :focus-within) .exo-dc-my-stream-actions {
+    opacity: 1;
+  }
+}
+
 .exo-dc .exo-dc-golive-stop {
   justify-content: center;
   background: var(--color-bad);

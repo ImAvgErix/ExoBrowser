@@ -5,7 +5,9 @@
 html, body, #root { min-height: 100%; margin: 0; background: var(--color-bg); color: var(--color-fg); font-family: var(--font-sans); }
 body { overflow-x: hidden; scrollbar-width: none; }
 
-@keyframes exb-arrive { from { opacity: 0; translate: 0 8px; } }
+/* From 1%, not 0: WebView2 holds a new page's first frames until something on it is visible, and with everything at 0
+   it showed nothing for about 300 ms, then the page almost done arriving. */
+@keyframes exb-arrive { from { opacity: 0.01; translate: 0 8px; } }
 
 .exb-ntp {
   min-height: 100vh;

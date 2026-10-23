@@ -5972,6 +5972,12 @@ button.exo-dc-gifv {
   font-size: calc(12px * var(--exo-scale, 1));
   font-weight: 600;
   white-space: nowrap;
+}
+
+/* The name (and your stream's numbers) end in an ellipsis on a small tile: a flex box itself never shows one. */
+.exo-dc-voice-tile-label {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
 }
 
@@ -6236,6 +6242,29 @@ button.exo-dc-gifv {
   background: var(--hover-fill);
 }
 
+/* A stream watched beside the big one: the whole tile makes it big; Stop Watching shows over it on hover. */
+.exo-dc-stream-tile-focus {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.exo-dc-voice-tile .exo-dc-stream-tile-stop {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 32px;
+  height: 32px;
+  opacity: 0;
+  transition: opacity var(--dur-quick) var(--ease-out);
+}
+
+.exo-dc-stream-tile:is(:hover, :focus-within) .exo-dc-stream-tile-stop {
+  opacity: 1;
+}
+
 .exo-dc-stream {
   position: relative;
   display: grid;
@@ -6262,12 +6291,18 @@ button.exo-dc-gifv {
 }
 
 /* The controls and LIVE show while the pointer moves over the stream and fade away 2.5s after it rests or as it
-   leaves (voice.tsx › StreamStage), as Discord's do; a focused control keeps them, and the pointer hides too. */
-.exo-dc-stream :is(.exo-dc-stream-bar, .exo-dc-live) {
+   leaves (voice.tsx › StreamStage), as Discord's do; a focused control keeps them, and the pointer hides too. Each
+   glass control fades itself: the bar fading whole was a backdrop root while it ran, so its glass drew clear and its
+   blur popped in after (liquid-glass.md › Backdrop roots). */
+.exo-dc-stream :is(.exo-dc-live, .exo-dc-stream-name, .exo-dc-stream-sound) {
   transition: opacity var(--dur-base) var(--ease-out);
 }
 
-.exo-dc-stream.is-idle:not(:focus-within) :is(.exo-dc-stream-bar, .exo-dc-live) {
+.exo-dc-stream .exo-dc-stream-tools > .exo-dc-voice-btn {
+  transition: background-color 120ms var(--ease-out), scale 120ms var(--ease-out), opacity var(--dur-base) var(--ease-out);
+}
+
+.exo-dc-stream.is-idle:not(:focus-within) :is(.exo-dc-live, .exo-dc-stream-name, .exo-dc-stream-sound, .exo-dc-stream-tools > .exo-dc-voice-btn) {
   opacity: 0;
   pointer-events: none;
 }
