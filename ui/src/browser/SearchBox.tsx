@@ -1,8 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { browser, holdInput, isFirstRun, local, onHost, send, setSetting, useBrowser, type Tab } from './host'
-import { engineOf, hostOf, isNewTab, looksLikeUrl, toUrl } from './search'
+import { browser, holdInput, isFirstRun, local, onHost, send, setSetting, useBrowserValue, type Tab } from './host'
+import { engineOf, hostOf, isNewTab, looksLikeUrl, siteSearches, siteSearchOf, siteSearchUrl, toUrl, type SiteSearch } from './search'
 import * as I from './icons'
 import { openVault } from './vault/store'
+import { newSpace, pageEdges } from './menus'
+import { markInk, spaceIcon } from './look'
+import { boostSite } from './Boosts'
+import { newFolder } from './Folders'
 
 /*
  * Search lives in the address: clicking it (or Ctrl+L, Ctrl+K) opens Exo's Search panel in place, the field over
@@ -21,14 +25,22 @@ export const openSettingsAt = (section = '') => send('openSettings', section)
 
 const COMMANDS: { title: string; Icon: I.Icon; run: () => void }[] = [
   { title: 'New tab', Icon: I.Plus, run: () => send('newtab') },
+  { title: 'New private tab', Icon: I.Private, run: () => send('privateTab') },
   { title: 'Close tab', Icon: I.Close, run: () => { const b = browser(); if (b.active) send('close', b.active) } },
   { title: 'Reopen closed tab', Icon: I.Undo, run: () => send('reopen') },
   { title: 'Bookmark this page', Icon: I.Star, run: () => send('bookmark') },
   { title: 'Duplicate tab', Icon: I.Copy, run: () => send('duplicate', browser().active) },
+  { title: 'Copy link', Icon: I.Link, run: () => send('copyLink', browser().active) },
   { title: 'Pin tab', Icon: I.Pin, run: () => send('pin', browser().active) },
+  { title: 'New folder', Icon: I.FolderPlus, run: () => newFolder() },
+  { title: 'Follow this site in a live folder', Icon: I.Rss, run: () => send('follow', browser().active) },
+  { title: 'Split view: a new tab beside this one', Icon: I.Columns, run: () => send('split', 0) },
+  { title: 'Leave split view', Icon: I.Columns, run: () => send('unsplit', browser().active) },
   { title: 'Mute tab', Icon: I.VolumeOff, run: () => send('mute', browser().active) },
   { title: 'Picture in picture', Icon: I.PictureInPicture, run: () => send('pip') },
   { title: 'Find in page', Icon: I.Search, run: () => local({ t: 'find' }) },
+  { title: 'Zap things on this page', Icon: I.Zap, run: () => send('zap', browser().active) },
+  { title: 'Boost this site', Icon: I.Brush, run: () => { const t = browser().tabs.find(x => x.id === browser().active); if (t && /^https?:/.test(t.url)) boostSite(hostOf(t.url)) } },
   { title: 'Close other tabs', Icon: I.Close, run: () => send('closeOthers', browser().active) },
   { title: 'Tabs down the side', Icon: I.SideTabs, run: () => setSetting('tabs', 'vertical') },
   { title: 'Tabs across the top', Icon: I.TopTabs, run: () => setSetting('tabs', 'horizontal') },
@@ -62,25 +74,66 @@ function matchScore(text: string, query: string) {
 const title = (t: Tab) => isNewTab(t.url) ? 'New tab' : t.title || hostOf(t.url) || 'New tab'
 const bare = (url: string) => url.replace(/^https?:\/\/(www\.)?/, '')
 
-function rowsFor(text: string, mode: Mode, b: ReturnType<typeof browser>): Row[] {
+// Commands matching what's typed: Exo Browser's own, then the spaces'.
+type Searched = Pick<ReturnType<typeof browser>, 'history' | 'tabs' | 'bookmarks' | 'favicons' | 'settings' | 'archive' | 'spaces' | 'space' | 'active'>
+
+function commandRows(text: string, b: Searched): Row[] {
+  const spaces = [
+    { title: 'New space', Icon: I.Plus, run: () => newSpace() },
+    ...(b.spaces.length > 1 ? b.spaces.filter(s => s.id !== b.space).map(s => ({ title: `Switch to ${s.name}`, Icon: spaceIcon(s.icon), run: () => send('space', s.id) })) : []),
+  ]
+  const cmds = [...COMMANDS, ...spaces].filter(c => matchScore(c.title, text) > 0).slice(0, 4)
+  return cmds.length ? [{ group: 'Commands' }, ...cmds.map(c => ({ kind: 'cmd' as const, Icon: c.Icon, main: c.title, run: c.run }))] : []
+}
+
+// Tabs the archive closed, found by what's typed (not ones open again).
+function archivedRows(text: string, b: Searched, open: Set<string>): Row[] {
+  const found = b.archive.filter(a => !open.has(a[0])).map(a => ({ a, s: matchScore(`${a[1]} ${bare(a[0])}`, text) })).filter(x => x.s > 0).slice(0, 3)
+  return found.length ? [{ group: 'Archived' }, ...found.map(({ a }) => ({ kind: 'go' as const, Icon: I.Archive, main: a[1] || hostOf(a[0]), sub: bare(a[0]), url: a[0] }))] : []
+}
+
+// Searching one site (its chip in the field): what's typed searches it, its pages from history under that.
+function siteRows(text: string, site: SiteSearch, b: Searched): Row[] {
+  const rows: Row[] = text ? [{ kind: 'go', Icon: I.Search, main: text, sub: `Search ${site.name}`, url: siteSearchUrl(site, text) }] : []
+  const host = hostOf(site.url)
+  const hist = b.history.filter(h => hostOf(h[0]) === host).map(h => ({ h, s: matchScore(`${h[1]} ${bare(h[0])}`, text) })).filter(x => x.s > 0).slice(0, 6)
+  if (hist.length) rows.push({ group: 'History' }, ...hist.map(({ h }) => ({ kind: 'go' as const, Icon: I.History, main: h[1] || hostOf(h[0]), sub: bare(h[0]), url: h[0] })))
+  return rows
+}
+
+// What Enter does with the line: a site's search named first ("yt cats"), an address (with Tab to search that site,
+// if it has one), or the engine's search.
+function firstRow(text: string, b: Searched): Row {
+  const sites = siteSearches(b.settings.siteSearches)
+  const url = toUrl(text, b.settings.engine, sites)!
+  const at = text.indexOf(' ')
+  const named = at > 0 && text.slice(at + 1).trim() ? siteSearchOf(text.slice(0, at), sites) : null
+  if (named) return { kind: 'go', Icon: I.Search, main: text.slice(at + 1).trim(), sub: `Search ${named.name}`, url }
+  const address = looksLikeUrl(text)
+  const tabTo = !/\s/.test(text) ? siteSearchOf(text, sites) : null
+  return { kind: 'go', Icon: address ? I.Globe : I.Search, main: text, url,
+    sub: [address ? 'Open' : `Search ${engineOf(b.settings.engine).short}`, tabTo ? `Tab to search ${tabTo.name}` : ''].filter(Boolean).join(' · ') }
+}
+
+function rowsFor(text: string, mode: Mode, b: Searched, site: SiteSearch | null): Row[] {
+  if (site) return siteRows(text, site, b)
   const now = Date.now() / 1000
-  const rows: Row[] = []
-  if (text) {
-    const url = toUrl(text, b.settings.engine)!
-    rows.push({ kind: 'go', Icon: looksLikeUrl(text) ? I.Globe : I.Search, main: text, sub: looksLikeUrl(text) ? 'Open' : `Search ${engineOf(b.settings.engine).short}`, url })
-  }
+  const rows: Row[] = text ? [firstRow(text, b)] : []
   const open = new Set(b.tabs.map(t => t.url))
   const tabs = b.tabs.filter(t => (t.id !== b.active || mode === 'palette') && !isNewTab(t.url))
     .map(t => ({ t, s: matchScore(`${t.title} ${t.url}`, text) })).filter(x => x.s > 0).slice(0, text ? 5 : 6)
   if (tabs.length) {
     rows.push({ group: 'Switch to tab' })
-    for (const { t } of tabs) rows.push({ kind: 'tab', id: t.id, fav: b.favicons[t.id], Icon: I.Globe, main: title(t), sub: hostOf(t.url) })
+    // A tab of another space says which: switching to it goes there.
+    const spaceName = (t: Tab) => t.space !== b.space ? b.spaces.find(s => s.id === t.space)?.name : ''
+    for (const { t } of tabs) rows.push({ kind: 'tab', id: t.id, fav: b.favicons[t.id], Icon: I.Globe, main: title(t), sub: [hostOf(t.url), spaceName(t)].filter(Boolean).join(' · ') })
   }
   const marks = text ? b.bookmarks.map(m => ({ m, s: matchScore(`${m[1]} ${m[0]}`, text) })).filter(x => x.s > 0).slice(0, 4) : []
   if (marks.length) {
     rows.push({ group: 'Bookmarks' })
     for (const { m } of marks) rows.push({ kind: 'go', Icon: I.Star, fav: m[2], main: m[1] || hostOf(m[0]), sub: hostOf(m[0]), url: m[0] })
   }
+  if (text) rows.push(...archivedRows(text, b, open))
   const marked = new Set(marks.map(x => x.m[0]))
   const hist = b.history.filter(h => !open.has(h[0]) && !marked.has(h[0]))
     .map(h => ({ h, s: matchScore(`${h[1]} ${bare(h[0])}`, text) })).filter(x => x.s > 0)
@@ -89,13 +142,7 @@ function rowsFor(text: string, mode: Mode, b: ReturnType<typeof browser>): Row[]
     rows.push({ group: text ? 'History' : 'Recent' })
     for (const { h } of hist) rows.push({ kind: 'go', Icon: I.History, main: h[1] || hostOf(h[0]), sub: bare(h[0]), url: h[0] })
   }
-  if (text && !looksLikeUrl(text)) {
-    const cmds = COMMANDS.filter(c => matchScore(c.title, text) > 0).slice(0, 4)
-    if (cmds.length) {
-      rows.push({ group: 'Commands' })
-      for (const c of cmds) rows.push({ kind: 'cmd', Icon: c.Icon, main: c.title, run: c.run })
-    }
-  }
+  if (text && !looksLikeUrl(text)) rows.push(...commandRows(text, b))
   return rows
 }
 
@@ -125,10 +172,19 @@ export function useSearch() {
   return controller
 }
 
+/** Search while it is open: closed, it is nothing, and draws nothing for the host's messages. */
 export function SearchBox({ controller }: { controller: ReturnType<typeof useSearch> }) {
-  const { mode, seed } = controller
-  const b = useBrowser()
+  return controller.mode ? <Panel controller={controller} mode={controller.mode} /> : null
+}
+
+function Panel({ controller, mode }: { controller: ReturnType<typeof useSearch>; mode: Mode }) {
+  const { seed } = controller
+  // What its rows are made of, each read alone (a download's progress doesn't score them again).
+  const history = useBrowserValue(b => b.history), tabs = useBrowserValue(b => b.tabs), bookmarks = useBrowserValue(b => b.bookmarks)
+  const favicons = useBrowserValue(b => b.favicons), settings = useBrowserValue(b => b.settings), archive = useBrowserValue(b => b.archive)
+  const spaces = useBrowserValue(b => b.spaces), space = useBrowserValue(b => b.space), active = useBrowserValue(b => b.active)
   const [text, setText] = useState('')
+  const [site, setSite] = useState<SiteSearch | null>(null)
   const [sel, setSel] = useState(0)
   const [box, setBox] = useState({ left: 0, top: 0, width: 560 })
   const field = useRef<HTMLInputElement>(null)
@@ -136,18 +192,31 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
 
   // Opening: the address (or what was typed elsewhere), selected; the panel over the address.
   useLayoutEffect(() => {
-    if (!mode) return
     const b = browser()
     const tab = b.tabs.find(t => t.id === b.active)
     setText(mode === 'edit' && tab?.url && !isNewTab(tab.url) ? tab.url : seed)
+    setSite(null)
     setSel(0)
     const place = () => {
       const cap = document.getElementById('exb-address')!.getBoundingClientRect()
       // Where the address rests: a hidden Bar is slid up by `translate` while it waits to come in.
       const slide = getComputedStyle(document.getElementById('exb-bar')!).translate
       const [dx = 0, dy = 0] = slide === 'none' ? [] : slide.split(' ').map(parseFloat)
-      const width = Math.min(innerWidth - 24, Math.max(560, cap.width))
-      setBox({ left: Math.max(12, Math.min(innerWidth - 12 - width, cap.left - dx + cap.width / 2 - width / 2)), top: cap.top - dy, width })
+      // Over the page only: never over the side tabs or the Bar's capsules still showing (the tabs step aside for it),
+      // whose words would show through it (the window frosts the page under it, not the chrome). Where they leave it
+      // under 360 px, it opens under the Bar.
+      const edges = pageEdges(), floor = edges.left ? edges.left + 10 : 12
+      const beside = [...document.querySelectorAll('#exb-bar .exo-glass')].filter(e => e.id !== 'exb-address' && e.checkVisibility({ visibilityProperty: true }))
+        .map(e => e.getBoundingClientRect())
+      const lo = Math.max(floor, ...beside.filter(r => r.right <= cap.left + 1).map(r => r.right - dx + 8))
+      const hi = Math.min(innerWidth - 12, ...beside.filter(r => r.left >= cap.right - 1).map(r => r.left - dx - 8))
+      const roomy = hi - lo >= 360
+      const [from, to] = roomy ? [lo, hi] : [floor, innerWidth - 12]
+      const width = Math.min(to - from, Math.max(560, cap.width))
+      // It grows out of the address: from its left edge on the left of the Bar, around its middle when it's centered.
+      const centered = b.settings.tabs === 'vertical'
+      const left = centered ? cap.left - dx + cap.width / 2 - width / 2 : cap.left - dx
+      setBox({ left: Math.max(from, Math.min(to - width, left)), top: roomy ? cap.top - dy : edges.top + 6, width })
     }
     place()
     addEventListener('resize', place)
@@ -156,12 +225,8 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
   }, [mode, seed])
   // The selected row stays in view as the arrows move it.
   useEffect(() => { list.current?.querySelector('.is-selected')?.scrollIntoView({ block: 'nearest' }) }, [sel, mode])
-  // Scored again only when what it searches changes, not on every message from the host while it's open.
-  const rows = useMemo(() => (mode ? rowsFor(text.trim(), mode, b) : []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- b changes identity on every host message
-    [text, mode, b.history, b.tabs, b.bookmarks, b.favicons, b.settings])
-
-  if (!mode) return null
+  const rows = useMemo(() => rowsFor(text.trim(), mode, { history, tabs, bookmarks, favicons, settings, archive, spaces, space, active }, site),
+    [text, mode, site, history, tabs, bookmarks, favicons, settings, archive, spaces, space, active])
   const picks = rows.filter((r): r is Exclude<Row, { group: string }> => !('group' in r))
   const current = Math.min(sel, Math.max(0, picks.length - 1))
   const choose = (i: number, newTab = false) => {
@@ -200,10 +265,23 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
       <div role="dialog" aria-label="Search" className="exo-glass is-panel exb-search" style={{ left: box.left, top: box.top, width: box.width }}>
         <div className="exb-search-field">
           <I.Search className="exb-search-icon" />
-          <input ref={field} value={text} spellCheck={false} autoComplete="off" placeholder={`Search ${engineOf(b.settings.engine).short} or type an address`}
-            onChange={e => { setText(e.target.value); setSel(0); complete(e.target.value, (e.nativeEvent as InputEvent).inputType?.startsWith('delete')) }}
+          {site ? <span className="exb-search-chip">{site.name}</span> : null}
+          <input ref={field} value={text} spellCheck={false} autoComplete="off" aria-label={site ? `Search ${site.name}` : 'Search or enter address'}
+            placeholder={site ? `Search ${site.name}` : `Search ${engineOf(settings.engine).short} or type an address`}
+            onChange={e => {
+              // A site's keyword and a space ("yt "): its chip; with a chip, what's typed is never filled in as an address.
+              const value = e.target.value
+              const word = !site && /^\S+ $/.test(value) ? siteSearchOf(value.trim(), siteSearches(settings.siteSearches)) : null
+              if (word) { setSite(word); setText(''); setSel(0); return }
+              setText(value); setSel(0)
+              if (!site) complete(value, (e.nativeEvent as InputEvent).inputType?.startsWith('delete'))
+            }}
             onKeyDown={e => {
-              if (e.key === 'ArrowDown') { e.preventDefault(); setSel((current + 1) % Math.max(1, picks.length)) }
+              // Tab after a site's keyword or address: its chip. Backspace in an empty field takes the chip off.
+              const named = !site && e.key === 'Tab' && !e.shiftKey && text && !/\s/.test(text.trim()) ? siteSearchOf(text.trim(), siteSearches(settings.siteSearches)) : null
+              if (named) { e.preventDefault(); setSite(named); setText(''); setSel(0) }
+              else if (e.key === 'Backspace' && site && !text) { e.preventDefault(); setSite(null) }
+              else if (e.key === 'ArrowDown') { e.preventDefault(); setSel((current + 1) % Math.max(1, picks.length)) }
               else if (e.key === 'ArrowUp') { e.preventDefault(); setSel((current - 1 + picks.length) % Math.max(1, picks.length)) }
               else if (e.key === 'Enter') { e.preventDefault(); choose(current, e.altKey || e.shiftKey) }
               else if (e.key === 'Escape') { e.preventDefault(); controller.close() }
@@ -218,7 +296,7 @@ export function SearchBox({ controller }: { controller: ReturnType<typeof useSea
                 <div key={k} role="option" aria-selected={i === current} className={`exb-search-row${i === current ? ' is-selected' : ''}`}
                   onPointerMove={() => { if (i !== current) setSel(i) }}
                   onPointerDown={e => { e.preventDefault(); if (e.button !== 2) choose(i, e.button === 1) }}>
-                  {'fav' in r && r.fav ? <img className="exb-search-fav" src={r.fav} alt="" /> : <r.Icon className="exb-search-lead" />}
+                  {'fav' in r && r.fav ? <img className="exb-search-fav" src={r.fav} alt="" onLoad={e => markInk(e.currentTarget)} /> : <r.Icon className="exb-search-lead" />}
                   <span className="exb-search-text">
                     <span className="exb-search-main">{r.main}</span>
                     {'sub' in r && r.sub ? <span className="exb-search-sub">{r.sub}</span> : null}

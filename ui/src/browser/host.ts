@@ -14,14 +14,20 @@ const webview = (window as unknown as { chrome?: { webview?: WebView } }).chrome
 
 export const send = (...parts: (string | number)[]) => webview?.postMessage(parts.join('\t'))
 
-export type Tab = { id: number; url: string; title: string; loading?: boolean; pinned?: boolean; muted?: boolean; audible?: boolean; sleeping?: boolean }
+export type Tab = { id: number; url: string; title: string; loading?: boolean; pinned?: boolean; muted?: boolean; audible?: boolean; sleeping?: boolean; space: number; home?: string; split?: number; folder?: number; priv?: boolean }
+/** A folder among a space's pinned tabs (side tabs): perhaps inside another, open or closed. */
+export type Folder = { id: number; space: number; parent: number; name: string; open: boolean; live?: boolean }
+/** A space: its own tabs, an icon, a color that becomes the accent while it's on screen, and optionally its own appearance. */
+export type Space = { id: number; name: string; icon: string; color: string; theme: string }
 export type Visit = [url: string, title: string, visits: number, last: number]
+/** A tab the archive closed: its address, title and when (Unix seconds), newest first. */
+export type Archived = [url: string, title: string, at: number]
 export type Mark = [url: string, title: string, icon: string, sharp?: boolean]
 export type Extension = { id: string; name: string; enabled: boolean; builtIn?: boolean; manifest?: string }
 export type Download = { id: number; name: string; url: string; state: string; received: number; total: number }
 export type Settings = Record<string, string>
 /** Updates, as the host tells them: checking, current, available, downloading (percent), installing, error. */
-export type Update = { state: string; version: string; latest: string; message: string; percent: number; checked: number; installable: boolean }
+export type Update = { state: string; version: string; latest: string; message: string; percent: number; checked: number; installable: boolean; notes?: string }
 
 type IconSet = string | Record<string, string>
 type Action = { default_icon?: IconSet; default_popup?: string }
@@ -39,8 +45,12 @@ export type Manifest = {
 }
 
 export type Browser = {
+  /** Every space's tabs (each strip shows its own space's). */
   tabs: Tab[]
   active: number
+  space: number
+  spaces: Space[]
+  folders: Folder[]
   back: boolean
   fwd: boolean
   max: boolean
@@ -48,6 +58,7 @@ export type Browser = {
   favicons: Record<number, string>
   extIcons: Record<string, string | null>
   history: Visit[]
+  archive: Archived[]
   bookmarks: Mark[]
   extensions: Extension[]
   downloads: Download[]
@@ -63,7 +74,7 @@ export type Browser = {
 }
 
 let store: Browser = {
-  tabs: [], active: 0, back: false, fwd: false, max: false, full: false, favicons: {}, extIcons: {}, history: [], bookmarks: [],
+  tabs: [], active: 0, space: 0, spaces: [], folders: [], back: false, fwd: false, max: false, full: false, favicons: {}, extIcons: {}, history: [], archive: [], bookmarks: [],
   extensions: [], downloads: [], downloaded: false, settings: {}, settingsLoaded: false, theme: 'void', revealTop: true, revealSide: true, update: null,
 }
 const listeners = new Set<() => void>()
@@ -72,11 +83,22 @@ const update = (next: Partial<Browser>) => {
   for (const listener of listeners) listener()
 }
 const subscribe = (on: () => void) => { listeners.add(on); return () => { listeners.delete(on) } }
-export const useBrowser = () => useSyncExternalStore(subscribe, () => store)
 /** One value from the store (a primitive, or something the store keeps the same while unchanged): the component
- * renders again only when that value changes, not on every message from the host. */
+ * renders again only when that value changes, not on every message from the host. The whole store is never
+ * subscribed to: every tab's title and every download's progress would draw the whole chrome again. */
 export const useBrowserValue = <T,>(pick: (b: Browser) => T) => useSyncExternalStore(subscribe, () => pick(store))
 export const browser = () => store
+/** Air Traffic Control's routes (Settings › Spaces): which space a site's links from other apps open in. */
+export const routes = (b: Pick<Browser, 'settings'>) => (b.settings.routes || '').split('|').filter(Boolean).map(r => { const at = r.lastIndexOf('='); return [r.slice(0, at), Number(r.slice(at + 1))] as [string, number] })
+export const setRoutes = (list: [string, number][]) => setSetting('routes', list.filter(([site, id]) => site && id).map(([site, id]) => `${site}=${id}`).join('|'))
+/** A site as routes name it: the address's host without www. */
+export const siteOf = (url: string) => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return '' } }
+
+/** A pinned tab that has left its own page (another address; a #part or a query on the same page doesn't count). */
+export const drifted = (t: Tab) => {
+  if (!t.home || !t.url) return false
+  try { const a = new URL(t.url), h = new URL(t.home); return a.origin !== h.origin || a.pathname !== h.pathname } catch { return t.url !== t.home }
+}
 
 export const setting = (key: string, fallback: string) => store.settings[key] || fallback
 /** First run is showing (until it's finished): nothing else opens over it. */
@@ -143,9 +165,15 @@ const fromHost: Record<string, (m: Message) => void> = {
     // A tab that didn't change keeps its object, so its button doesn't draw again for another tab's news.
     const before = new Map(store.tabs.map(t => [t.id, t]))
     const same = (a: Tab, b: Tab) => (Object.keys(b) as (keyof Tab)[]).every(k => a[k] === b[k]) && Object.keys(a).length === Object.keys(b).length
-    const tabs = (m.tabs as Tab[]).map(t => { const old = before.get(t.id); return old && same(old, t) ? old : t })
+    const fresh = (m.tabs as Tab[]).map(t => { const old = before.get(t.id); return old && same(old, t) ? old : t })
+    // Nothing about the tabs changed (the message was about Back or another window state): the same list, so nothing
+    // that lists them draws again.
+    const tabs = fresh.length === store.tabs.length && fresh.every((t, i) => t === store.tabs[i]) ? store.tabs : fresh
     const favicons = Object.fromEntries(Object.entries(store.favicons).filter(([id]) => tabs.some(t => t.id === Number(id))))
-    update({ tabs, active: m.active as number, back: !!m.back, fwd: !!m.fwd, max: !!m.max, full: !!m.full, favicons })
+    // The spaces keep their array while unchanged, so what lists them doesn't draw again for a tab's news.
+    const spaces = JSON.stringify(m.spaces) === JSON.stringify(store.spaces) ? store.spaces : (m.spaces as Space[]) ?? []
+    const folders = JSON.stringify(m.folders) === JSON.stringify(store.folders) ? store.folders : (m.folders as Folder[]) ?? []
+    update({ tabs, active: m.active as number, space: (m.space as number) ?? 0, spaces, folders, back: !!m.back, fwd: !!m.fwd, max: !!m.max, full: !!m.full, favicons })
   },
   fav(m) {
     const favicons = { ...store.favicons }
@@ -153,6 +181,7 @@ const fromHost: Record<string, (m: Message) => void> = {
     update({ favicons })
   },
   history: m => update({ history: m.items as Visit[] }),
+  archive: m => update({ archive: m.items as Archived[] }),
   update: m => update({ update: m as unknown as Update }),
   visit(m) {
     const item = m.item as Visit

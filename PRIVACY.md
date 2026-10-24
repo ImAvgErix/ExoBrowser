@@ -8,10 +8,12 @@ Exo Browser has no server of its own. Nothing you do in it is sent to Exo or its
 
 Exo Browser keeps its data in `%LocalAppData%\ExoBrowser`, beside the app (in `app`), never inside it, so updates never touch it:
 
-- your settings, open tabs, history, bookmarks, site icons, downloads list and the extensions you added (`settings.tsv`, `session.tsv`, `history.tsv`, `bookmarks.tsv`, `favicons.tsv`, `icons.tsv`, `iconmiss.tsv`, `downloads.tsv`, `extensions.tsv`);
+- your settings (Boosts, Mods and your own CSS among them), open tabs, spaces and folders, history, archived tabs, bookmarks, site icons, downloads list and the extensions you added (`settings.tsv`, `session.tsv`, `spaces.tsv`, `history.tsv`, `archive.tsv`, `bookmarks.tsv`, `favicons.tsv`, `icons.tsv`, `iconmiss.tsv`, `downloads.tsv`, `extensions.tsv`);
 - the browser profile (`Profile`): cookies and sign-ins, site data, the cache, and your extensions' own data, kept by Microsoft Edge WebView2 as Edge keeps them;
 - Exo Vault (`vault.exovault`, and `vault.exovault.bak` from the save before): your logins, cards, notes and identities, encrypted (see **Exo Vault**);
 - a working copy of Exo Shield (`Builtin`).
+
+A private tab (Ctrl+Shift+N) runs on a profile kept in memory only: its cookies, sign-ins and site data stay apart from your other tabs and go when the last private tab closes, and what it visits never reaches your history or saved tabs.
 
 Settings > Privacy > Cookies, site data and cache clears cookies, every site's stored data and the cache, which signs you out of every site. Uninstalling with **Also remove my data and Exo Vault** deletes the whole folder; without it, the folder stays for a reinstall.
 
@@ -27,7 +29,7 @@ Settings > Privacy > Cookies, site data and cache clears cookies, every site's s
 
 ## Bringing your things from other browsers
 
-When you choose Import (or Bring in on first run), Exo Browser reads that browser's own files on this PC: bookmarks, history, site icons, cookies (so you stay signed in), its search engine and its Chrome Web Store extensions, and, into Exo Vault, its saved passwords. For Firefox it reads bookmarks, history, cookies and passwords. Encrypted data is decrypted on this PC with Windows' own protection for your user. Nothing is removed from the other browser, and nothing is sent anywhere. A password export file you import is read the same way.
+When you choose Import (or Bring in on first run), Exo Browser reads that browser's own files on this PC: bookmarks, history, site icons, cookies (so you stay signed in), its search engine and its Chrome Web Store extensions, and, into Exo Vault, its saved passwords. From Arc it also reads its sidebar file (`StorableSidebar.json`) for your spaces, their colors, favorites, pinned tabs with their folders and Today tabs. For Firefox, Zen, Floorp, LibreWolf and Waterfox it reads bookmarks, history, cookies and passwords. Encrypted data is decrypted on this PC with Windows' own protection for your user. Nothing is removed from the other browser, and nothing is sent anywhere. A password export file you import is read the same way.
 
 ## What leaves your PC
 
@@ -41,11 +43,15 @@ Every address lookup (a site's name, like `github.com`) goes encrypted over HTTP
 
 ### Your search engine
 
-What you type in the Bar when it isn't an address goes to the search engine you pick in Settings > General (Brave Search unless you change it; Google, DuckDuckGo, Startpage, Kagi and Bing are the others), as a normal search. Nothing is sent while you type: the Bar's suggestions come from your tabs, bookmarks and history on this PC.
+What you type in the Bar when it isn't an address goes to the search engine you pick in Settings > General (Brave Search unless you change it; Google, DuckDuckGo, Startpage, Kagi and Bing are the others), as a normal search. A site search (a keyword such as yt, or a site's address and Tab) sends what you type to that site's own search instead, as a normal visit. Nothing is sent while you type: the Bar's suggestions come from your tabs, bookmarks and history on this PC.
 
 ### Site icons
 
 For your bookmarks and most visited sites, Exo Browser asks each site for its large icon (`/apple-touch-icon.png`, or the icon the page names). These requests go to that site only, through Windows' own download service, so their address lookups use your PC's usual DNS rather than Cloudflare.
+
+### Sites you follow in live folders
+
+When you follow a site in a live folder, Exo Browser asks that site for its feed (the RSS or Atom address its page names) 15 seconds after it starts and every 30 minutes while it runs. These requests go to that site only, through Windows' own internet service, with "ExoBrowser/" and the version you run and none of your cookies; their address lookups use your PC's usual DNS rather than Cloudflare. Delete the folder and they stop.
 
 ### Twitch (Exo Shield)
 

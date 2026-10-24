@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Button } from '../../components/ui/Button'
 import { Row, Section } from '../../components/settings/parts'
 import * as I from '../icons'
-import { useBrowser } from '../host'
+import { useBrowserValue } from '../host'
 import { saveItem, setVault, useVault, type Field, type Item } from './store'
 import { Act } from './parts'
 import { DEFAULT_RECIPE, generate, strength } from './generate'
@@ -24,8 +24,8 @@ function Input({ item, edit, field, label, type = 'text', placeholder, wide }: {
 
 /** Generated passwords follow Vault settings: their length, and whether they use symbols. */
 export function useRecipe() {
-  const b = useBrowser()
-  return { ...DEFAULT_RECIPE, length: Number(b.settings.vaultLength || DEFAULT_RECIPE.length), symbols: (b.settings.vaultSymbols || 'on') === 'on' }
+  const length = useBrowserValue(b => b.settings.vaultLength), symbols = useBrowserValue(b => b.settings.vaultSymbols)
+  return { ...DEFAULT_RECIPE, length: Number(length || DEFAULT_RECIPE.length), symbols: (symbols || 'on') === 'on' }
 }
 
 function PasswordInput({ item, edit }: { item: Item; edit: Edit }) {

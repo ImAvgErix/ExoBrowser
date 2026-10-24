@@ -127,43 +127,16 @@
   padding: 0 20px 20px;
 }
 
-.exo-captures-chips,
+.exo-captures-chips {
+  align-self: flex-start;
+  margin: 2px 0 14px;
+}
+
 .exo-snip-tools {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: 2px 0 14px;
-}
-
-.exo-capture-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid rgb(var(--exo-ink-rgb) / 0.14);
-  border-radius: 999px;
-  background: var(--exo-fill);
-  color: var(--color-muted);
-  font-size: calc(12px * var(--exo-scale, 1));
-  transition: color 120ms var(--ease-out), background-color 120ms var(--ease-out);
-}
-
-.exo-capture-chip.is-on {
-  color: var(--color-fg);
-  background: var(--exo-selected);
-}
-
-.exo-capture-chip:disabled {
-  opacity: 0.4;
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .exo-capture-chip:hover:not(.is-on, :disabled) {
-    color: var(--color-fg);
-    background: var(--hover-fill);
-  }
 }
 
 /* Nothing saved yet: centered in the sheet, the three ways to capture as pills with their keys. */

@@ -134,6 +134,8 @@ export type DiscordChannels = {
   events?: number
   /** Opt-in mode: the sidebar lists only followed channels. */
   optIn?: boolean
+  /** The server's banner hash, over the top of the channel list. */
+  banner?: string | null
   /** Discord's rows over the channels this server has. */
   rows?: { guide: boolean; events: boolean; browse: boolean; members: boolean }
   /** What this user may do in Server Settings and to members. */
@@ -148,6 +150,8 @@ export type DiscordPlace = { name: string; guildId: string | null; guild: string
 export type DiscordModeration = {
   kick: boolean; ban: boolean; manageGuild: boolean; auditLog: boolean; manageRoles: boolean; timeout: boolean
   manageChannels: boolean; manageExpressions: boolean; manageWebhooks: boolean; manageNicknames: boolean; prune: boolean; owner: boolean
+  /** The account itself has 2FA on (an owner needs it to require 2FA of moderators). */
+  mfa: boolean
 }
 /** An invite as a message's invite card shows it: the server (name only for a group DM), its counts, and whether you're in it. */
 export type DiscordInvite = {
@@ -192,12 +196,28 @@ export type DiscordCollectibleFields = {
   avatar_decoration_data?: { asset: string; sku_id?: string | null } | null
   collectibles?: { nameplate?: { sku_id: string; asset?: string | null; palette?: string | null } | null } | null
   display_name_styles?: { font_id: number; effect_id: number; colors: number[] } | null
+  /** Their server tag: the server they chose to represent, while its identity is on. */
+  primary_guild?: { identity_guild_id: string | null; identity_enabled: boolean | null; tag: string | null; badge: string | null } | null
+}
+/** A server's public profile, as Discord's tag card shows it (GET guilds/{id}/profile). */
+export type DiscordGuildProfile = {
+  id: string
+  name: string
+  icon_hash?: string | null
+  description?: string | null
+  member_count?: number | null
+  online_count?: number | null
+  tag?: string | null
+  badge_hash?: string | null
+  traits?: { emoji_id?: string | null; emoji_name?: string | null; label: string; position: number }[] | null
 }
 /** Someone's collectibles as the room draws them: the host's look on its lists, or lookOf a user and member. */
 export type DiscordLook = {
   decoration?: { asset: string; skuId?: string | null } | null
   nameplate?: { skuId: string; asset?: string | null; palette?: string | null } | null
   nameStyle?: { font: number; effect: number; colors: number[] } | null
+  /** Their server tag and badge, beside their name as Discord shows it. */
+  tag?: { guildId: string; tag: string; badge: string | null } | null
 }
 /** A profile effect's item in Discord's Shop (camelCase, as Discord sends it): its layers, timed in ms on a 450 px wide canvas. */
 export type DiscordEffectItem = {
@@ -355,6 +375,20 @@ export function displayName(message: Pick<DiscordMessage, 'author' | 'member'>):
 /** Discord's CDN size for a picture shown at size px: a power of two with room for a 2x screen, never under 128. */
 export function cdnSize(size: number): number {
   return Math.min(4096, 2 ** Math.ceil(Math.log2(Math.max(128, size * Math.max(2, window.devicePixelRatio || 1)))))
+}
+
+// The sizes Discord's CDN serves (Discord's own list).
+const CDN_STEPS = [16, 20, 22, 24, 28, 32, 40, 44, 48, 56, 60, 64, 80, 96, 100, 128, 160, 240, 256, 300, 320, 480, 512, 600, 640, 1024, 1280, 1536, 2048, 3072, 4096]
+
+/** The smallest CDN size covering this many CSS pixels at the screen's density, as Discord's client picks one. */
+export function cdnStep(px: number): number {
+  const want = px * (window.devicePixelRatio || 1)
+  return CDN_STEPS.find(step => step >= want) ?? 4096
+}
+
+/** A server's banner as Discord's channel list asks for it: 360 px wide at the screen's density, moving (a_) only when motion is allowed. */
+export function guildBannerUrl(guildId: string, hash: string, moving: boolean): string {
+  return `https://cdn.discordapp.com/banners/${guildId}/${hash}.webp?size=${cdnStep(360)}${moving && hash.startsWith('a_') ? '&animated=true' : ''}`
 }
 
 /** A Discord CDN picture at the size it is drawn: the host's lists link one size (256) for every place, which a 32px

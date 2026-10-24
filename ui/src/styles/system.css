@@ -5,11 +5,9 @@
    Filled capsules, not outlines (Apple's fills on black): fields, chips, segment groups and the
    game and Store pages' pills are #121212 with a faint white rim on top, no hairline. */
 .exo-music-sort,
-.exo-capture-chip,
 .exo-game-sources,
 .exo-game-status,
 .exo-shelf-chips,
-.exo-set-chip,
 .exo-hub-tabs,
 .exo-upscalers-family,
 .exo-sgp-offer,
@@ -510,8 +508,8 @@
 }
 
 /* Pressed (DESIGN.md › Controls): one fill for every raised or quiet control, the step past hover. */
-:is(.exo-set-btn:not(.is-primary), .exo-game-tool, .exo-ghost-btn:not(.is-primary), .exo-shelf-sort-trigger, .exo-pin-nav-btn,
-  .exo-add-game-btn, .exo-game-close, .exo-set-chip, .exo-shelf-chip, .exo-music-sort, .exo-music-mini button,
+:is(.exo-set-btn:not(.is-primary), .exo-game-tool, .exo-shelf-sort-trigger, .exo-pin-nav-btn,
+  .exo-add-game-btn, .exo-game-close, .exo-shelf-chip, .exo-music-sort, .exo-music-mini button,
   .exo-dc-icon-btn, .exo-dc-tab:not(.is-add, .exo-dc-blurple), .button--secondary, .button--ghost, .exo-capture-btn, .exo-mouse-pill,
   .exo-dc-item, .exo-dc-member, .exo-dc-server-name, .exo-dc-me-who, .exo-dc-input-btn, .exo-dc-new-bar-read,
   .exo-music-row, .exo-music-recent-open, .exo-settings-nav button, .exo-dc-settings-nav button, .exo-dc-round-btn, .exo-dc-label-btn,
@@ -521,7 +519,7 @@
 }
 
 /* Primary is the one filled control: white, no hairline, so it stands apart from the black ones. */
-:is(.exo-set-btn, .exo-ghost-btn, .exo-dc-cv-button, .exo-sgp-offer, .exo-upscaler-btn).is-primary,
+:is(.exo-set-btn, .exo-dc-cv-button, .exo-sgp-offer, .exo-upscaler-btn).is-primary,
 .exo-dc :is(.exo-dc-tab.is-add, .exo-dc-blurple, .exo-dc-tab.is-raised.is-good) {
   box-shadow: none;
 }
@@ -587,6 +585,30 @@
   transition: opacity var(--dur-quick) var(--ease-out);
 }
 
+/* Browse Channels: one list with hairlines between its rows, as Exo's settings lists are, not a stack of cards; the
+   activity line in the muted ink at Exo's 12px so it reads on black. */
+.exo-dc .exo-dc-page .exo-dc-browse-row {
+  padding: 10px 4px;
+  border: 0;
+  border-bottom: 1px solid var(--dc-line);
+  border-radius: 0;
+  background: none;
+}
+
+.exo-dc .exo-dc-browse-row .exo-dc-friend-names > span {
+  color: var(--color-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+
+.exo-dc-browse-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+  font-weight: 500;
+}
+
 .exo-dc .exo-dc-browse-view {
   transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out), scale var(--dur-quick) var(--ease-out),
     opacity var(--dur-quick) var(--ease-out);
@@ -595,8 +617,8 @@
 /* Feel: every capsule control gives way a little under the press (never on hover): in over 90ms, back
    over 120ms (each control's own transition list carries `scale`; DESIGN.md › Motion › Press). The
    individual property, so a press never fights a control's own transform. */
-:is(.exo-set-btn, .exo-game-tool, .exo-ghost-btn, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-continue-play,
-  .exo-continue-more, .exo-friend-pill-go, .exo-bar-search, .exo-nav-btn, .exo-settings-btn, .exo-shelf-chip, .exo-cta,
+:is(.exo-set-btn, .exo-game-tool, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-continue-play,
+  .exo-continue-more, .exo-friend-pill-go, .exo-bar-search, .exo-nav-btn, .exo-settings-btn, .exo-shelf-chip,
   .exo-play, .exo-dc-tab, .exo-music-bar-play, .exo-island-btn, .exo-mini-play, .exo-game-close, .exo-dc-cv-button,
   .exo-dc-voice-btn, .exo-dc-voice-join, .exo-dc-watch, .button, .exo-capture-btn, .exo-mouse-pill, .exo-dc-guild, .exo-dc-round-btn,
   .exo-sgp-offer):active:not(:disabled) {
@@ -1407,8 +1429,8 @@
 }
 
 /* Reduce motion: presses and hovers change color only, nothing moves. */
-html[data-exo-motion="reduce"] :is(.exo-set-btn, .exo-game-tool, .exo-ghost-btn, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-continue-play,
-  .exo-continue-more, .exo-friend-pill-go, .exo-bar-search, .exo-nav-btn, .exo-settings-btn, .exo-shelf-chip, .exo-cta,
+html[data-exo-motion="reduce"] :is(.exo-set-btn, .exo-game-tool, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-continue-play,
+  .exo-continue-more, .exo-friend-pill-go, .exo-bar-search, .exo-nav-btn, .exo-settings-btn, .exo-shelf-chip,
   .exo-play, .exo-dc-tab, .exo-music-bar-play, .exo-island-btn, .exo-mini-play, .exo-game-close, .exo-dc-voice-btn,
   .exo-dc-voice-join, .exo-dc-watch, .exo-dc-cv-button, .exo-capture-btn, .exo-mouse-pill, .exo-dc-guild, .exo-dc-round-btn, .exo-sgp-offer):active:not(:disabled),
 html[data-exo-motion="reduce"] .exo-shaders-poster > button:is(:hover, :active) .exo-shaders-art {

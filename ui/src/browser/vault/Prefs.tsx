@@ -3,7 +3,7 @@ import { Button } from '../../components/ui/Button'
 import { Switch } from '../../components/Switch'
 import { Row, Section } from '../../components/settings/parts'
 import * as I from '../icons'
-import { send, setSetting, useBrowser } from '../host'
+import { send, setSetting, useBrowserValue } from '../host'
 import { Choice } from '../Settings'
 import { allowSave, b64, lock, useVault } from './store'
 import { health } from './health'
@@ -66,7 +66,7 @@ const LENGTHS: [string, string][] = [['16', '16 characters'], ['20', '20 charact
 
 export function Prefs() {
   const v = useVault()
-  const b = useBrowser()
+  const settings = useBrowserValue(b => b.settings)
   const never = v.data?.never ?? []
   return (
     <>
@@ -75,13 +75,13 @@ export function Prefs() {
           <Switch checked={v.hello} disabled={!v.helloReady} label="Unlock with Windows Hello" onChange={on => { send(on ? 'vaultHelloOn' : 'vaultHelloOff'); return Promise.resolve(null) }} />
         </Row>
         <Row label="Lock after" detail="Without use. It also locks whenever Windows locks or sleeps">
-          <Choice label="Lock after" value={b.settings.vaultLock || '15'} choices={LOCKS.map(([value, label]) => ({ value, label }))} onChange={value => setSetting('vaultLock', value)} />
+          <Choice label="Lock after" value={settings.vaultLock || '15'} choices={LOCKS.map(([value, label]) => ({ value, label }))} onChange={value => setSetting('vaultLock', value)} />
         </Row>
         <Row label="Generated passwords">
-          <Choice label="Generated password length" value={b.settings.vaultLength || '20'} choices={LENGTHS.map(([value, label]) => ({ value, label }))} onChange={value => setSetting('vaultLength', value)} />
+          <Choice label="Generated password length" value={settings.vaultLength || '20'} choices={LENGTHS.map(([value, label]) => ({ value, label }))} onChange={value => setSetting('vaultLength', value)} />
         </Row>
         <Row label="Symbols in generated passwords" detail="A few sites refuse them">
-          <Switch checked={(b.settings.vaultSymbols || 'on') === 'on'} label="Symbols in generated passwords" onChange={on => { setSetting('vaultSymbols', on ? 'on' : 'off'); return Promise.resolve(null) }} />
+          <Switch checked={(settings.vaultSymbols || 'on') === 'on'} label="Symbols in generated passwords" onChange={on => { setSetting('vaultSymbols', on ? 'on' : 'off'); return Promise.resolve(null) }} />
         </Row>
         <ChangePassword />
         <Row label="Lock now" detail="Copied passwords clear from the clipboard on their own after 30 seconds">

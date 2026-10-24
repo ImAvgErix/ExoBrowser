@@ -56,7 +56,7 @@
 }
 
 /* A primary button on glass is ink on its own fill: no lift under its words. */
-:is(.exo-glass, .exo-shelf-sort-menu, .exo-key-popover, .exo-toast) :is(.is-primary, .exo-cta) {
+:is(.exo-glass, .exo-shelf-sort-menu, .exo-key-popover, .exo-toast) .is-primary {
   text-shadow: none;
 }
 
@@ -105,7 +105,6 @@ button.exo-glass:hover {
    control that is glass of its own (a lens, a light tone) keeps its own. */
 :where(
   .exo-capture-rec,
-  .exo-capture-chip,
   .exo-captures-empty-icon,
   .exo-captures-way,
   .exo-capture-duration,
@@ -177,7 +176,6 @@ button.exo-glass:hover {
   .exo-music-sheet-field :is(input, textarea),
   .exo-ob-service,
   .exo-ob-discord,
-  .exo-set-chip,
   .exo-store-badge,
   .exo-sgp-pill,
   .exo-sgp-offer,
@@ -199,7 +197,6 @@ button.exo-glass:hover {
   .exo-system-head-icon,
   .exo-set-btn,
   .exo-game-tool,
-  .exo-ghost-btn,
   .exo-shelf-sort-trigger,
   .exo-add-game-btn,
   .exo-game-close

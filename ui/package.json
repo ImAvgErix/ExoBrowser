@@ -8,7 +8,7 @@
     "icons": "node scripts/icons.mjs",
     "build": "node scripts/sync-exo.mjs && node scripts/icons.mjs && tsc -p . && vite build",
     "build:setup": "vite build --config vite.setup.config.ts --logLevel warn",
-    "check": "node scripts/icons.mjs --check && tsc -p . && eslint src/browser src/setup --max-warnings 0 && node scripts/css-design.mjs css-design.config.mjs src/browser src/setup",
+    "check": "node scripts/icons.mjs --check && tsc -p . && eslint src/browser src/setup --max-warnings 0 && node scripts/css-design.mjs css-design.config.mjs src/browser && node scripts/css-design.mjs css-design.config.mjs src/setup && node scripts/browser-design.mjs",
     "dev": "vite"
   },
   "dependencies": {

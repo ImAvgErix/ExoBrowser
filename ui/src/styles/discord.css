@@ -3579,11 +3579,17 @@ video.exo-dc-media {
   min-width: 0;
 }
 
+/* The side panel's close sits at the end of its channel's header row, which keeps its place clear (Discord's
+   header ends with the panel's close, never over the inbox). */
 .exo-dc-guide-close {
   position: absolute;
-  top: 10px;
-  right: 10px;
+  top: 8px;
+  right: 8px;
   z-index: 1;
+}
+
+.exo-dc-guide-side .exo-dc-chat-head {
+  padding-right: 48px;
 }
 
 .exo-dc-resource .exo-dc-text {
@@ -3771,20 +3777,6 @@ textarea.exo-dc-modal-input {
   padding: 12px 4px 6px;
 }
 
-.exo-dc-switch {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-}
-
-.exo-dc-switch input,
-.exo-dc-browse-row input {
-  accent-color: var(--dc-blurple);
-  width: 18px;
-  height: 18px;
-}
-
 .exo-dc-browse-row {
   display: flex;
   align-items: center;
@@ -3811,40 +3803,6 @@ textarea.exo-dc-modal-input {
 
 .exo-dc-browse-name:disabled {
   cursor: default;
-}
-
-.exo-dc-switch input[role="switch"] {
-  position: relative;
-  width: 40px;
-  height: 24px;
-  margin: 0;
-  border-radius: 12px;
-  background: var(--dc-line);
-  appearance: none;
-  cursor: pointer;
-  transition: background-color var(--dur-base) var(--ease-out);
-}
-
-/* The knob travels on the spring, as Exo's switch's does. */
-.exo-dc-switch input[role="switch"]::after {
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
-  content: "";
-  transition: transform var(--dur-move) var(--ease-spring), background-color var(--dur-base) var(--ease-out);
-}
-
-.exo-dc-switch input[role="switch"]:checked {
-  background: var(--dc-blurple);
-}
-
-.exo-dc-switch input[role="switch"]:checked::after {
-  transform: translateX(16px);
 }
 
 .exo-dc-browse-view {
@@ -5053,8 +5011,7 @@ button.exo-dc-pf-badge {
 }
 
 :root[data-exo-motion="reduce"] .exo-dc :is(.exo-dc-search, .exo-dc-upload-bar i),
-:root[data-exo-motion="reduce"] .exo-dc-poll-answer.is-result::before,
-:root[data-exo-motion="reduce"] .exo-dc-switch input[role="switch"]::after {
+:root[data-exo-motion="reduce"] .exo-dc-poll-answer.is-result::before {
   transition: none;
 }
 
@@ -5574,9 +5531,20 @@ button.exo-dc-gifv {
 }
 
 .exo-dc-new-bar > .exo-dc-new-bar-read {
+  position: relative;
   flex: none;
-  border-left: 1px solid var(--exo-float-line);
   font-weight: 600;
+}
+
+/* The divider before Mark As Read stays inside the capsule, as the Bar's does: a short line, not one through the rim. */
+.exo-dc-new-bar > .exo-dc-new-bar-read::before {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 1px;
+  background: var(--exo-selected);
+  content: "";
 }
 
 /* Forward To: a search, the conversations with a check each, a note, Send. */
@@ -6868,4 +6836,136 @@ button.exo-dc-poll-answer:hover:not(:disabled) {
   background: none;
   font: inherit;
   cursor: pointer;
+}
+
+/* The server's banner over the top of its channel list, as Discord shows it: 16:9, the list's width. */
+.exo-dc-guild-banner {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+/* Someone's server tag beside their name, as Discord draws it: the badge and the tag in a small chip. */
+.exo-dc-guild-tag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--exo-fill);
+  color: var(--dc-text);
+  font: inherit;
+  font-size: calc(12px * var(--exo-scale, 1));
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+.exo-dc-guild-tag:hover {
+  background: var(--hover-fill);
+}
+
+.exo-dc-guild-tag.is-static {
+  margin-left: 0;
+  cursor: default;
+}
+
+.exo-dc-guild-tag > img {
+  flex: none;
+}
+
+/* The server's card a tag opens: its icon and name with the tag, its counts, what it's about. */
+.exo-dc-tag-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.exo-dc-tag-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.exo-dc-tag-card-head > img,
+.exo-dc-tag-card-icon {
+  flex: none;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+}
+
+.exo-dc-tag-card-icon {
+  display: grid;
+  place-items: center;
+  background: var(--exo-fill);
+  font-size: calc(20px * var(--exo-scale, 1));
+}
+
+.exo-dc-tag-card-who {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.exo-dc-tag-card-who > strong {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--dc-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exo-dc-tag-card-counts {
+  display: flex;
+  gap: 12px;
+  margin: 0;
+  color: var(--dc-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+
+.exo-dc-tag-card-counts > .is-online::before {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: var(--dc-good);
+  content: "";
+}
+
+.exo-dc-tag-card-about {
+  margin: 0;
+  color: var(--dc-text);
+}
+
+.exo-dc-tag-card-traits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exo-dc-tag-card-traits > li {
+  padding: 2px 8px;
+  border: 1px solid var(--exo-float-line);
+  border-radius: 999px;
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+
+.exo-dc-pf-name-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
 }

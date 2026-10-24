@@ -223,13 +223,7 @@
 }
 
 
-/* Primary and progress buttons (update) */
-
-.exo-set-btn.is-primary {
-  border-color: var(--color-fg);
-  background: var(--color-fg);
-  color: var(--color-primary-fg);
-}
+/* Progress buttons (update) */
 
 .exo-set-progress {
   position: relative;
@@ -263,20 +257,6 @@
   list-style: none;
 }
 
-.exo-set-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding: 0 14px 0 10px;
-  border: 1px solid rgb(var(--exo-ink-rgb) / 0.14);
-  border-radius: 999px;
-  background: var(--exo-fill);
-  color: var(--color-muted);
-  font-size: calc(13px * var(--exo-scale, 1));
-  transition: color 120ms var(--ease-out), border-color 120ms var(--ease-out);
-}
-
 .exo-set-link {
   height: 32px;
   padding: 0 4px;
@@ -298,22 +278,10 @@
 
 @media (hover: hover) and (pointer: fine) {
   .exo-settings-nav button:hover:not(.is-current),
-  .exo-set-chip:hover:not(:disabled),
   .exo-set-link:hover {
     color: var(--color-fg);
   }
 
-  .exo-set-chip:hover:not(:disabled) {
-    background: var(--hover-fill);
-  }
-
-  .exo-set-btn:hover:not(:disabled) {
-    background: var(--hover-fill);
-  }
-
-  .exo-set-btn.is-primary:hover:not(:disabled) {
-    background-color: var(--exo-primary-hover);
-  }
 }
 
 

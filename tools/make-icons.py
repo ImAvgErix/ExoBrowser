@@ -1,6 +1,6 @@
-# Draws Exo Browser's and Exo Shield's icons from the Exo mark (brand/exo-mark.svg): the same
-# glass squircle, rim and white bars, holding a globe ring (Browser) or a shield (Shield).
-# python tools/make-icons.py  ->  brand/exo-browser.svg, brand/exo-shield.svg
+# Draws Exo Shield's icon from the Exo mark (brand/exo-mark.svg): the same glass squircle, rim and white bars, cut
+# into a shield. (Exo Browser's own icon, the Horizon, is drawn by hand in brand/exo-browser.svg.)
+# python tools/make-icons.py  ->  brand/exo-shield.svg
 import re
 from pathlib import Path
 
@@ -27,12 +27,6 @@ base = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">{defs.repl
         f'<path d="{tile}" fill="url(#p)"/><path d="{tile}" fill="url(#s)"/>')
 end = f'<path d="{rim}" fill="none" stroke="url(#r)" stroke-width="0.77"/></svg>'
 
-# Exo Browser: the Exo bars inside a globe's ring.
-browser = base + '<circle cx="32" cy="32" r="20" fill="none" stroke="url(#w)" stroke-width="4.2"/>'
-for i, d in enumerate(bars):
-    browser += f'<path d="{scaled(d, 0.5, dx=0.6)}" fill="url(#w)"/>'
-browser += end
-
 # Exo Shield: a white shield, the Exo bars cut into it.
 shield_d = "M32 10.5 L49.5 17 V30.5 C49.5 41.5 42 49.5 32 53.5 C22 49.5 14.5 41.5 14.5 30.5 V17 Z"
 shield = base + f'<path d="{shield_d}" fill="url(#w)"/>'
@@ -41,7 +35,5 @@ for d in bars:
 shield += end
 
 (root / "brand").mkdir(exist_ok=True)
-(root / "brand" / "exo-browser.svg").write_text(browser, encoding="utf-8")
 (root / "brand" / "exo-shield.svg").write_text(shield, encoding="utf-8")
-(root / "ui" / "exo-browser.svg").write_text(browser, encoding="utf-8")
-print("ok", len(browser), len(shield))
+print("ok", len(shield))

@@ -1,4 +1,5 @@
-# Builds a release installer, as Exo Launcher's tools\Build-Release.ps1 does: artifacts\ExoBrowser-Setup.exe and its .sha256.
+# Builds a release installer, as Exo Launcher's tools\Build-Release.ps1 does: artifacts\ExoBrowser-Setup.exe and its .sha256,
+# and artifacts\whats-new.json (upload all three to the release).
 #   pwsh -File tools\Build-Release.ps1 [-TestRoot C:\path]   (-TestRoot: a walk-through build that installs only there)
 # Steps: the browser (build.cmd: the exe, its interface and Exo Shield), a clean payload of just what ships, Setup's
 # window (setup\build.ps1), the NSIS install engine, then the two joined and the SHA-256 file.
@@ -11,6 +12,10 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 $version = (Get-Content VERSION -Raw).Trim()
+# This release's What's New, uploaded beside Setup as whats-new.json: the version before it shows these items while it
+# offers the update (ui\src\browser\WhatsNew.tsx checks the file).
+$whatsNew = @(Get-Content ui\src\browser\whatsNew.json -Raw | ConvertFrom-Json) | Where-Object version -EQ $version | Select-Object -First 1
+if (-not $whatsNew) { throw "ui\src\browser\whatsNew.json has no entry for $version." }
 
 & (Join-Path $repo 'build.cmd')
 if ($LASTEXITCODE) { throw "Browser build failed ($LASTEXITCODE)." }
@@ -53,4 +58,5 @@ Remove-Item $engine -Force
 
 $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -Path "$setup.sha256" -Value "$hash  $name" -NoNewline -Encoding ascii
+Set-Content -Path (Join-Path $artifacts 'whats-new.json') -Value ($whatsNew | ConvertTo-Json -Depth 4) -NoNewline -Encoding utf8NoBOM
 Write-Output "Exo Browser ${version}: $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB), SHA-256 $hash"

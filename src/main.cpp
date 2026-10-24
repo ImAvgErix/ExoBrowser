@@ -80,12 +80,35 @@ struct Tab {
     std::vector<std::function<void(Tab*)>> whenReady;
     HCURSOR cursor = nullptr;
     ULONGLONG lastActive = 0;
+    UINT64 left = 0;  // when it was last left, as a count (two left in the same instant still differ): Ctrl+Tab's order
     bool creating = false, loading = false, audible = false, muted = false;
     bool suspended = false, lowMemory = false, pinned = false;
     UINT64 navId = 0;  // the navigation the tab is loading: a late "done" from one it replaced doesn't end it
+    int space = 0;     // the space it belongs to; 0 is a favorite, in every space
+    std::wstring home; // a pinned tab's own page: it goes back there, and closing it only puts it to sleep there
+    long long seen = 0;  // when it was last on screen (Unix seconds), for the archive
+    bool peek = false;   // Peek's card: a tab off the strip, floating over the page until opened or closed
+    int split = 0;         // split view: the tabs sharing it show side by side (2 to 4)
+    bool under = false;    // scrolled down with nothing pinned to its top: the page runs up under the Bar (edge-page.js)
+    std::wstring navFrom;  // where the navigation under way started, before any redirect
+    ULONGLONG navAt = 0;
+    std::wstring boostScript;  // the id of its Boosts script (run on every page it opens), once added
+    int folder = 0;            // the folder it sits in among its space's pinned tabs (0: none)
+    bool priv = false;         // private: its own profile, kept in memory only; no history, never in the session
 };
 
+// A space: a set of tabs of its own (its pinned tabs and the one last on screen too), with a name, an icon, a color
+// that becomes the Bar's accent while it is on screen, and optionally its own appearance. There is always at least
+// one; with only one, nothing about spaces shows.
+struct Space { int id = 0; std::wstring name, icon, color, theme; int last = 0; };
+
+// A folder among a space's pinned tabs, as Arc's: a name, open or closed, perhaps inside another folder. Its tabs are
+// pinned and sit together, folders first in the order they were made, then the space's other pinned tabs. A live folder
+// follows a site's feed instead (RSS or Atom): its newest posts show in it.
+struct TabFolder { int id = 0, space = 0, parent = 0; std::wstring name; bool open = true; std::wstring feed; };
+
 struct ClosedTab { std::wstring url, title; size_t index; };
+struct Archived { std::wstring url, title; long long at = 0; };
 struct Visit { std::wstring url, title; int visits = 0; long long last = 0; };
 struct Bookmark { std::wstring url, title; };
 
@@ -102,6 +125,12 @@ struct App {
     bool revealedTop = true, revealedSide = true;
     bool glassTopIn = true, glassSideIn = true;  // the Bar's and sidebar's frost, as the page last showed them
     winrt::Windows::UI::Composition::LayerVisual content{nullptr};
+    winrt::Windows::UI::Composition::ContainerVisual peekLayer{nullptr};  // Peek's card, over the blurred page
+    // What the glass frosts: the page and Peek's card over it.
+    winrt::Windows::UI::Composition::ContainerVisual scene{nullptr};
+    int peekId = 0;
+    RECT peekRect{};
+    int nextSplit = 1;
     winrt::Windows::UI::Composition::CompositionEffectBrush blur{nullptr};
     bool revealed = true, pinned = false;
     ComPtr<ICoreWebView2CompositionController> uiComp;
@@ -125,6 +154,11 @@ struct App {
     HWND popup = nullptr;          // an extension's popup
     ComPtr<ICoreWebView2Controller> popupCtl;
     int activeId = 0, nextId = 1;
+    std::vector<Space> spaces;
+    int space = 0, nextSpace = 1;  // the space on screen
+    std::vector<TabFolder> folders;
+    int nextFolder = 1;
+    std::vector<Archived> archive;  // tabs the archive closed, newest last (archive.tsv)
     bool overlay = false, fullscreen = false, elementFullscreen = false, minimized = false;
     bool statePending = false, sessionDirty = false, historyDirty = false, tracking = false;
     int capture = 0, hover = 0, focus = 0;
@@ -263,6 +297,23 @@ static Tab* FindTab(int id) {
 
 static Tab* Active() { return FindTab(g.activeId); }
 
+static Space* FindSpace(int id) {
+    for (auto& s : g.spaces) if (s.id == id) return &s;
+    return nullptr;
+}
+
+// The tabs of a space, in the strip's order.
+static TabFolder* FindFolder(int id) {
+    for (auto& f : g.folders) if (f.id == id) return &f;
+    return nullptr;
+}
+
+static std::vector<Tab*> SpaceTabs(int space) {
+    std::vector<Tab*> out;
+    for (auto& t : g.tabs) if ((t->space == space || t->space == 0) && !t->peek) out.push_back(t.get());
+    return out;
+}
+
 static size_t IndexOf(int id) {
     for (size_t i = 0; i < g.tabs.size(); i++) if (g.tabs[i]->id == id) return i;
     return g.tabs.size();
@@ -297,16 +348,62 @@ static void SaveSettings() {
 
 static void SaveSession() {
     g.sessionDirty = false;
-    // The active tab's place among the tabs written (a tab with no address yet isn't).
+    // The active tab's place among the tabs written (a tab with no address yet isn't), and each space's last one.
     size_t active = 0, n = 0;
-    std::string tabs;
+    std::string tabs, last;
     for (auto& t : g.tabs) {
-        if (t->url.empty()) continue;
+        if (t->url.empty() || t->peek || t->priv) continue;
         if (t->id == g.activeId) active = n;
+        Space* s = FindSpace(t->space);
+        if (s && t->id == (s->id == g.space ? g.activeId : s->last)) last += "last\t" + std::to_string(s->id) + "\t" + std::to_string(n) + "\n";
         n++;
-        tabs += Utf8(L"tab\t" + Field(t->url) + L"\t" + Field(t->title) + L"\t" + (t->pinned ? L"1" : L"0")) + "\n";
+        tabs += Utf8(L"tab\t" + Field(t->url) + L"\t" + Field(t->title) + L"\t" + (t->pinned ? L"1" : L"0") + L"\t" +
+                     std::to_wstring(t->space) + L"\t" + Field(t->home) + L"\t" + std::to_wstring(t->seen) + L"\t" + std::to_wstring(t->split) + L"\t" +
+                     std::to_wstring(t->folder)) + "\n";
     }
-    WriteFileUtf8(g.dataDir + L"\\session.tsv", "active\t" + std::to_string(active) + "\n" + tabs);
+    WriteFileUtf8(g.dataDir + L"\\session.tsv", "active\t" + std::to_string(active) + "\n" + last + tabs);
+}
+
+// Spaces are saved the moment they change, apart from the tabs: one made a second before a crash is still there, and
+// they stay when Reopen tabs is off.
+static void SaveSpaces() {
+    std::string out = "current\t" + std::to_string(g.space) + "\n";
+    for (auto& s : g.spaces)
+        out += Utf8(L"space\t" + std::to_wstring(s.id) + L"\t" + Field(s.name) + L"\t" + Field(s.icon) + L"\t" + Field(s.color) +
+                    L"\t" + Field(s.theme)) + "\n";
+    for (auto& f : g.folders)
+        out += Utf8(L"folder\t" + std::to_wstring(f.id) + L"\t" + std::to_wstring(f.space) + L"\t" + std::to_wstring(f.parent) + L"\t" +
+                    (f.open ? L"1" : L"0") + L"\t" + Field(f.name) + L"\t" + Field(f.feed)) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\spaces.tsv", out);
+}
+
+static void LoadSpaces() {
+    int current = 0;
+    for (auto& row : ReadTable(L"spaces.tsv")) {
+        if (row[0] == L"current" && row.size() > 1) current = _wtoi(row[1].c_str());
+        if (row[0] != L"space" || row.size() < 3) continue;
+        Space s;
+        s.id = _wtoi(row[1].c_str());
+        if (s.id <= 0 || FindSpace(s.id) || row[2].empty()) continue;
+        s.name = row[2];
+        if (row.size() > 3) s.icon = row[3];
+        if (row.size() > 4) s.color = row[4];
+        if (row.size() > 5) s.theme = row[5];
+        g.spaces.push_back(s);
+        g.nextSpace = std::max(g.nextSpace, s.id + 1);
+    }
+    if (g.spaces.empty()) g.spaces.push_back({g.nextSpace++, L"Home", L"home"});
+    g.space = FindSpace(current) ? current : g.spaces[0].id;
+    for (auto& row : ReadTable(L"spaces.tsv")) {
+        if (row[0] != L"folder" || row.size() < 6) continue;
+        TabFolder f{_wtoi(row[1].c_str()), _wtoi(row[2].c_str()), _wtoi(row[3].c_str()), row[5], row[4] != L"0", row.size() > 6 ? row[6] : L""};
+        if (f.id <= 0 || FindFolder(f.id) || !FindSpace(f.space)) continue;
+        g.folders.push_back(f);
+        g.nextFolder = std::max(g.nextFolder, f.id + 1);
+    }
+    // One whose parent is gone (or in another space) sits at the top of its space.
+    for (auto& f : g.folders)
+        if (TabFolder* up = FindFolder(f.parent); f.parent && (!up || up->space != f.space)) f.parent = 0;
 }
 
 static void SaveHistory() {
@@ -363,12 +460,17 @@ static std::wstring TabJson(const Tab* t) {
     return L"{\"id\":" + std::to_wstring(t->id) + L",\"title\":" + Json(t->title) + L",\"url\":" + Json(t->url) +
            L",\"loading\":" + Bool(t->loading) + L",\"audible\":" + Bool(t->audible) + L",\"muted\":" +
            Bool(t->muted) + L",\"sleeping\":" + Bool(t->suspended || (!t->ctl && !t->creating)) +
-           L",\"pinned\":" + Bool(t->pinned) + L"}";
+           L",\"pinned\":" + Bool(t->pinned) + L",\"space\":" + std::to_wstring(t->space) +
+           (t->home.empty() ? L"" : L",\"home\":" + Json(t->home)) + (t->split ? L",\"split\":" + std::to_wstring(t->split) : L"") +
+           (t->folder ? L",\"folder\":" + std::to_wstring(t->folder) : L"") + (t->priv ? L",\"priv\":true" : L"") + L"}";
 }
+
+static void ArmSleep();
 
 // Many events land at once (a navigation fires source, title, history and favicon), so the
 // page hears one state message per turn of the message loop.
 static void QueueState() {
+    ArmSleep();
     if (g.statePending || !g.hwnd) return;
     g.statePending = true;
     PostMessageW(g.hwnd, WM_APP_STATE, 0, 0);
@@ -378,6 +480,7 @@ static void SendState() {
     g.statePending = false;
     std::wstring tabs;
     for (auto& t : g.tabs) {
+        if (t->peek) continue;
         if (!tabs.empty()) tabs += L",";
         tabs += TabJson(t.get());
     }
@@ -386,9 +489,21 @@ static void SendState() {
         a->core->get_CanGoBack(&back);
         a->core->get_CanGoForward(&fwd);
     }
+    std::wstring spaces;
+    for (auto& s : g.spaces) {
+        if (!spaces.empty()) spaces += L",";
+        spaces += L"{\"id\":" + std::to_wstring(s.id) + L",\"name\":" + Json(s.name) + L",\"icon\":" + Json(s.icon) + L",\"color\":" +
+                  Json(s.color) + L",\"theme\":" + Json(s.theme) + L"}";
+    }
+    std::wstring folders;
+    for (auto& f : g.folders) {
+        if (!folders.empty()) folders += L",";
+        folders += L"{\"id\":" + std::to_wstring(f.id) + L",\"space\":" + std::to_wstring(f.space) + L",\"parent\":" + std::to_wstring(f.parent) +
+                   L",\"name\":" + Json(f.name) + L",\"open\":" + Bool(f.open) + (f.feed.empty() ? L"" : L",\"live\":true") + L"}";
+    }
     UiPost(L"{\"t\":\"state\",\"active\":" + std::to_wstring(g.activeId) + L",\"tabs\":[" + tabs + L"],\"back\":" +
            Bool(back) + L",\"fwd\":" + Bool(fwd) + L",\"max\":" + Bool(IsZoomed(g.hwnd)) + L",\"full\":" +
-           Bool(g.fullscreen) + L"}");
+           Bool(g.fullscreen) + L",\"space\":" + std::to_wstring(g.space) + L",\"spaces\":[" + spaces + L"],\"folders\":[" + folders + L"]}");
 }
 
 static void SendFavicon(const Tab* t) {
@@ -648,6 +763,8 @@ static bool WindowsUsesLight() {
 }
 
 // The window's own colors under the Bar and sidebar, and its frame, in a theme.
+static void ApplyBackdrop();
+static void LittlesTheme();
 static void PaintTheme(const std::wstring& theme) {
     g.page = theme == L"light" ? RGB(245, 245, 245) : theme == L"dark" ? RGB(18, 18, 18) : RGB(0, 0, 0);
     if (g.hwnd) {
@@ -657,21 +774,42 @@ static void PaintTheme(const std::wstring& theme) {
         DwmSetWindowAttribute(g.hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof caption);
         InvalidateRect(g.hwnd, nullptr, TRUE);
     }
+    LittlesTheme();
+    ApplyBackdrop();
 }
 
 // Once the chrome page is up, the window takes a new theme's colors when the page shows it (SetGlass): taken at once,
 // the band under the Bar turned light about 30 ms before the Bar did.
 static void ApplyTheme() {
-    std::wstring a = Setting(L"appearance", L"void");
+    // A space can have its own appearance; the rest follow Settings'.
+    Space* s = FindSpace(g.space);
+    std::wstring a = s && !s->theme.empty() ? s->theme : Setting(L"appearance", L"void");
     g.theme = a == L"match" ? (WindowsUsesLight() ? L"light" : L"dark") : (a == L"light" || a == L"dark") ? a : L"void";
     if (!g.uiReady) PaintTheme(g.theme);
+}
+
+// The appearance on screen may have changed (another space, or its own appearance): pages hear it as their color
+// scheme, the chrome and new tab pages as their theme.
+static void ThemeChanged() {
+    std::wstring was = g.theme;
+    ApplyTheme();
+    if (g.theme == was) return;
+    for (auto& t : g.tabs) {
+        ComPtr<ICoreWebView2_13> c13;
+        ComPtr<ICoreWebView2Profile> profile;
+        if (!t->core || FAILED(t->core.As(&c13)) || FAILED(c13->get_Profile(&profile))) continue;
+        profile->put_PreferredColorScheme(g.theme == L"light" ? COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT : COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
+        break;
+    }
+    SendSettings();
+    RefreshNewTabs();
 }
 
 static std::wstring NewTabJson() {
     return L"{\"bookmarks\":" + BookmarksJson() + L",\"top\":" + TopSitesJson() + L",\"engine\":" +
            Json(Setting(L"engine", L"brave")) + L",\"theme\":" + Json(g.theme) + L",\"material\":" +
            Json(Setting(L"material", L"glass")) + L",\"bookmarkStyle\":" + Json(Setting(L"bookmarkStyle", L"cards")) +
-           L",\"tiles\":" + Json(Setting(L"tiles", L"on")) +
+           L",\"tiles\":" + Json(Setting(L"tiles", L"on")) + L",\"motion\":" + Json(Setting(L"reduceMotion", L"off")) +
            // How far the Bar and side tabs push the page in, so it can center itself in the window.
            L",\"insetTop\":" + std::to_wstring(g.autohide || g.fullscreen ? 0 : g.chromeTopDip) +
            L",\"insetLeft\":" + std::to_wstring(g.autohide || g.fullscreen ? 0 : g.sidebarDip) + L"}";
@@ -731,7 +869,8 @@ struct Sql {
     }
 };
 
-struct Browser { std::wstring key, name, dir; bool firefox = false; };
+// arc: an Arc (or Dia) StorableSidebar.json beside the profile, holding its spaces, favorites and pinned tabs.
+struct Browser { std::wstring key, name, dir; bool firefox = false; std::wstring arc; };
 
 static bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
@@ -741,8 +880,9 @@ static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
     return Take(p);
 }
 
-static std::wstring FirefoxProfile() {
-    std::wstring base = KnownFolder(FOLDERID_RoamingAppData) + L"\\Mozilla\\Firefox\\Profiles\\";
+// The Firefox-engine profile used last under %APPDATA%\<rel>\Profiles (Firefox, Zen, Floorp, LibreWolf, Waterfox).
+static std::wstring FirefoxProfile(const wchar_t* rel) {
+    std::wstring base = KnownFolder(FOLDERID_RoamingAppData) + L"\\" + rel + L"\\Profiles\\";
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((base + L"*").c_str(), &fd);
     std::wstring best;
@@ -778,13 +918,29 @@ static bool IsPasswordManager(const std::wstring& id, const std::wstring& name) 
     return false;
 }
 
-// Settings asks for the list every time it reloads; the scan reads two levels of %LOCALAPPDATA% and the registry,
-// so its answer is kept for half a minute.
+// Settings asks for the list every time it opens; the scan reads two levels of %LOCALAPPDATA% and the registry (120 ms
+// on a PC with 3,800 folders there), so its answer is kept for half a minute, and Settings' question waits for a fresh
+// one on a thread of its own: the window kept no mouse or keys for the page while it searched.
+static std::vector<Browser> g_browsers;
+static ULONGLONG g_browsersAt = 0;
+static std::vector<std::function<void()>> g_scanWaiters;
+static const UINT WM_APP_SCANNED = WM_APP + 7;  // lParam: new std::vector<Browser>*
+static bool BrowsersFresh() { return g_browsersAt && GetTickCount64() - g_browsersAt <= 30000; }
+
 static std::vector<Browser> DetectBrowsers() {
-    static std::vector<Browser> cached;
-    static ULONGLONG at = 0;
-    if (!at || GetTickCount64() - at > 30000) { cached = ScanBrowsers(); at = GetTickCount64(); }
-    return cached;
+    if (!BrowsersFresh()) { g_browsers = ScanBrowsers(); g_browsersAt = GetTickCount64(); }
+    return g_browsers;
+}
+
+static void WhenBrowsersKnown(std::function<void()> then) {
+    if (BrowsersFresh()) { then(); return; }
+    g_scanWaiters.push_back(std::move(then));
+    if (g_scanWaiters.size() > 1) return;  // a scan is already on its way
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd] {
+        auto* found = new std::vector<Browser>(ScanBrowsers());
+        if (!PostMessageW(hwnd, WM_APP_SCANNED, 0, (LPARAM)found)) delete found;
+    }).detach();
 }
 
 static std::vector<Browser> ScanBrowsers() {
@@ -797,9 +953,10 @@ static std::vector<Browser> ScanBrowsers() {
     std::vector<Browser> out;
     auto consider = [&](const std::wstring& base, const std::wstring& name) {
         std::wstring dir = base + L"\\User Data\\Default";
-        if (!Exists(dir + L"\\Bookmarks") && !Exists(dir + L"\\History")) return;
-        for (auto& b : out) if (_wcsicmp(b.dir.c_str(), dir.c_str()) == 0) return;
+        if (!Exists(dir + L"\\Bookmarks") && !Exists(dir + L"\\History")) return false;
+        for (auto& b : out) if (_wcsicmp(b.dir.c_str(), dir.c_str()) == 0) return false;
         out.push_back({dir, name, dir});
+        return true;
     };
     for (auto& [rel, name] : known) consider(local + L"\\" + rel, name);
     auto scan = [&](const std::wstring& base, int depth, auto&& self) -> void {
@@ -817,9 +974,32 @@ static std::vector<Browser> ScanBrowsers() {
         FindClose(h);
     };
     scan(local, 2, scan);
+    // The Browser Company's apps come from the Store (MSIX): Arc keeps its profile under
+    // Packages\TheBrowserCompany.Arc_*\LocalCache\Local\Arc, with its sidebar in StorableSidebar.json beside it. The
+    // files stay after Arc stops opening (2026-12-22), so this still imports them then.
+    auto each = [](const std::wstring& pattern, auto&& fn) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.' && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                fn(std::wstring(fd.cFileName));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+    each(local + L"\\Packages\\TheBrowserCompany.*", [&](const std::wstring& pkg) {
+        std::wstring cache = local + L"\\Packages\\" + pkg + L"\\LocalCache\\Local";
+        each(cache + L"\\*", [&](const std::wstring& app) {
+            std::wstring root = cache + L"\\" + app;
+            if (consider(root, app) && Exists(root + L"\\StorableSidebar.json")) out.back().arc = root + L"\\StorableSidebar.json";
+        });
+    });
     std::wstring opera = KnownFolder(FOLDERID_RoamingAppData) + L"\\Opera Software\\Opera Stable";
     if (Exists(opera + L"\\Bookmarks") || Exists(opera + L"\\History")) out.push_back({opera, L"Opera", opera});
-    if (std::wstring ff = FirefoxProfile(); !ff.empty()) out.push_back({ff, L"Firefox", ff, true});
+    static const std::pair<const wchar_t*, const wchar_t*> gecko[] = {
+        {L"Mozilla\\Firefox", L"Firefox"}, {L"zen", L"Zen"}, {L"Floorp", L"Floorp"}, {L"librewolf", L"LibreWolf"}, {L"Waterfox", L"Waterfox"}};
+    for (auto& [rel, name] : gecko)
+        if (std::wstring ff = FirefoxProfile(rel); !ff.empty()) out.push_back({ff, name, ff, true});
     return out;
 }
 
@@ -1035,9 +1215,9 @@ static void ImportFirefox(const Browser& b) {
     SaveBookmarks();
     SendHistory();
     SendBookmarks();
-    std::wstring note = CookieNote(c, L"Firefox");
+    std::wstring note = CookieNote(c, b.name);
     Toast(L"Imported " + std::to_wstring(marks) + L" bookmarks, " + std::to_wstring(visits) + L" pages and " +
-          std::to_wstring(c.added) + L" sign-ins from Firefox" + (note.empty() ? L"" : L". " + note));
+          std::to_wstring(c.added) + L" sign-ins from " + b.name + (note.empty() ? L"" : L". " + note));
 }
 
 static void SaveSettings();
@@ -1060,7 +1240,8 @@ static void Import(const std::wstring& key) {
                L",\"cookies\":" + std::to_wstring(c.added) + L",\"note\":" + Json(CookieNote(c, b.name)) +
                L",\"bookmarks\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Bookmarks"))) +
                L",\"prefs\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Preferences"))) +
-               L",\"secure\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Secure Preferences"))) + L"}");
+               L",\"secure\":" + Json(Wide(ReadFileUtf8(b.dir + L"\\Secure Preferences"))) +
+               (b.arc.empty() ? L"" : L",\"arc\":" + Json(Wide(ReadFileUtf8(b.arc)))) + L"}");
         SendHistory();
         RefreshNewTabs();
         return;
@@ -1659,6 +1840,37 @@ static wuc::CompositionEffectBrush GlassBrush(wchar_t kind, float dim, const std
     return brush;
 }
 
+// See-through (Settings > Look > Material): your desktop, frosted, shows through wherever the page doesn't cover the
+// window (the Bar's band, behind side tabs), as Zen's glass does: Windows' host backdrop (what's behind the window) in
+// the window's own glass recipe, under the page and the chrome.
+// Windows draws no backdrop while its Transparency effects are off (Settings > Personalization > Colors): See-through is
+// Glass then, and Settings says what it waits for.
+static wuc::SpriteVisual g_backdrop{nullptr};
+static bool WindowsTransparency() {
+    DWORD on = 1, size = sizeof on;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"EnableTransparency",
+                 RRF_RT_REG_DWORD, nullptr, &on, &size);
+    return on != 0;
+}
+static bool SeeThrough() { return Setting(L"material", L"glass") == L"window" && WindowsTransparency(); }
+static void ApplyBackdrop() {
+    if (!g.hwnd || !g.compositor) return;
+    bool on = SeeThrough();
+    BOOL use = on;
+    DwmSetWindowAttribute(g.hwnd, 17 /* DWMWA_USE_HOSTBACKDROPBRUSH */, &use, sizeof use);
+    if (!on) {
+        if (g_backdrop) g_backdrop.IsVisible(false);
+        return;
+    }
+    if (!g_backdrop) {
+        g_backdrop = g.compositor.CreateSpriteVisual();
+        g_backdrop.RelativeSizeAdjustment({1, 1});
+        g.root.Children().InsertAtBottom(g_backdrop);
+    }
+    g_backdrop.Brush(GlassBrush(L'l', 0.f, g.theme, g.compositor.CreateHostBackdropBrush()));
+    g_backdrop.IsVisible(true);
+}
+
 // The page lists its glass: "@,theme,material,bar,sidebar;kind,x,y,w,h,radius,place,key,in,out;..." in CSS pixels. The
 // first item is how the page looks right now: its theme, glass or solid, and whether the auto-hidden Bar and sidebar
 // are in (1) or out (0); the frost follows the page's own frames that way instead of running ahead of them. Then each
@@ -1724,7 +1936,7 @@ static void SetGlass(const std::wstring& spec) {
         float x = (float)_wtof(f[1].c_str()) * k, y = (float)_wtof(f[2].c_str()) * k;
         float w = (float)_wtof(f[3].c_str()) * k, h = (float)_wtof(f[4].c_str()) * k, r = (float)_wtof(f[5].c_str()) * k;
         if (w < 1 || h < 1) continue;
-        // A piece that doesn't sit over the page has nothing to frost (the Bar's own band is solid).
+        // A piece that doesn't sit over the page has nothing to frost (the Bar's own band is solid); menus open below it.
         if (x + w <= g.contentRect.left || y + h <= g.contentRect.top || x >= g.contentRect.right || y >= g.contentRect.bottom)
             continue;
         wchar_t kind = f[0] == L"p" ? L'p' : f[0] == L"l" ? L'l' : L's';
@@ -1737,7 +1949,7 @@ static void SetGlass(const std::wstring& spec) {
         int fadeOut = f.size() > 9 ? _wtoi(f[9].c_str()) : 0;
         if (!piece.sprite) {
             piece.surface = g.compositor.CreateVisualSurface();
-            piece.surface.SourceVisual(g.content);
+            piece.surface.SourceVisual(g.scene);
             piece.backdrop = g.compositor.CreateSurfaceBrush(piece.surface);
             piece.backdrop.Stretch(wuc::CompositionStretch::None);
             piece.backdrop.HorizontalAlignmentRatio(0);
@@ -1762,7 +1974,7 @@ static void SetGlass(const std::wstring& spec) {
         else if (fadeOut == 0 && piece.leaving) FadeGlass(piece.sprite, 1.f, std::max(fadeIn, 1));
         piece.leaving = fadeOut > 0;
         piece.seen = true;
-        piece.surface.SourceOffset({x - g.contentRect.left - pad, y - g.contentRect.top - pad});
+        piece.surface.SourceOffset({x - pad, y - pad});
         piece.surface.SourceSize({w + 2 * pad, h + 2 * pad});
         piece.sprite.Offset({x, y, 0});
         piece.sprite.Size({w, h});
@@ -1810,7 +2022,13 @@ static void InitComposition() {
     g.chromeVisual.RelativeSizeAdjustment({1, 1});
     g.chromeLayer.Children().InsertAtTop(g.glassLayer);
     g.chromeLayer.Children().InsertAtTop(g.chromeVisual);
-    g.root.Children().InsertAtTop(g.content);
+    g.peekLayer = g.compositor.CreateContainerVisual();
+    g.peekLayer.RelativeSizeAdjustment({1, 1});
+    g.scene = g.compositor.CreateContainerVisual();
+    g.scene.RelativeSizeAdjustment({1, 1});
+    g.scene.Children().InsertAtTop(g.content);
+    g.scene.Children().InsertAtTop(g.peekLayer);
+    g.root.Children().InsertAtTop(g.scene);
     g.root.Children().InsertAtTop(g.chromeLayer);
     g.target.Root(g.root);
     auto blur = Blur(wuc::CompositionEffectSourceParameter(L"source"), 0.f);
@@ -1922,13 +2140,91 @@ static void FollowNewTab() {
     if (g.revealedSide && g.sidebarDip) Hold(false, pt.x < Px(g.sidebarDip) + Px(18));
 }
 
+// Split view: the tab on screen and, when it's in a split, the others in it (in the strip's order, at most 4).
+static std::vector<Tab*> Panes() {
+    std::vector<Tab*> out;
+    Tab* a = Active();
+    if (!a) return out;
+    if (!a->split) return {a};
+    for (auto& t : g.tabs) if (t->split == a->split && !t->peek && out.size() < 4) out.push_back(t.get());
+    return out;
+}
+
+static bool Shown(const Tab* t) {
+    Tab* a = Active();
+    return t == a || (a && a->split && t->split == a->split);
+}
+
+// A pane's place in the window: 2 or 3 side by side, 4 in a grid, 6 px apart; one tab fills the content area.
+static RECT PaneRect(const Tab* t) {
+    auto panes = Panes();
+    size_t n = panes.size(), i = std::find(panes.begin(), panes.end(), t) - panes.begin();
+    RECT c = g.contentRect;
+    if (n < 2 || i >= n) return c;
+    LONG gap = Px(6), w = c.right - c.left, h = c.bottom - c.top;
+    size_t cols = n == 4 ? 2 : n, rows = n == 4 ? 2 : 1, col = i % cols, row = i / cols;
+    LONG cw = (w - gap * (LONG)(cols - 1)) / (LONG)cols, rh = (h - gap * (LONG)(rows - 1)) / (LONG)rows;
+    LONG x = c.left + (LONG)col * (cw + gap), y = c.top + (LONG)row * (rh + gap);
+    return {x, y, col == cols - 1 ? c.right : x + cw, row == rows - 1 ? c.bottom : y + rh};
+}
+
+// Each pane's view where it belongs; in a split, each rounded at its corners.
+static void PlacePanes() {
+    auto panes = Panes();
+    float k = (float)g.dpi / 96.f;
+    for (Tab* t : panes) {
+        RECT r = PaneRect(t);
+        if (t->ctl) t->ctl->put_Bounds(r);
+        if (!t->visual) continue;
+        float w = (float)(r.right - r.left), h = (float)(r.bottom - r.top);
+        t->visual.Offset({(float)(r.left - g.contentRect.left), (float)(r.top - g.contentRect.top), 0});
+        t->visual.Size({w, h});
+        if (panes.size() > 1) {
+            auto shape = g.compositor.CreateRoundedRectangleGeometry();
+            shape.Size({w, h});
+            shape.CornerRadius({10 * k, 10 * k});
+            t->visual.Clip(g.compositor.CreateGeometricClip(shape));
+        } else {
+            t->visual.Clip(nullptr);
+        }
+    }
+}
+
+// Peek (below, with the tabs).
+static void PlacePeek();
+static void OpenPeek(const std::wstring& url);
+static void ClosePeek();
+static bool IsMeeting(const std::wstring& url);
+static bool Downloading(int tabId);
+static void CloseWhenDownloaded(int tabId);
+
+// The page on screen runs up under the Bar's clear band once it has scrolled and has no header pinned to its top, so the
+// Bar's capsules and menus frost the page itself, as Exo's frost the room under its Bar. Never with a split, Peek or a
+// hidden Bar (that one already lies over the page).
+static bool UnderBar() {
+    Tab* a = Active();
+    return a && a->under && !a->split && !g.peekId && !g.fullscreen && !g.autohide;
+}
+
+static void Layout();
+// The page slid under the Bar or out from it: laid out again and scrolled by the Bar's height the other way, so what
+// you're reading stays where it is.
+static void SlideUnder(bool was, bool top = false) {
+    bool now = UnderBar();
+    if (now == was) return;
+    Layout();
+    // Back below at the page's very top: the top shows, nothing to keep in place.
+    if (Tab* a = Active(); a && a->core && !top)
+        a->core->ExecuteScript((std::wstring(L"window.scrollBy(0, ") + (now ? L"-" : L"") + std::to_wstring(g.chromeTopDip) + L")").c_str(), nullptr);
+}
+
 static void Layout() {
     if (!g.hwnd) return;
     RECT client;
     GetClientRect(g.hwnd, &client);
     RECT c = client;
     if (!g.fullscreen && !g.autohide) {
-        c.top = Px(g.chromeTopDip);
+        c.top = UnderBar() ? 0 : Px(g.chromeTopDip);
         c.left = Px(g.sidebarDip);
     }
     if (c.right < c.left) c.right = c.left;
@@ -1938,10 +2234,11 @@ static void Layout() {
         float w = (float)(c.right - c.left), h = (float)(c.bottom - c.top);
         g.content.Offset({(float)c.left, (float)c.top, 0});
         g.content.Size({w, h});
-        for (auto& t : g.tabs) if (t->visual) t->visual.Size({w, h});
+        for (auto& t : g.tabs) if (t->visual && !t->peek) t->visual.Size({w, h});
     }
-    if (Tab* a = Active(); a && a->ctl) a->ctl->put_Bounds(c);
+    PlacePanes();
     if (g.uiCtl) g.uiCtl->put_Bounds(client);
+    if (g.peekId) PlacePeek();
     SetGlass(g_glassSpec);
 }
 
@@ -1977,13 +2274,23 @@ static bool InUiHot(POINT pt) {
 
 // What the pointer is over: the Bar and every overlay belong to the chrome page, the content
 // card to the active tab.
+static const int kPeekAround = -2;  // the blurred page around Peek's card: a press there closes it
+
 static int HitTarget(POINT pt) {
     if (g.overlay || InUiHot(pt)) return kUi;
+    if (!g.fullscreen && !g.autohide && pt.y < Px(g.chromeTopDip)) return kUi;
+    if (g.peekId && !g.fullscreen) {
+        if (PtInRect(&g.peekRect, pt)) return g.peekId;
+        if (PtInRect(&g.contentRect, pt)) return kPeekAround;
+    }
     // In full screen the chrome page is hidden: a reveal band left from before would swallow the page's clicks.
     if (!g.fullscreen && ((g.revealTop && pt.y < g.revealTop) || (g.revealLeft && pt.x < g.revealLeft))) return kUi;
     if (PtInRect(&g.contentRect, pt)) {
-        Tab* a = Active();
-        return a && a->comp ? a->id : kUi;
+        for (Tab* t : Panes()) {
+            RECT r = PaneRect(t);
+            if (PtInRect(&r, pt)) return t->comp ? t->id : kUi;
+        }
+        return 0;  // the gap between panes
     }
     return g.fullscreen ? 0 : kUi;
 }
@@ -1998,8 +2305,9 @@ static void SendMouse(int target, COREWEBVIEW2_MOUSE_EVENT_KIND kind, WPARAM wp,
              kind == COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOUBLE_CLICK)
         data = GET_XBUTTON_WPARAM(wp);
     if (target != kUi) {
-        pt.x -= g.contentRect.left;
-        pt.y -= g.contentRect.top;
+        RECT at = target == g.peekId ? g.peekRect : FindTab(target) ? PaneRect(FindTab(target)) : g.contentRect;
+        pt.x -= at.left;
+        pt.y -= at.top;
     }
     comp->SendMouseInput(kind, (COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS)GET_KEYSTATE_WPARAM(wp), data, pt);
 }
@@ -2014,7 +2322,7 @@ class DropTarget : public IDropTarget {
         POINT p{screen.x, screen.y};
         ScreenToClient(g.hwnd, &p);
         int target = HitTarget(p);
-        if (target != kUi) { p.x -= g.contentRect.left; p.y -= g.contentRect.top; }
+        if (target != kUi) { RECT at = target == g.peekId ? g.peekRect : FindTab(target) ? PaneRect(FindTab(target)) : g.contentRect; p.x -= at.left; p.y -= at.top; }
         *pt = p;
         ComPtr<ICoreWebView2CompositionController3> c3;
         if (ICoreWebView2CompositionController* comp = CompFor(target)) comp->QueryInterface(IID_PPV_ARGS(&c3));
@@ -2087,6 +2395,8 @@ static void SendLeave(int target) {
 // Tabs
 
 static void ShowActive();
+static void Activate(int id);
+static void Order();
 static void CreateView(Tab* t);
 static void OpenOverlay(const wchar_t* mode, const std::wstring& text = L"");
 static void OnNewTabMessage(int id, const std::wstring& msg);
@@ -2102,18 +2412,18 @@ static void EnsureView(Tab* t, std::function<void(Tab*)> then) {
     if (!t->creating) CreateView(t);
 }
 
-static void RecordVisit(Tab* t) {
-    const std::wstring& u = t->url;
+static void RecordVisit(const std::wstring& u, const std::wstring& title) {
     if ((u.rfind(L"http://", 0) != 0 && u.rfind(L"https://", 0) != 0) || IsNewTab(u)) return;
     Visit& v = g.history[u];
     v.url = u;
-    if (!t->title.empty()) v.title = t->title;
+    if (!title.empty()) v.title = title;
     v.visits++;
     v.last = NowSeconds();
     g.historyDirty = true;
     UiPost(L"{\"t\":\"visit\",\"item\":[" + Json(v.url) + L"," + Json(v.title) + L"," + std::to_wstring(v.visits) +
            L"," + std::to_wstring(v.last) + L"]}");
 }
+static void RecordVisit(Tab* t) { if (!t->priv) RecordVisit(t->url, t->title); }
 
 static void RefreshFavicon(int id) {
     Tab* t = FindTab(id);
@@ -2136,7 +2446,7 @@ static void RefreshFavicon(int id) {
                 t->favicon = fav;
                 SendFavicon(t);
             }
-            if (!fav.empty() && !IsNewTab(t->url) && g.favicons[SiteOf(t->url)] != fav) {
+            if (!fav.empty() && !t->priv && !IsNewTab(t->url) && g.favicons[SiteOf(t->url)] != fav) {
                 g.favicons[SiteOf(t->url)] = fav;
                 g.faviconsDirty = true;
             }
@@ -2158,6 +2468,47 @@ static std::wstring ExpectedId(const std::wstring& folder) {
     std::string key(n, 0);
     CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)key.data(), &n, nullptr, nullptr);
     return IdOfKey(key);
+}
+
+// A private tab's profile (made again after the last one closed): Edge's Strict tracking prevention, the Appearance, no
+// passwords or form data saved, and Exo Shield.
+static void ConfigurePrivate(ICoreWebView2* core) {
+    ComPtr<ICoreWebView2_13> c13;
+    ComPtr<ICoreWebView2Profile> profile;
+    if (FAILED(core->QueryInterface(IID_PPV_ARGS(&c13))) || FAILED(c13->get_Profile(&profile))) return;
+    if (ComPtr<ICoreWebView2Profile3> p3; SUCCEEDED(profile.As(&p3)))
+        p3->put_PreferredTrackingPreventionLevel(COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT);
+    profile->put_PreferredColorScheme(g.theme == L"light" ? COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT : COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
+    if (ComPtr<ICoreWebView2Profile6> p6; SUCCEEDED(profile.As(&p6))) {
+        p6->put_IsPasswordAutosaveEnabled(FALSE);
+        p6->put_IsGeneralAutofillEnabled(FALSE);
+    }
+    ComPtr<ICoreWebView2Profile7> p7;
+    if (FAILED(profile.As(&p7))) return;
+    p7->GetBrowserExtensions(Callback<ICoreWebView2ProfileGetBrowserExtensionsCompletedHandler>(
+        [p7](HRESULT hr, ICoreWebView2BrowserExtensionList* list) -> HRESULT {
+            // Already there (Edge's own Clipboard and PDF viewer are listed too, so it's found by its name).
+            UINT count = 0;
+            if (SUCCEEDED(hr) && list && SUCCEEDED(list->get_Count(&count)))
+                for (UINT i = 0; i < count; i++) {
+                    ComPtr<ICoreWebView2BrowserExtension> ext;
+                    LPWSTR name = nullptr;
+                    if (SUCCEEDED(list->GetValueAtIndex(i, &ext)) && SUCCEEDED(ext->get_Name(&name)) && Take(name).rfind(L"Exo Shield", 0) == 0)
+                        return S_OK;
+                }
+            std::wstring folder = BuiltinFolder(L"exo-shield");
+            p7->AddBrowserExtension(folder.c_str(), Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+                [](HRESULT hr, ICoreWebView2BrowserExtension*) -> HRESULT {
+                    if (SUCCEEDED(hr)) return S_OK;
+                    wchar_t line[96];
+                    swprintf_s(line, L"private profile: Exo Shield failed 0x%08lx\n", (unsigned long)hr);
+                    std::string log = Utf8(line);
+                    HANDLE f = CreateFileW((g.dataDir + L"\\exo.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+                    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, log.data(), (DWORD)log.size(), &w, nullptr); CloseHandle(f); }
+                    return S_OK;
+                }).Get());
+            return S_OK;
+        }).Get());
 }
 
 static void ConfigureProfile(ICoreWebView2* core) {
@@ -2199,7 +2550,11 @@ static void ConfigureProfile(ICoreWebView2* core) {
                     if (FAILED(list->GetValueAtIndex(i, &ext)) || FAILED(ext->get_Id(&id)) || FAILED(ext->get_Name(&name))) continue;
                     std::wstring sid = Take(id), sname = Take(name);
                     // What Exo Shield replaced (uBlock Origin Lite, TTV LOL PRO) and the dark mode it dropped.
-                    if (sname == L"uBlock Origin Lite" || sname == L"TTV LOL PRO" || sname == L"Dark Reader") {
+                    // Exo's own earlier copies of what Exo Shield replaced (uBlock Origin Lite, TTV LOL PRO) and of the dark
+                    // mode it dropped; one you add from the Chrome Web Store yourself (kept in Extensions) stays.
+                    auto from = g_extFolders.find(sid);
+                    bool ours = from == g_extFolders.end() || from->second.rfind(g.dataDir + L"\\Builtin\\", 0) == 0;
+                    if (ours && (sname == L"uBlock Origin Lite" || sname == L"TTV LOL PRO" || sname == L"Dark Reader")) {
                         stale->push_back(ext);
                         continue;
                     }
@@ -2275,9 +2630,205 @@ static void ConfigureProfile(ICoreWebView2* core) {
 static void ApplyFind(Tab* t);
 static void ServeApi(ICoreWebView2WebResourceRequestedEventArgs* a);
 static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId);
+static void DownloadTick();
 static void OnUiMessage(const std::wstring& msg);
 static void InstallStoreExtension(const std::wstring& id);
 extern const wchar_t kStoreScriptRef[];
+
+// ---------------------------------------------------------------------------------------
+// Boosts (Settings > Boosts): a site your way. "boosts" holds, per site (its subdomains too), the things Zap took off
+// its pages and a style of your own, as JSON the chrome page edits. Every tab runs it as a script before a page's own,
+// so a boosted page paints boosted, and a change reaches the pages already open at once.
+
+static unsigned g_boostGen = 0;  // the boosts' version: a script added for an older one is taken off again
+
+// A boost on a page: a constructed style sheet (no page's Content Security Policy refuses one), made once and changed
+// in place. `b` is the site's boost, or null.
+static const wchar_t kBoostApply[] = LR"js(
+  const css = b && b.on !== false ? (b.zap || []).map(z => z + ' { display: none !important; }').join('\n') + '\n' + (b.css || '') : '';
+  let sheet = document.__exoBoost;
+  if (!sheet) {
+    if (!css.trim()) return;
+    sheet = new CSSStyleSheet();
+    Object.defineProperty(document, '__exoBoost', { value: sheet });
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+  }
+  sheet.replaceSync(css);
+})())js";
+
+// Every page's script, run before the page's own (so no page sees the others' boosts): the most specific site that
+// matches wins (news.example.com's own over example.com's).
+static std::wstring BoostScript() {
+    return L"(() => { if (window.top !== window) return; const all = " + Setting(L"boosts", L"{}") + LR"js(;
+  const site = location.hostname.replace(/^www\./, '');
+  const key = Object.keys(all).filter(k => site === k || site.endsWith('.' + k)).sort((x, y) => y.length - x.length)[0];
+  const b = key ? all[key] : null;)js" + std::wstring(kBoostApply);
+}
+
+// The boost of a page already running, read here from "boosts" (its JSON, as the chrome page wrote it): only that
+// site's goes into the page, never the rest. The most specific matching site wins; "null" when none does.
+static std::wstring BoostFor(const std::wstring& site) {
+    std::wstring all = Setting(L"boosts", L"{}"), best, found = L"null";
+    size_t i = all.find(L'{');
+    if (i == std::wstring::npos || site.empty()) return found;
+    i++;
+    auto space = [&] { while (i < all.size() && iswspace(all[i])) i++; };
+    // A JSON string at i, decoded into `out` (when given); i ends after its closing quote.
+    auto text = [&](std::wstring* out) {
+        if (i >= all.size() || all[i] != L'"') return false;
+        for (i++; i < all.size(); i++) {
+            wchar_t c = all[i];
+            if (c == L'"') { i++; return true; }
+            if (c == L'\\' && i + 1 < all.size()) {
+                wchar_t e = all[++i];
+                if (e == L'u') {
+                    if (out && i + 4 < all.size()) *out += (wchar_t)wcstol(all.substr(i + 1, 4).c_str(), nullptr, 16);
+                    i += 4;
+                } else if (out) *out += e == L'n' ? L'\n' : e == L't' ? L'\t' : e == L'r' ? L'\r' : e;
+            } else if (out) *out += c;
+        }
+        return false;
+    };
+    // A JSON value at i, as it's written; i ends after it.
+    auto value = [&] {
+        size_t start = i;
+        int depth = 0;
+        while (i < all.size()) {
+            wchar_t c = all[i];
+            if (c == L'"') { text(nullptr); continue; }
+            if (c == L'{' || c == L'[') depth++;
+            else if (c == L'}' || c == L']') { if (depth-- == 0) break; if (depth == 0) { i++; break; } }
+            else if (c == L',' && depth == 0) break;
+            i++;
+        }
+        return all.substr(start, i - start);
+    };
+    for (;;) {
+        space();
+        std::wstring key;
+        if (!text(&key)) break;
+        space();
+        if (i >= all.size() || all[i] != L':') break;
+        i++;
+        space();
+        std::wstring v = value();
+        bool match = site == key || (site.size() > key.size() && site.compare(site.size() - key.size() - 1, std::wstring::npos, L"." + key) == 0);
+        if (match && key.size() > best.size()) { best = key; found = v; }
+        space();
+        if (i < all.size() && all[i] == L',') i++;
+        else break;
+    }
+    return found;
+}
+
+// A tab's Boosts script, made again from the newest boosts (and run on the page it shows now when `now`).
+static void InstallBoost(Tab* t, bool now) {
+    if (!t || !t->core) return;
+    if (!t->boostScript.empty()) {
+        t->core->RemoveScriptToExecuteOnDocumentCreated(t->boostScript.c_str());
+        t->boostScript.clear();
+    }
+    std::wstring script = BoostScript();
+    if (now) t->core->ExecuteScript((L"(() => { if (window.top !== window) return; const b = " + BoostFor(SiteOf(t->url)) + L";" + kBoostApply).c_str(), nullptr);
+    if (Setting(L"boosts", L"{}") == L"{}") return;
+    int id = t->id;
+    unsigned gen = g_boostGen;
+    t->core->AddScriptToExecuteOnDocumentCreated(script.c_str(), Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+        [id, gen](HRESULT hr, LPCWSTR scriptId) -> HRESULT {
+            Tab* t = FindTab(id);
+            if (FAILED(hr) || !scriptId || !t || !t->core) return S_OK;
+            if (gen != g_boostGen) t->core->RemoveScriptToExecuteOnDocumentCreated(scriptId);
+            else t->boostScript = scriptId;
+            return S_OK;
+        }).Get());
+}
+
+static void ApplyBoosts() {
+    g_boostGen++;
+    for (auto& t : g.tabs) InstallBoost(t.get(), true);
+}
+
+// Zap: the page on screen marks what's under the pointer; a click takes it off the site for good (the chrome page adds
+// it to the site's boost), Esc or Done ends it. A click there reaches nothing on the page.
+static int g_zapId = 0;
+static int g_zapsThisRun = 0;
+static ULONGLONG g_zapAt = 0;
+static const wchar_t kZapScript[] = LR"js((() => {
+  if (window.__exoZap) return;
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;box-sizing:border-box;border:2px solid #ff453a;background:rgba(255,69,58,.14);border-radius:6px;display:none';
+  document.documentElement.appendChild(box);
+  let target = null;
+  const ok = c => /^[a-zA-Z_][\w-]*$/.test(c) && !/\d{4,}/.test(c) && !/^(is|has)-|active|hover|focus|open|selected|visible/.test(c);
+  // The element as a selector that finds it alone: an id, else its tag and steady classes (its place among its kind
+  // where it has siblings), up its parents until one alone matches.
+  const selectorOf = el => {
+    const parts = [];
+    for (let e = el; e && e.nodeType === 1 && e !== document.documentElement && e !== document.body; e = e.parentElement) {
+      let p;
+      if (e.id && ok(e.id)) p = '#' + CSS.escape(e.id);
+      else {
+        p = e.localName;
+        const cls = [...e.classList].filter(ok).slice(0, 3);
+        if (cls.length) p += '.' + cls.map(c => CSS.escape(c)).join('.');
+        const kin = e.parentElement ? [...e.parentElement.children].filter(x => x.localName === e.localName) : [];
+        if (kin.length > 1) p += ':nth-of-type(' + (kin.indexOf(e) + 1) + ')';
+      }
+      parts.unshift(p);
+      const sel = parts.join(' > ');
+      try { if (document.querySelectorAll(sel).length === 1) return sel; } catch (_) { }
+    }
+    return parts.join(' > ');
+  };
+  const move = e => {
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el || el === box || el === document.documentElement || el === document.body) { box.style.display = 'none'; target = null; return; }
+    target = el;
+    const r = el.getBoundingClientRect();
+    Object.assign(box.style, { display: 'block', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+  };
+  const eat = e => { e.preventDefault(); e.stopImmediatePropagation(); };
+  const click = e => {
+    eat(e);
+    if (e.button === 0 && target) { chrome.webview.postMessage('exo-zap\t' + selectorOf(target)); box.style.display = 'none'; target = null; }
+  };
+  const key = e => { if (e.key === 'Escape') { eat(e); chrome.webview.postMessage('exo-zap-end'); } };
+  const kinds = ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick', 'contextmenu', 'dblclick'];
+  const stop = () => {
+    removeEventListener('mousemove', move, true);
+    for (const k of kinds) removeEventListener(k, eat, true);
+    removeEventListener('click', click, true);
+    removeEventListener('keydown', key, true);
+    box.remove();
+    document.documentElement.style.removeProperty('cursor');
+    window.__exoZap = null;
+  };
+  addEventListener('mousemove', move, true);
+  for (const k of kinds) addEventListener(k, eat, true);
+  addEventListener('click', click, true);
+  addEventListener('keydown', key, true);
+  document.documentElement.style.cursor = 'crosshair';
+  window.__exoZap = stop;
+})())js";
+
+static void EndZap() {
+    if (!g_zapId) return;
+    if (Tab* t = FindTab(g_zapId); t && t->core) t->core->ExecuteScript(L"window.__exoZap && window.__exoZap()", nullptr);
+    g_zapId = 0;
+    UiPost(L"{\"t\":\"zapping\",\"on\":false}");
+}
+
+static void FocusTarget(int target);
+static void StartZap(Tab* t) {
+    if (!t || !t->core || (t->url.rfind(L"https://", 0) != 0 && t->url.rfind(L"http://", 0) != 0)) return;
+    EndZap();
+    if (t->id != g.activeId) Activate(t->id);
+    g_zapId = t->id;
+    g_zapsThisRun = 0;
+    t->core->ExecuteScript(kZapScript, nullptr);
+    UiPost(L"{\"t\":\"zapping\",\"on\":true,\"site\":" + Json(SiteOf(t->url)) + L"}");
+    FocusTarget(t->id);
+}
 
 // A new tab page's color until it draws: its own background (var(--color-bg) in the Appearance's theme), so it doesn't
 // open black in Light.
@@ -2305,10 +2856,19 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
     s->put_IsZoomControlEnabled(TRUE);
     if (ComPtr<ICoreWebView2Settings8> s8; SUCCEEDED(s.As(&s8))) s8->put_IsReputationCheckingRequired(FALSE);
     if (ComPtr<ICoreWebView2_9> c9; SUCCEEDED(t->core.As(&c9))) {
-        c9->put_DefaultDownloadDialogCornerAlignment(COREWEBVIEW2_DEFAULT_DOWNLOAD_DIALOG_CORNER_ALIGNMENT_TOP_RIGHT);
-        c9->put_DefaultDownloadDialogMargin({Px(8), Px(8)});
+        // WebView2's own download bubble stays shut: the Bar's ring and Settings > Downloads show downloads.
+        EventRegistrationToken dialog;
+        c9->add_IsDefaultDownloadDialogOpenChanged(Callback<ICoreWebView2IsDefaultDownloadDialogOpenChangedEventHandler>(
+            [](ICoreWebView2* core, IUnknown*) -> HRESULT {
+                ComPtr<ICoreWebView2_9> w9;
+                BOOL open = FALSE;
+                if (SUCCEEDED(core->QueryInterface(IID_PPV_ARGS(&w9))) && SUCCEEDED(w9->get_IsDefaultDownloadDialogOpen(&open)) && open)
+                    w9->CloseDefaultDownloadDialog();
+                return S_OK;
+            }).Get(), &dialog);
     }
-    ConfigureProfile(t->core.Get());
+    if (t->priv) ConfigurePrivate(t->core.Get());
+    else ConfigureProfile(t->core.Get());
 
     EventRegistrationToken tok;
     // The new tab page: ui/ served at newtab.exo to top-level navigations only, its data at
@@ -2329,11 +2889,31 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
             if (IsNewTab(from)) OnNewTabMessage(id, msg);
             else if (from.rfind(L"https://chromewebstore.google.com/", 0) == 0 && msg.rfind(L"exo-install\t", 0) == 0)
                 InstallStoreExtension(msg.substr(12));
+            else if (msg.rfind(L"exo-edge\t", 0) == 0) {
+                if (Tab* t = FindTab(id); t && !t->peek) {
+                    bool was = t->id == g.activeId && UnderBar();
+                    t->under = msg.size() > 9 && msg[9] == L'1';
+                    if (t->id == g.activeId) SlideUnder(was, msg.size() > 10 && msg[10] == L't');
+                }
+            }
             else if (msg.rfind(L"exo-vault\t", 0) == 0 && (from.rfind(L"https://", 0) == 0 || from.rfind(L"http://", 0) == 0))
                 OnVaultPage(FindTab(id), from, msg.substr(10));
+            else if (msg.rfind(L"exo-zap\t", 0) == 0 && id == g_zapId && msg.size() < 520 && msg.find_first_of(L"{};<", 8) == std::wstring::npos &&
+                     GetTickCount64() - g_zapAt > 150 && g_zapsThisRun < 50) {
+                // What the page says it is goes no further than that page's own boost.
+                g_zapAt = GetTickCount64();
+                g_zapsThisRun++;
+                UiPost(L"{\"t\":\"zap\",\"site\":" + Json(SiteOf(from)) + L",\"sel\":" + Json(msg.substr(8)) + L"}");
+            }
+            else if (msg == L"exo-zap-end" && id == g_zapId)
+                EndZap();
             return S_OK;
         }).Get(), &tok);
     t->core->AddScriptToExecuteOnDocumentCreated(kStoreScriptRef, nullptr);
+    InstallBoost(t, false);
+    // Whether the page may run up under the Bar (ui/edge-page.js).
+    static const std::wstring edgeScript = Wide(ReadFileUtf8(g.exeDir + L"\\ui\\edge-page.js"));
+    if (!edgeScript.empty()) t->core->AddScriptToExecuteOnDocumentCreated(edgeScript.c_str(), nullptr);
     // Exo Vault's eyes on sign-in forms (ui/vault-page.js).
     static const std::wstring vaultScript = Wide(ReadFileUtf8(g.exeDir + L"\\ui\\vault-page.js"));
     if (!vaultScript.empty()) t->core->AddScriptToExecuteOnDocumentCreated(vaultScript.c_str(), nullptr);
@@ -2381,6 +2961,21 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
                     a->put_Cancel(TRUE);
                     return S_OK;
                 }
+                BOOL user = FALSE, redirected = FALSE;
+                a->get_IsUserInitiated(&user);
+                a->get_IsRedirected(&redirected);
+                if (id == g_zapId) EndZap();
+                // A pinned tab's own page that redirects (a site's / to /en-US/, by the server or by its script within
+                // a few seconds and nobody's click) makes the redirect its page.
+                bool follows = redirected || (!user && GetTickCount64() - t->navAt < 5000 && SiteOf(url) == SiteOf(t->navFrom));
+                if (follows && t->pinned && !t->home.empty() && t->navFrom == t->home) { t->home = url; MarkSessionDirty(); QueueState(); }
+                if (!follows) t->navAt = GetTickCount64();
+                t->navFrom = url;
+                if (!redirected && t->under) {
+                    bool was = t->id == g.activeId && UnderBar();
+                    t->under = false;
+                    if (t->id == g.activeId && was) Layout();
+                }
                 t->loading = true;
                 a->get_NavigationId(&t->navId);
                 if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(t->ctl.As(&c2)))
@@ -2400,7 +2995,7 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
                 a->get_IsSuccess(&ok);
                 if (ok) RecordVisit(t);
                 std::wstring site = SiteOf(t->url);
-                if (ok && t->url.rfind(L"https://", 0) == 0 && !IsNewTab(t->url) && !g_icons.count(site) && !g_iconTried.count(site + L"#page"))
+                if (ok && !t->priv && t->url.rfind(L"https://", 0) == 0 && !IsNewTab(t->url) && !g_icons.count(site) && !g_iconTried.count(site + L"#page"))
                     t->core->ExecuteScript(kIconScript, Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
                         [site](HRESULT hr, LPCWSTR result) -> HRESULT {
                             std::wstring href = SUCCEEDED(hr) && result ? result : L"";
@@ -2440,24 +3035,72 @@ static void SetupTab(Tab* t, ICoreWebView2CompositionController* comp) {
             a->get_Uri(&u);
             // Ctrl+click and middle click open behind, as every browser does.
             bool background = GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MBUTTON) < 0 || GetTickCount64() - g_middleUpAt < 500;
+            // Shift+click: Peek (meeting links get their tab). A plain click opens as it always does; Peek is also on
+            // the page's right-click menu.
+            std::wstring want = u ? u : L"";
+            Tab* from = FindTab(id);
+            BOOL user = FALSE;
+            a->get_IsUserInitiated(&user);
+            if (!background && user && !IsMeeting(want) && (want.rfind(L"http", 0) == 0) && from && !from->peek &&
+                GetKeyState(VK_SHIFT) < 0) {
+                CoTaskMemFree(u);
+                a->put_Handled(TRUE);
+                deferral->Complete();
+                OpenPeek(want);
+                return S_OK;
+            }
             auto t = std::make_unique<Tab>();
             t->id = g.nextId++;
             t->url = Take(u);
             t->lastActive = GetTickCount64();
+            Tab* opener = FindTab(id);
+            t->space = opener ? opener->space : g.space;
+            t->priv = opener && opener->priv;
             Tab* raw = t.get();
             g.tabs.insert(g.tabs.begin() + std::min(IndexOf(id) + 1, g.tabs.size()), std::move(t));
+            Order();
             EnsureView(raw, [args, deferral, background](Tab* nt) {
                 args->put_NewWindow(nt->core.Get());
                 args->put_Handled(TRUE);
                 deferral->Complete();
-                if (!background) {
-                    g.activeId = nt->id;
-                    ShowActive();
-                }
+                if (!background) Activate(nt->id);
             });
             QueueState();
             return S_OK;
         }).Get(), &tok);
+    // The page's right-click menu on a link: Open link in Peek, after Chromium's own Open link in new tab/window.
+    if (ComPtr<ICoreWebView2_11> c11; SUCCEEDED(t->core.As(&c11)))
+        c11->add_ContextMenuRequested(Callback<ICoreWebView2ContextMenuRequestedEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2ContextMenuRequestedEventArgs* a) -> HRESULT {
+                ComPtr<ICoreWebView2ContextMenuTarget> target;
+                BOOL link = FALSE;
+                if (FAILED(a->get_ContextMenuTarget(&target)) || FAILED(target->get_HasLinkUri(&link)) || !link || !g.env) return S_OK;
+                LPWSTR raw = nullptr;
+                target->get_LinkUri(&raw);
+                std::wstring url = Take(raw);
+                if (url.rfind(L"http://", 0) != 0 && url.rfind(L"https://", 0) != 0) return S_OK;
+                ComPtr<ICoreWebView2ContextMenuItem> item;
+                if (FAILED(g.env->CreateContextMenuItem(L"Open link in Peek", nullptr, COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, &item))) return S_OK;
+                EventRegistrationToken picked;
+                item->add_CustomItemSelected(Callback<ICoreWebView2CustomItemSelectedEventHandler>([url](ICoreWebView2ContextMenuItem*, IUnknown*) -> HRESULT {
+                    OpenPeek(url);
+                    return S_OK;
+                }).Get(), &picked);
+                ComPtr<ICoreWebView2ContextMenuItemCollection> items;
+                if (FAILED(a->get_MenuItems(&items))) return S_OK;
+                UINT32 count = 0, at = 0;
+                items->get_Count(&count);
+                for (UINT32 i = 0; i < count; i++) {
+                    ComPtr<ICoreWebView2ContextMenuItem> it;
+                    LPWSTR name = nullptr;
+                    if (SUCCEEDED(items->GetValueAtIndex(i, &it)) && SUCCEEDED(it->get_Name(&name))) {
+                        std::wstring n = Take(name);
+                        if (n == L"openLinkInNewWindow" || n == L"openLinkInNewTab") at = i + 1;
+                    }
+                }
+                items->InsertValueAtIndex(at, item.Get());
+                return S_OK;
+            }).Get(), &tok);
     t->core->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
         [id](ICoreWebView2*, IUnknown*) -> HRESULT {
             PostMessageW(g.hwnd, WM_COMMAND, MAKEWPARAM(1, 0), (LPARAM)id);
@@ -2525,7 +3168,9 @@ static void CreateView(Tab* t) {
     t->creating = true;
     ComPtr<ICoreWebView2ControllerOptions> opts;
     g.env->CreateCoreWebView2ControllerOptions(&opts);
-    opts->put_ProfileName(L"Default");
+    // A private tab's profile lives in memory and goes with the last private tab.
+    opts->put_ProfileName(t->priv ? L"Private" : L"Default");
+    if (t->priv) opts->put_IsInPrivateModeEnabled(TRUE);
     int id = t->id;
     g.env->CreateCoreWebView2CompositionControllerWithOptions(g.hwnd, opts.Get(),
         Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
@@ -2545,8 +3190,14 @@ static void CreateView(Tab* t) {
 static void ShowActive() {
     Tab* a = Active();
     for (auto& t : g.tabs)
-        if (t->ctl && t.get() != a) t->ctl->put_IsVisible(FALSE);
+        if (t->ctl && !Shown(t.get()) && !t->peek) t->ctl->put_IsVisible(FALSE);
     g.content.Children().RemoveAll();
+    // The other panes of a split, beside it.
+    for (Tab* p : Panes()) {
+        if (p == a) continue;
+        if (p->ctl) { g.content.Children().InsertAtTop(p->visual); p->ctl->put_IsVisible(!g.minimized); }
+        else EnsureView(p, [](Tab* t) { if (Shown(t)) ShowActive(); });
+    }
     if (a) {
         a->lastActive = GetTickCount64();
         if (a->ctl) {
@@ -2556,44 +3207,201 @@ static void ShowActive() {
                 a->suspended = a->lowMemory = false;
             }
             g.content.Children().InsertAtTop(a->visual);
-            a->ctl->put_Bounds(g.contentRect);
             a->ctl->put_IsVisible(!g.minimized);
             if (!g.overlay) FocusTarget(a->id);
         } else {
             EnsureView(a, [](Tab* t) { if (t->id == g.activeId) ShowActive(); });
         }
     }
+    if (RECT c = g.contentRect; (c.top == 0) != UnderBar() && !g.fullscreen && !g.autohide) Layout();
+    PlacePanes();
     Commit();
     FollowNewTab();
     MarkSessionDirty();
     QueueState();
 }
 
+static void EnterSpace(int id);
+
+// Picture in picture by itself (Settings > General): leaving a tab whose video plays with sound floats the video;
+// coming back puts it in the page again. A muted video (an ad playing quietly) stays put.
+static void AutoPip(Tab* t, bool enter) {
+    if (!t || !t->core || Setting(L"autoPip", L"on") == L"off") return;
+    t->core->ExecuteScript(enter
+        ? L"(() => { if (document.pictureInPictureElement) return; const v = [...document.querySelectorAll('video')]"
+          L".filter(v => !v.paused && !v.muted && v.volume > 0 && v.readyState > 2 && v.clientWidth > 160 && !v.disablePictureInPicture)"
+          L".sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];"
+          L" if (v) v.requestPictureInPicture().then(() => { window.__exoAutoPip = true }, () => {}); })()"
+        : L"(() => { if (window.__exoAutoPip && document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});"
+          L" window.__exoAutoPip = false; })()",
+        nullptr);
+}
+
 static void Activate(int id) {
-    if (!FindTab(id)) return;
+    Tab* t = FindTab(id);
+    if (!t || t->peek) return;
+    if (g.peekId) ClosePeek();
     // A video's full screen belongs to its own tab: switching away leaves it.
     if (id != g.activeId && g.elementFullscreen) LeaveFullscreen();
-    if (Tab* prev = Active()) prev->lastActive = GetTickCount64();
+    if (g_zapId && g_zapId != id) EndZap();
+    if (Tab* prev = Active()) {
+        static UINT64 leftCount = 0;
+        if (prev->id != id) prev->left = ++leftCount;
+        prev->lastActive = GetTickCount64();
+        prev->seen = _time64(nullptr);
+        if (prev->id != id && prev->audible) AutoPip(prev, true);
+    }
+    if (id != g.activeId) AutoPip(t, false);
+    t->seen = _time64(nullptr);
+    // A tab of another space (Search's "Switch to tab") takes you to its space; a favorite is in every space.
+    if (t->space && t->space != g.space) EnterSpace(t->space);
     g.activeId = id;
     ShowActive();
 }
 
-static Tab* AddTab(const std::wstring& url, bool activate, size_t index) {
+// ---------------------------------------------------------------------------------------
+// Peek: a link from a pinned tab or a favorite (or any link Shift+clicked) opens in a card over the page, which
+// blurs behind it, so the page you were on stays put. Esc or a press around it closes it; Ctrl+O, or its button,
+// opens it as a tab. Meeting links open as tabs, as calls need them.
+
+static void Discard(Tab* t);
+
+static bool IsMeeting(const std::wstring& url) {
+    std::wstring site = SiteOf(url);
+    for (auto m : {L"meet.google.com", L"zoom.us", L"teams.microsoft.com", L"teams.live.com", L"whereby.com", L"meet.jit.si"})
+        if (site == m || (site.size() > wcslen(m) && site.compare(site.size() - wcslen(m) - 1, wcslen(m) + 1, std::wstring(L".") + m) == 0)) return true;
+    return false;
+}
+
+// The card: 84% of the page's width (at most 1180 px), the page's height less a band above (for its buttons) and a
+// margin below, centered.
+static void PlacePeek() {
+    Tab* t = FindTab(g.peekId);
+    if (!t) return;
+    float k = Scale();
+    RECT c = g.contentRect;
+    LONG w = c.right - c.left, h = c.bottom - c.top;
+    LONG cw = std::min<LONG>((LONG)(w * 0.84f), (LONG)(1180 * k)), top = (LONG)(56 * k), bottom = (LONG)(20 * k);
+    g.peekRect = {c.left + (w - cw) / 2, c.top + top, c.left + (w - cw) / 2 + cw, std::max(c.top + top + 1, c.bottom - bottom)};
+    if (t->ctl) t->ctl->put_Bounds(g.peekRect);
+    if (t->visual) {
+        float rw = (float)(g.peekRect.right - g.peekRect.left), rh = (float)(g.peekRect.bottom - g.peekRect.top);
+        t->visual.Offset({(float)g.peekRect.left, (float)g.peekRect.top, 0});
+        t->visual.Size({rw, rh});
+        auto shape = g.compositor.CreateRoundedRectangleGeometry();
+        shape.Size({rw, rh});
+        shape.CornerRadius({18 * k, 18 * k});
+        t->visual.Clip(g.compositor.CreateGeometricClip(shape));
+    }
+    float css = 1 / k;
+    UiPost(L"{\"t\":\"peek\",\"open\":true,\"x\":" + std::to_wstring(g.peekRect.left * css) + L",\"y\":" + std::to_wstring(g.peekRect.top * css) +
+           L",\"w\":" + std::to_wstring((g.peekRect.right - g.peekRect.left) * css) + L",\"h\":" + std::to_wstring((g.peekRect.bottom - g.peekRect.top) * css) +
+           L",\"title\":" + Json(t->title) + L",\"url\":" + Json(t->url) + L"}");
+}
+
+static void ShowPeek(Tab* t) {
+    if (t->id != g.peekId || !t->ctl) return;
+    g.peekLayer.Children().RemoveAll();
+    g.peekLayer.Children().InsertAtTop(t->visual);
+    PlacePeek();
+    t->ctl->put_IsVisible(!g.minimized);
+    FocusTarget(t->id);
+}
+
+static void OpenPeek(const std::wstring& url) {
+    if (Tab* t = FindTab(g.peekId)) {
+        t->url = url;
+        if (t->core) t->core->Navigate(url.c_str());
+        else t->pendingNav = url;
+        return;
+    }
     auto t = std::make_unique<Tab>();
     t->id = g.nextId++;
+    t->url = t->pendingNav = url;
+    t->peek = true;
+    t->space = g.space;
+    if (Tab* a = Active()) t->priv = a->priv;
+    t->seen = _time64(nullptr);
+    t->lastActive = GetTickCount64();
+    Tab* raw = t.get();
+    g.tabs.push_back(std::move(t));
+    g.peekId = raw->id;
+    SetBlur(true);
+    EnsureView(raw, [](Tab* p) { ShowPeek(p); });
+}
+
+static void ClosePeek() {
+    int id = g.peekId;
+    if (!id) return;
+    g.peekId = 0;
+    g.peekRect = {};
+    g.peekLayer.Children().RemoveAll();
+    if (g.hover == id) g.hover = 0;
+    if (g.capture == id) g.capture = 0;
+    size_t i = IndexOf(id);
+    if (i < g.tabs.size() && Downloading(id)) {
+        // Still fetching a file: out of sight until it's done (the download closes it then).
+        if (g.tabs[i]->ctl) g.tabs[i]->ctl->put_IsVisible(FALSE);
+        CloseWhenDownloaded(id);
+    } else if (i < g.tabs.size()) {
+        Discard(g.tabs[i].get());
+        g.tabs.erase(g.tabs.begin() + i);
+    }
+    if (!g.overlay) SetBlur(false);
+    UiPost(L"{\"t\":\"peek\",\"open\":false}");
+    if (Tab* a = Active(); a && a->ctl && !g.overlay) FocusTarget(a->id);
+}
+
+static void Activate(int id);
+
+// The card becomes a tab after the one on screen.
+static void ExpandPeek() {
+    Tab* t = FindTab(g.peekId);
+    if (!t) return;
+    g.peekId = 0;
+    g.peekRect = {};
+    g.peekLayer.Children().RemoveAll();
+    t->peek = false;
+    t->space = g.space;
+    if (t->visual) { t->visual.Offset({0, 0, 0}); t->visual.Clip(nullptr); }
+    size_t from = IndexOf(t->id);
+    auto up = std::move(g.tabs[from]);
+    g.tabs.erase(g.tabs.begin() + from);
+    Tab* a = Active();
+    g.tabs.insert(g.tabs.begin() + (a ? IndexOf(a->id) + 1 : g.tabs.size()), std::move(up));
+    if (!g.overlay) SetBlur(false);
+    UiPost(L"{\"t\":\"peek\",\"open\":false}");
+    Activate(t->id);
+}
+
+static Tab* AddTab(const std::wstring& url, bool activate, size_t index, bool priv = false) {
+    auto t = std::make_unique<Tab>();
+    t->id = g.nextId++;
+    t->priv = priv;
     t->url = url;
     t->pendingNav = url;
     t->lastActive = GetTickCount64();
+    t->seen = _time64(nullptr);
+    t->space = g.space;
     Tab* raw = t.get();
     g.tabs.insert(g.tabs.begin() + std::min(index, g.tabs.size()), std::move(t));
+    Order();  // after the tab on screen, but never among the pinned tabs and folders
     if (activate) Activate(raw->id);
     else QueueState();
     return raw;
 }
 
-static void NewTabPage() {
+// After the tab on screen, or at the end of the space when the one on screen is another space's (a space just entered).
+static size_t NextPlace() {
     Tab* a = Active();
-    AddTab(kNewTab, true, a ? IndexOf(a->id) + 1 : g.tabs.size());
+    if (a && a->space == g.space) return IndexOf(a->id) + 1;
+    size_t at = g.tabs.size();
+    for (size_t i = 0; i < g.tabs.size(); i++) if (g.tabs[i]->space == g.space) at = i + 1;
+    return at;
+}
+
+static void NewTabPage() {
+    AddTab(kNewTab, true, NextPlace());
 }
 
 static void Discard(Tab* t) {
@@ -2609,11 +3417,65 @@ static void Discard(Tab* t) {
     t->pendingNav = t->url;
 }
 
-static void CloseTab(int id) {
+// The tab that takes the place of one leaving its space at index i (already gone from g.tabs): the next of that space,
+// else the one before it.
+static Tab* Neighbor(int space, size_t i) {
+    auto in = [space](const Tab* t) { return t->space == space || t->space == 0; };
+    for (size_t j = i; j < g.tabs.size(); j++) if (in(g.tabs[j].get())) return g.tabs[j].get();
+    for (size_t j = std::min(i, g.tabs.size()); j-- > 0;) if (in(g.tabs[j].get())) return g.tabs[j].get();
+    return nullptr;
+}
+
+// Favorites lead the strip, then pinned tabs, then the rest, each in its own order.
+static void Order() {
+    // The folders depth first, each before the folders in it, in the order they were made.
+    std::unordered_map<int, int> place;
+    std::function<void(int)> walk = [&](int parent) {
+        for (auto& f : g.folders)
+            if (f.parent == parent) {
+                place[f.id] = (int)place.size();
+                walk(f.id);
+            }
+    };
+    walk(0);
+    int loose = (int)place.size();
+    std::stable_sort(g.tabs.begin(), g.tabs.end(), [&](auto& a, auto& b) {
+        auto rank = [](const Tab* t) { return t->space == 0 ? 0 : t->pinned ? 1 : 2; };
+        auto sub = [&](const Tab* t) {
+            if (!t->pinned || t->space == 0) return 0;
+            auto it = place.find(t->folder);
+            return it == place.end() ? loose : it->second;
+        };
+        int ra = rank(a.get()), rb = rank(b.get());
+        return ra != rb ? ra < rb : sub(a.get()) < sub(b.get());
+    });
+}
+
+static void SwitcherForget(int id);
+static void CloseTab(int id, bool force = false) {
     size_t i = IndexOf(id);
     if (i >= g.tabs.size()) return;
+    if (id == g_zapId) EndZap();
+    SwitcherForget(id);
     Tab* t = g.tabs[i].get();
-    if (!t->url.empty()) {
+    int space = t->space ? t->space : g.space;
+    // A pinned tab (a favorite too) stays: closing it puts it to sleep on its own page, and the next tab shows.
+    if (t->pinned && !force) {
+        if (id == g.activeId && g.elementFullscreen) LeaveFullscreen();
+        if (g.activeId == id) {
+            Tab* next = nullptr;
+            for (size_t j = i + 1; j < g.tabs.size() && !next; j++) if (g.tabs[j]->space == space || g.tabs[j]->space == 0) next = g.tabs[j].get();
+            for (size_t j = i; j-- > 0 && !next;) if (g.tabs[j]->space == space || g.tabs[j]->space == 0) next = g.tabs[j].get();
+            if (next) Activate(next->id);
+            else { g.activeId = 0; NewTabPage(); }
+        }
+        if (!t->home.empty()) t->url = t->home;
+        Discard(t);
+        MarkSessionDirty();
+        QueueState();
+        return;
+    }
+    if (!t->url.empty() && !t->priv) {
         g.closed.push_back({t->url, t->title, i});
         if (g.closed.size() > 50) g.closed.erase(g.closed.begin());
     }
@@ -2621,15 +3483,19 @@ static void CloseTab(int id) {
     if (g.hover == id) g.hover = 0;
     if (g.focus == id) g.focus = 0;
     if (id == g.activeId && g.elementFullscreen) LeaveFullscreen();
+    int split = t->split;
     Discard(t);
     g.tabs.erase(g.tabs.begin() + i);
+    if (split && std::count_if(g.tabs.begin(), g.tabs.end(), [split](auto& x) { return x->split == split; }) < 2)
+        for (auto& x : g.tabs) if (x->split == split) x->split = 0;
     if (g.activeId == id) {
-        if (g.tabs.empty()) {
+        // The space's last tab closed leaves a new tab page in it.
+        if (Tab* next = Neighbor(space, i)) {
+            g.activeId = next->id;
+            ShowActive();
+        } else {
             g.activeId = 0;
             NewTabPage();
-        } else {
-            g.activeId = g.tabs[std::min(i, g.tabs.size() - 1)]->id;
-            ShowActive();
         }
     } else {
         QueueState();
@@ -2645,23 +3511,156 @@ static void ReopenClosed() {
     t->title = c.title;
 }
 
+// Ctrl+Tab and Ctrl+PageDown go round the space's tabs.
 static void CycleTab(int step) {
-    if (g.tabs.empty()) return;
-    size_t i = IndexOf(g.activeId);
-    if (i >= g.tabs.size()) i = 0;
-    i = (i + g.tabs.size() + step) % g.tabs.size();
-    Activate(g.tabs[i]->id);
+    auto tabs = SpaceTabs(g.space);
+    if (tabs.empty()) return;
+    size_t i = std::find(tabs.begin(), tabs.end(), Active()) - tabs.begin();
+    if (i >= tabs.size()) i = 0;
+    i = (i + tabs.size() + step) % tabs.size();
+    Activate(tabs[i]->id);
+}
+
+// ---------------------------------------------------------------------------------------
+// Spaces
+
+// Into another space: the one left remembers its tab on screen, and the appearance follows the new one.
+static void EnterSpace(int id) {
+    if (id == g.space || !FindSpace(id)) return;
+    if (Space* cur = FindSpace(g.space)) cur->last = g.activeId;
+    g.space = id;
+    SaveSpaces();
+    ThemeChanged();
+}
+
+// Shows a space with the tab it last had on screen (its first, or a new tab page when it has none).
+static void SwitchSpace(int id) {
+    Space* s = FindSpace(id);
+    if (!s || id == g.space) return;
+    Tab* t = FindTab(s->last);
+    if (!t || (t->space != id && t->space != 0)) {
+        auto tabs = SpaceTabs(id);
+        t = tabs.empty() ? nullptr : tabs[0];
+    }
+    // Entered first: its tab may be a favorite, which is in every space and so wouldn't take you there itself.
+    EnterSpace(id);
+    if (t) Activate(t->id);
+    else NewTabPage();
+}
+
+// A tab into another space, at the end of its tabs (pinned ones still lead). The space on screen keeps a tab: the next
+// one, or a new tab page; `follow` goes along with it instead.
+static void MoveToSpace(Tab* t, int id, bool follow) {
+    if (!FindSpace(id) || t->space == id) { if (follow) Activate(t->id); return; }
+    int from = t->space, tabId = t->id;
+    bool wasOn = tabId == g.activeId;
+    size_t i = IndexOf(tabId);
+    auto up = std::move(g.tabs[i]);
+    g.tabs.erase(g.tabs.begin() + i);
+    up->space = id;
+    up->folder = 0;  // folders belong to their space
+    size_t at = g.tabs.size();
+    for (size_t j = 0; j < g.tabs.size(); j++) if (g.tabs[j]->space == id) at = j + 1;
+    g.tabs.insert(g.tabs.begin() + at, std::move(up));
+    Order();
+    FindSpace(id)->last = tabId;
+    if (follow) {
+        Activate(tabId);
+    } else if (wasOn && from == g.space) {
+        if (Tab* next = Neighbor(from, i)) Activate(next->id);
+        else { g.activeId = 0; NewTabPage(); }
+    }
+    MarkSessionDirty();
+    QueueState();
+}
+
+// A space goes with its tabs (Ctrl+Shift+T brings them back, one by one); the last space stays.
+static void DeleteSpace(int id) {
+    if (g.spaces.size() < 2 || !FindSpace(id)) return;
+    if (id == g.space) {
+        size_t i = 0;
+        while (g.spaces[i].id != id) i++;
+        SwitchSpace(g.spaces[i > 0 ? i - 1 : i + 1].id);
+    }
+    std::vector<int> ids;
+    for (auto& t : g.tabs) if (t->space == id) ids.push_back(t->id);
+    for (int tabId : ids) CloseTab(tabId, true);
+    std::erase_if(g.spaces, [id](auto& s) { return s.id == id; });
+    std::erase_if(g.folders, [id](auto& f) { return f.space == id; });
+    SaveSpaces();
+    MarkSessionDirty();
+    QueueState();
+}
+
+// The archive (Settings > General > Archive tabs): a tab that isn't pinned and hasn't been on screen for the chosen
+// time (never, by default) closes into it, unless it plays sound or downloads. Search finds it again, Ctrl+Shift+T
+// brings the last ones back, and archive.tsv keeps the newest 300.
+static void SaveArchive() {
+    std::string out;
+    for (auto& a : g.archive) out += Utf8(Field(a.url) + L"\t" + Field(a.title) + L"\t" + std::to_wstring(a.at)) + "\n";
+    WriteFileUtf8(g.dataDir + L"\\archive.tsv", out);
+}
+
+static void SendArchive() {
+    std::wstring items;
+    for (auto it = g.archive.rbegin(); it != g.archive.rend(); ++it) {
+        if (!items.empty()) items += L",";
+        items += L"[" + Json(it->url) + L"," + Json(it->title) + L"," + std::to_wstring(it->at) + L"]";
+    }
+    UiPost(L"{\"t\":\"archive\",\"items\":[" + items + L"]}");
+}
+
+static long long ArchiveAfter() {
+    std::wstring v = Setting(L"archive", L"never");
+    return v == L"12h" ? 12 * 3600LL : v == L"24h" ? 24 * 3600LL : v == L"7d" ? 7 * 86400LL : v == L"30d" ? 30 * 86400LL : 0;
+}
+
+static bool Downloading(int tabId);
+
+static void ArchiveTick() {
+    long long after = ArchiveAfter(), now = _time64(nullptr);
+    if (!after) return;
+    std::vector<int> ids;
+    for (auto& t : g.tabs)
+        if (!t->pinned && !t->peek && !t->priv && t->space != 0 && !Shown(t.get()) && !t->audible && !t->url.empty() && t->url != kNewTab &&
+            !Downloading(t->id) && now - t->seen > after) ids.push_back(t->id);
+    if (ids.empty()) return;
+    for (int id : ids) {
+        Tab* t = FindTab(id);
+        g.archive.push_back({t->url, t->title, now});
+        CloseTab(id);
+    }
+    if (g.archive.size() > 300) g.archive.erase(g.archive.begin(), g.archive.end() - 300);
+    SaveArchive();
+    SendArchive();
+    Toast(ids.size() == 1 ? L"1 tab moved to the archive. Ctrl+Shift+T brings it back"
+                          : std::to_wstring(ids.size()) + L" tabs moved to the archive. Ctrl+Shift+T brings the last one back");
+}
+
+// The step-down tick (every 30 s) runs only while it has work: a tab off screen still holding its page, the archive on,
+// or history and icons waiting to be saved. With none of that it stops, so an idle window wakes for nothing; anything
+// that changes the tabs (every change reaches QueueState) or a setting starts it again.
+static bool g_sleepArmed = false;
+static void ArmSleep() {
+    if (g_sleepArmed || !g.hwnd) return;
+    g_sleepArmed = true;
+    SetTimer(g.hwnd, kTimerSleep, 30 * 1000, nullptr);
+}
+
+static bool SleepWork() {
+    if (g.historyDirty || g.faviconsDirty || ArchiveAfter()) return true;
+    for (auto& t : g.tabs) if (t->ctl && !t->peek && !Shown(t.get())) return true;
+    return false;
 }
 
 // Background tabs step down: lower memory priority after a minute, frozen after five,
 // closed (title, icon and address kept) after thirty. Playing tabs are never touched.
-static bool Downloading(int tabId);
-
 static void SleepTick() {
+    ArchiveTick();
     ULONGLONG now = GetTickCount64();
     for (auto& up : g.tabs) {
         Tab* t = up.get();
-        if (t->id == g.activeId || !t->ctl || t->audible || t->creating || Downloading(t->id)) continue;
+        if (Shown(t) || t->peek || !t->ctl || t->audible || t->creating || Downloading(t->id)) continue;
         ULONGLONG idle = now - t->lastActive;
         if (idle > kDiscardAfterMs) {
             Discard(t);
@@ -2734,8 +3733,11 @@ struct Download {
     ComPtr<ICoreWebView2DownloadOperation> op;
     int closeTab = 0;  // the tab that only fetched this file: closed once the file is finished
     int tab = 0;       // the tab it came from: kept awake until the file is done
+    HWND little = nullptr;  // the Little Exo window it came from, kept until it's done
+    bool priv = false;      // from a private tab: listed until the browser closes, never saved
 };
 static std::vector<Download> g_downloads;
+static void LittleDownloaded(HWND hwnd);
 static int g_nextDownload = 1;
 static bool g_downloadsPending = false;
 static const UINT WM_APP_DOWNLOADS = WM_APP + 3;
@@ -2752,10 +3754,15 @@ static bool Downloading(int tabId) {
     return false;
 }
 
+// A tab that only fetches files now (a Peek card closed mid-download) closes once its downloads are done.
+static void CloseWhenDownloaded(int tabId) {
+    for (auto& d : g_downloads) if (d.tab == tabId && d.op) d.closeTab = tabId;
+}
+
 static void SaveDownloads() {
     std::string out;
     for (auto& d : g_downloads) {
-        if (d.state == L"progress" || d.state == L"paused") continue;
+        if (d.state == L"progress" || d.state == L"paused" || d.priv) continue;
         out += Utf8(Field(d.url) + L"\t" + Field(d.path) + L"\t" + d.state + L"\t" + std::to_wstring(d.total) + L"\t" +
                     std::to_wstring(d.started)) + "\n";
     }
@@ -2806,7 +3813,13 @@ static void SendDownloads() {
     UiPost(L"{\"t\":\"downloads\",\"items\":" + DownloadsJson() + L"}");
 }
 
+static const UINT kTimerDownloads = 13;
+struct Download;
+static void DownloadState(Download* d, ICoreWebView2DownloadOperation* op);
+
 static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) {
+    bool priv = false;
+    if (Tab* from = FindTab(tabId)) priv = from->priv;
     // A tab opened only to fetch a file (it never showed a page) steps aside at once and closes once the file is
     // finished, as in Chrome. Closing it sooner left the file half done: WebView2 never finished a download whose
     // page was gone (the whole file sat as a .tmp at 0%).
@@ -2816,8 +3829,9 @@ static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) 
         t->core->get_CanGoBack(&back);
         if (!back && (t->title.empty() || t->url == L"about:blank")) {
             closeTab = tabId;
-            size_t i = IndexOf(tabId);
-            if (g.activeId == tabId && g.tabs.size() > 1) Activate(g.tabs[i > 0 ? i - 1 : i + 1]->id);
+            auto tabs = SpaceTabs(t->space);
+            size_t i = std::find(tabs.begin(), tabs.end(), t) - tabs.begin();
+            if (g.activeId == tabId && tabs.size() > 1) Activate(tabs[i > 0 ? i - 1 : i + 1]->id);
         }
     }
     ComPtr<ICoreWebView2DownloadOperation> op;
@@ -2828,6 +3842,7 @@ static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) 
     d.op = op;
     d.closeTab = closeTab;
     d.tab = tabId;
+    d.priv = priv;
     d.state = L"progress";
     d.started = NowSeconds();
     LPWSTR uri = nullptr, path = nullptr;
@@ -2856,8 +3871,16 @@ static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) 
         }).Get(), &tok);
     op->add_StateChanged(Callback<ICoreWebView2StateChangedEventHandler>(
         [id](ICoreWebView2DownloadOperation* op, IUnknown*) -> HRESULT {
-            Download* d = FindDownload(id);
-            if (!d) return S_OK;
+            if (Download* d = FindDownload(id)) DownloadState(d, op);
+            return S_OK;
+        }).Get(), &tok);
+    SetTimer(g.hwnd, kTimerDownloads, 1000, nullptr);
+    SendDownloads();
+}
+
+// A download's state as WebView2 has it now: done, stopped (cancelled or failed) or still going.
+static void DownloadState(Download* d, ICoreWebView2DownloadOperation* op) {
+            int id = d->id;
             COREWEBVIEW2_DOWNLOAD_STATE state;
             op->get_State(&state);
             LPWSTR path = nullptr;
@@ -2880,12 +3903,31 @@ static void TrackDownload(ICoreWebView2DownloadStartingEventArgs* a, int tabId) 
                 d->op.Reset();
                 if (d->closeTab) PostMessageW(g.hwnd, WM_COMMAND, MAKEWPARAM(1, 0), (LPARAM)d->closeTab);
                 d->closeTab = 0;
+                if (d->little) LittleDownloaded(d->little);
+                d->little = nullptr;
                 SaveDownloads();
             }
             SendDownloads();
-            return S_OK;
-        }).Get(), &tok);
-    SendDownloads();
+}
+
+// Every second while a download runs, its state is read again: its "finished" event never comes once the page that
+// started it is gone (a file stayed "in progress" at 418 of 418 MB, finished on disk). Without its operation left to
+// ask, a file at its full size on disk is done.
+static void DownloadTick() {
+    bool running = false;
+    for (auto& d : g_downloads) {
+        if (d.state != L"progress" && d.state != L"paused") continue;
+        if (d.op) DownloadState(&d, d.op.Get());
+        else if (WIN32_FILE_ATTRIBUTE_DATA info; !d.path.empty() && GetFileAttributesExW(d.path.c_str(), GetFileExInfoStandard, &info) &&
+                 d.total > 0 && (((INT64)info.nFileSizeHigh << 32) | info.nFileSizeLow) == d.total) {
+            d.state = L"done";
+            d.received = d.total;
+            SaveDownloads();
+            SendDownloads();
+        }
+        running = running || d.state == L"progress" || d.state == L"paused";
+    }
+    if (!running) KillTimer(g.hwnd, kTimerDownloads);
 }
 
 static void DownloadAction(const std::wstring& verb, int id) {
@@ -2962,7 +4004,8 @@ static std::wstring StateJson() {
     return L"{\"settings\":{" + values + L"},\"theme\":" + Json(g.theme) + L",\"sources\":" + SourcesJson() + L",\"engine\":" +
            Json(Take(engine)) + L",\"history\":" + std::to_wstring(g.history.size()) + L",\"bookmarks\":" +
            std::to_wstring(g.bookmarks.size()) + L",\"shield\":" + (shield.empty() ? L"null" : Wide(shield)) +
-           L",\"version\":" + Json(EXO_VERSION_W) + L",\"registered\":" + Bool(IsRegistered()) + L",\"isDefault\":" + Bool(IsDefaultBrowser()) + L"}";
+           L",\"version\":" + Json(EXO_VERSION_W) + L",\"registered\":" + Bool(IsRegistered()) + L",\"isDefault\":" + Bool(IsDefaultBrowser()) +
+           L",\"transparency\":" + Bool(WindowsTransparency()) + L"}";
 }
 
 static std::wstring HistoryJson() {
@@ -2993,7 +4036,7 @@ using ApiReply = std::function<void(const std::string& body, const wchar_t* type
 
 static void ApiData(const std::wstring& path, ApiReply reply) {
     if (path == L"/ntp.json") reply(Utf8(NewTabJson()), L"application/json", 200);
-    else if (path == L"/state.json") reply(Utf8(StateJson()), L"application/json", 200);
+    else if (path == L"/state.json") WhenBrowsersKnown([reply] { reply(Utf8(StateJson()), L"application/json", 200); });
     else if (path == L"/bookmarks.json") reply(Utf8(BookmarksJson()), L"application/json", 200);
     else if (path == L"/history.json") reply(Utf8(HistoryJson()), L"application/json", 200);
     else if (path == L"/downloads.json") reply(Utf8(DownloadsJson(true)), L"application/json", 200);
@@ -3104,12 +4147,13 @@ static void CloseOverlay(bool tell = true) {
     if (!g.overlay) return;
     g.overlay = false;
     if (tell) UiPost(L"{\"t\":\"overlay.closed\"}");
-    SetBlur(false);
+    SetBlur(g.peekId != 0);
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
     AutoHideTrack(pt, false);
-    if (Tab* a = Active(); a && a->ctl) FocusTarget(a->id);
+    if (Tab* p = FindTab(g.peekId); p && p->ctl) FocusTarget(p->id);
+    else if (Tab* a = Active(); a && a->ctl) FocusTarget(a->id);
 }
 
 static void SetFullscreen(bool on) {
@@ -3149,6 +4193,22 @@ static void LeaveFullscreen() {
     SetFullscreen(false);
 }
 
+// Air Traffic Control (Settings > Spaces): "routes" is site=space|site=space. A link from another app to that site, or
+// to any of its subdomains, opens in that space; anything else in the space on screen.
+static int RouteFor(const std::wstring& url) {
+    std::wstring site = SiteOf(url);
+    if (site.empty()) return 0;
+    for (auto& r : Split(Setting(L"routes", L""), L'|')) {
+        size_t eq = r.find(L'=');
+        if (eq == std::wstring::npos || eq == 0) continue;
+        std::wstring want = r.substr(0, eq);
+        int id = _wtoi(r.c_str() + eq + 1);
+        bool sub = site.size() > want.size() && site.compare(site.size() - want.size() - 1, want.size() + 1, L"." + want) == 0;
+        if (FindSpace(id) && (site == want || sub)) return id;
+    }
+    return 0;
+}
+
 static void Navigate(const std::wstring& url, bool newTab) {
     Tab* a = Active();
     if (newTab || !a) {
@@ -3161,10 +4221,141 @@ static void Navigate(const std::wstring& url, bool newTab) {
     QueueState();
 }
 
+// ---------------------------------------------------------------------------------------
+// Copy link (Ctrl+Shift+C, Search's Copy link, a tab's menu): the tab's address without the tracking parts sites and
+// their share buttons add to it (utm_ and the ad networks' click ids everywhere; si on YouTube and Spotify, s and t on X).
+
+static std::wstring CleanUrl(const std::wstring& url) {
+    size_t q = url.find(L'?');
+    if (q == std::wstring::npos) return url;
+    size_t hash = url.find(L'#', q);
+    std::wstring query = url.substr(q + 1, hash == std::wstring::npos ? std::wstring::npos : hash - q - 1);
+    std::wstring site = SiteOf(url);
+    auto on = [&](std::initializer_list<const wchar_t*> sites) {
+        for (std::wstring x : sites)
+            if (site == x || (site.size() > x.size() && site.compare(site.size() - x.size() - 1, std::wstring::npos, L"." + x) == 0)) return true;
+        return false;
+    };
+    static const std::unordered_set<std::wstring> kTrackers = {
+        L"fbclid", L"gclid", L"dclid", L"gbraid", L"wbraid", L"gclsrc", L"msclkid", L"yclid", L"ttclid", L"twclid", L"li_fat_id",
+        L"mc_cid", L"mc_eid", L"igshid", L"igsh", L"_hsenc", L"_hsmi", L"mkt_tok", L"oly_anon_id", L"oly_enc_id", L"rb_clickid",
+        L"vero_id", L"wickedid", L"_gl", L"ref_src", L"ref_url", L"srsltid", L"epik", L"s_cid", L"spm"};
+    std::wstring kept;
+    for (auto& part : Split(query, L'&')) {
+        if (part.empty()) continue;
+        std::wstring name = part.substr(0, part.find(L'='));
+        for (auto& c : name) c = towlower(c);
+        bool track = name.rfind(L"utm_", 0) == 0 || kTrackers.count(name)
+            || (name == L"si" && on({L"youtube.com", L"youtu.be", L"spotify.com"}))
+            || ((name == L"s" || name == L"t") && on({L"x.com", L"twitter.com"}))
+            || (part == L"feature=shared" && on({L"youtube.com", L"youtu.be"}));
+        if (!track) kept += (kept.empty() ? L"" : L"&") + part;
+    }
+    return url.substr(0, q) + (kept.empty() ? L"" : L"?" + kept) + (hash == std::wstring::npos ? L"" : url.substr(hash));
+}
+
+static bool CopyText(const std::wstring& text) {
+    if (!OpenClipboard(g.hwnd)) return false;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    bool ok = false;
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        memcpy(GlobalLock(mem), text.c_str(), bytes);
+        GlobalUnlock(mem);
+        ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        if (!ok) GlobalFree(mem);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+static void CopyLink(Tab* t) {
+    if (!t || t->url.empty() || IsNewTab(t->url)) return;
+    std::wstring clean = CleanUrl(t->url);
+    if (CopyText(clean)) Toast(clean == t->url ? L"Link copied" : L"Link copied without its trackers");
+}
+
+// ---------------------------------------------------------------------------------------
+// Ctrl+Tab: the space's tabs in the order you used them, as Alt+Tab goes through windows. A quick Ctrl+Tab goes back
+// to the tab you were on before; held, the switcher shows after a moment and each Tab moves along it (Shift back).
+// Letting go of Ctrl opens the one chosen (going round to the first stays; Windows keeps Ctrl+Esc for Start). Settings >
+// General can make Ctrl+Tab go along the strip instead.
+
+static const UINT kTimerSwitcher = 14;
+static const ULONGLONG kSwitcherShowMs = 160;
+struct Switcher { std::vector<int> ids; size_t sel = 0; ULONGLONG at = 0; bool shown = false; };
+static Switcher g_switcher;
+
+static void SwitcherSend() {
+    std::wstring ids;
+    for (int id : g_switcher.ids) ids += (ids.empty() ? L"" : L",") + std::to_wstring(id);
+    UiPost(L"{\"t\":\"switcher\",\"ids\":[" + ids + L"],\"sel\":" + std::to_wstring(g_switcher.sel) + L"}");
+}
+
+static void SwitcherEnd(bool go) {
+    if (g_switcher.ids.empty()) return;
+    KillTimer(g.hwnd, kTimerSwitcher);
+    int id = go ? g_switcher.ids[g_switcher.sel] : 0;
+    bool shown = g_switcher.shown;
+    g_switcher = {};
+    if (shown) UiPost(L"{\"t\":\"switcher\",\"ids\":[]}");
+    if (id && id != g.activeId && FindTab(id)) Activate(id);
+}
+
+static void SwitcherStep(int step) {
+    if (g_switcher.ids.empty()) {
+        auto tabs = SpaceTabs(g.space);
+        if (tabs.size() < 2) return;
+        // The tab on screen, then the others by when they were last on screen; ones never opened keep the strip's order.
+        std::stable_sort(tabs.begin(), tabs.end(), [](Tab* a, Tab* b) {
+            UINT64 x = a->id == g.activeId ? ~0ull : a->left, y = b->id == g.activeId ? ~0ull : b->left;
+            return x > y;
+        });
+        for (Tab* t : tabs) g_switcher.ids.push_back(t->id);
+        g_switcher.sel = step > 0 ? 1 : tabs.size() - 1;
+        g_switcher.at = GetTickCount64();
+        SetTimer(g.hwnd, kTimerSwitcher, 15, nullptr);
+        return;
+    }
+    size_t n = g_switcher.ids.size();
+    g_switcher.sel = (g_switcher.sel + n + step) % n;
+    g_switcher.shown = true;
+    SwitcherSend();
+}
+
+static void SwitcherForget(int id) {
+    auto it = std::find(g_switcher.ids.begin(), g_switcher.ids.end(), id);
+    if (it == g_switcher.ids.end()) return;
+    size_t at = it - g_switcher.ids.begin();
+    g_switcher.ids.erase(it);
+    if (g_switcher.ids.size() < 2) { SwitcherEnd(false); return; }
+    if (g_switcher.sel > at || g_switcher.sel >= g_switcher.ids.size()) g_switcher.sel = g_switcher.sel ? g_switcher.sel - 1 : 0;
+    if (g_switcher.shown) SwitcherSend();
+}
+
+static void SwitcherTick() {
+    if (g_switcher.ids.empty()) { KillTimer(g.hwnd, kTimerSwitcher); return; }
+    if (GetAsyncKeyState(VK_CONTROL) >= 0) { SwitcherEnd(true); return; }
+    if (!g_switcher.shown && GetTickCount64() - g_switcher.at >= kSwitcherShowMs) {
+        g_switcher.shown = true;
+        SwitcherSend();
+    }
+}
+
+static void OnUiMessage(const std::wstring& msg);
+// Ctrl+Shift+=: a new tab page beside the tab on screen, in split view.
+static void OnUiMessageSplitNew() { OnUiMessage(L"split\t0"); }
+
 static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     Tab* a = Active();
+    if (g.peekId && !g.overlay) {
+        if (vk == VK_ESCAPE && !ctrl && !alt) { ClosePeek(); return true; }
+        if (vk == 'O' && ctrl && !alt && !shift) { ExpandPeek(); return true; }
+    }
+    if (ctrl && shift && !alt && (vk == VK_OEM_PLUS || vk == VK_ADD) && !repeat) { OnUiMessageSplitNew(); return true; }
     if (ctrl && !alt) {
+        if (vk == VK_TAB && Setting(L"ctrlTab", L"recent") == L"recent") { SwitcherStep(shift ? -1 : 1); return true; }
         if (vk == VK_TAB || vk == VK_NEXT || vk == VK_PRIOR) {
             CycleTab((vk == VK_PRIOR || (vk == VK_TAB && shift)) ? -1 : 1);
             return true;
@@ -3172,10 +4363,11 @@ static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
         if (repeat) return vk == 'T' || vk == 'L' || vk == 'K' || vk == 'W' || vk == 'D' || vk == 'N' || vk == 'H' || vk == 'J';
         switch (vk) {
         case 'T': if (shift) ReopenClosed(); else NewTabPage(); return true;
-        case 'N': if (!shift) { NewTabPage(); return true; } return false;
+        case 'N': if (shift) AddTab(kNewTab, true, NextPlace(), true); else NewTabPage(); return true;
         case 'D': if (!shift && a) ToggleBookmark(a->url, a->title); return !shift;
         case 'E': if (shift) { UiPost(L"{\"t\":\"extensions.open\"}"); return true; } return false;
-        case 'H': if (!shift) { OpenSettings(L"history"); return true; } return false;
+        case 'H': if (!shift) { OpenSettings(L"history-full"); return true; } return false;
+        case 'C': if (shift) { CopyLink(a); return true; } return false;
         case 'J': if (!shift) { OpenSettings(L"downloads"); return true; } return false;
         case 'L': OpenOverlay(L"edit"); return true;
         case 'K': if (g.overlay && g.tabs.size()) UiPost(L"{\"t\":\"close\"}"); else OpenOverlay(L"palette"); return true;
@@ -3183,15 +4375,29 @@ static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
         case 'F': if (!shift && a) { LeaveFullscreen(); UiPost(L"{\"t\":\"find\"}"); FocusTarget(kUi); } return !shift;
         case 'R': if (fromUi && a && a->core) a->core->Reload(); return fromUi;
         }
-        if (vk >= '1' && vk <= '9' && !g.tabs.empty()) {
-            size_t i = vk == '9' ? g.tabs.size() - 1 : std::min<size_t>(vk - '1', g.tabs.size() - 1);
-            Activate(g.tabs[i]->id);
+        if (vk >= '1' && vk <= '9') {
+            // The tabs as the strip shows them: with side tabs, none inside a closed folder.
+            auto tabs = SpaceTabs(g.space);
+            if (Setting(L"tabs", L"horizontal") == L"vertical")
+                std::erase_if(tabs, [](Tab* t) {
+                    for (TabFolder* f = t->pinned ? FindFolder(t->folder) : nullptr; f; f = FindFolder(f->parent))
+                        if (!f->open) return true;
+                    return false;
+                });
+            if (tabs.empty()) return false;
+            size_t i = vk == '9' ? tabs.size() - 1 : std::min<size_t>(vk - '1', tabs.size() - 1);
+            Activate(tabs[i]->id);
             return true;
         }
         return false;
     }
     if (repeat) return false;
     if (alt && !ctrl) {
+        // Alt+1 to Alt+9: the spaces, in their order (with one space, the page keeps the keys).
+        if (!shift && vk >= '1' && vk <= '9' && g.spaces.size() > 1 && size_t(vk - '1') < g.spaces.size()) {
+            SwitchSpace(g.spaces[vk - '1'].id);
+            return true;
+        }
         if (vk == 'D') { OpenOverlay(L"edit"); return true; }
         if (fromUi && a && a->core && (vk == VK_LEFT || vk == VK_RIGHT)) {
             if (vk == VK_LEFT) a->core->GoBack(); else a->core->GoForward();
@@ -3207,6 +4413,311 @@ static bool HandleKey(UINT vk, bool repeat, bool fromUi) {
     case VK_ESCAPE: if (g.fullscreen && !g.elementFullscreen && !fromUi) { SetFullscreen(false); return true; } return false;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------------------
+// Little Exo (Settings > General > Links from other apps): a link from another app opens in a small window of its own
+// over what you're doing, so a quick look never lands in your tabs. Its strip says where it is and offers Open in Exo
+// Browser (Ctrl+O), which moves the page into a tab of the space its site belongs to; Ctrl+W closes it. Arc's Little
+// Arc, Exo's way. A site with a space of its own (Air Traffic Control) still opens in that space.
+
+static const wchar_t kLittleClass[] = L"ExoLittleWindow";
+static const int kLittleStripDip = 44;
+struct Little {
+    HWND hwnd = nullptr;
+    bool downloading = false;  // a file it started is still coming: closing it only hides it until then
+    ComPtr<ICoreWebView2Controller> stripCtl, pageCtl;
+    ComPtr<ICoreWebView2> strip, page;
+    std::wstring url, title;
+    bool loading = true;
+};
+static std::vector<std::unique_ptr<Little>> g_littles;
+
+static Little* LittleOf(HWND hwnd) {
+    for (auto& l : g_littles) if (l->hwnd == hwnd) return l.get();
+    return nullptr;
+}
+
+static void LittleLayout(Little* l) {
+    RECT rc;
+    GetClientRect(l->hwnd, &rc);
+    int strip = MulDiv(kLittleStripDip, GetDpiForWindow(l->hwnd), 96);
+    if (l->stripCtl) l->stripCtl->put_Bounds({0, 0, rc.right, strip});
+    if (l->pageCtl) l->pageCtl->put_Bounds({0, strip, rc.right, rc.bottom});
+}
+
+// The window's caption in the Appearance, and the strip's news: where the page is, its title, whether it loads.
+static void LittleTell(Little* l) {
+    BOOL dark = g.theme != L"light";
+    DwmSetWindowAttribute(l->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
+    COLORREF caption = g.page;
+    DwmSetWindowAttribute(l->hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof caption);
+    SetWindowTextW(l->hwnd, (l->title.empty() ? SiteOf(l->url) : l->title).c_str());
+    if (l->strip)
+        l->strip->PostWebMessageAsJson((L"{\"t\":\"little\",\"url\":" + Json(l->url) + L",\"title\":" + Json(l->title) +
+                                        L",\"loading\":" + Bool(l->loading) + L",\"theme\":" + Json(g.theme) + L"}").c_str());
+}
+
+// A download from a Little Exo window: the window stays until the file is done, then goes if it was closed meanwhile.
+static void LittleDownload(HWND hwnd) {
+    if (!g_downloads.empty()) g_downloads.back().little = hwnd;
+}
+
+// Its downloads all done: the window closes if it was closed meanwhile.
+static void LittleDownloaded(HWND hwnd) {
+    Little* l = LittleOf(hwnd);
+    if (!l || std::any_of(g_downloads.begin(), g_downloads.end(), [hwnd](auto& d) { return d.little == hwnd && (d.state == L"progress" || d.state == L"paused"); }))
+        return;
+    l->downloading = false;
+    if (!IsWindowVisible(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
+static void LittlesTheme() {
+    for (auto& l : g_littles) LittleTell(l.get());
+}
+
+// Into the window: a tab in the space its site belongs to, on screen. (Closed with a message: never from inside one of
+// its own pages' events.)
+static void LittleToTab(Little* l) {
+    std::wstring url = l->url;
+    PostMessageW(l->hwnd, WM_CLOSE, 0, 0);
+    if (url.empty()) return;
+    if (IsIconic(g.hwnd)) ShowWindow(g.hwnd, SW_RESTORE);
+    SetForegroundWindow(g.hwnd);
+    CloseOverlay();
+    if (int space = RouteFor(url)) EnterSpace(space);
+    AddTab(url, true, NextPlace());
+}
+
+static void LittleCopy(Little* l) {
+    if (!l->url.empty() && CopyText(CleanUrl(l->url)) && l->strip) l->strip->PostWebMessageAsJson(L"{\"t\":\"copied\"}");
+}
+
+static void LittleKeys(ICoreWebView2Controller* c, HWND hwnd) {
+    EventRegistrationToken tok;
+    c->add_AcceleratorKeyPressed(Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+        [hwnd](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* a) -> HRESULT {
+            COREWEBVIEW2_KEY_EVENT_KIND kind;
+            a->get_KeyEventKind(&kind);
+            Little* l = LittleOf(hwnd);
+            bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
+            if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN || !l || !ctrl || alt) return S_OK;
+            UINT vk = 0;
+            a->get_VirtualKey(&vk);
+            if (vk == 'O' && !shift) LittleToTab(l);
+            else if (vk == 'W' && !shift) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            else if (vk == 'C' && shift) LittleCopy(l);
+            else return S_OK;
+            a->put_Handled(TRUE);
+            return S_OK;
+        }).Get(), &tok);
+}
+
+static LRESULT CALLBACK LittleProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Little* l = LittleOf(hwnd);
+    switch (msg) {
+    case WM_CLOSE:
+        // A file it started is still coming (WebView2 never finishes one whose page is gone): out of sight till then.
+        if (l && l->downloading) { ShowWindow(hwnd, SW_HIDE); return 0; }
+        break;
+    case WM_SIZE:
+        if (l) {
+            LittleLayout(l);
+            BOOL shown = wp != SIZE_MINIMIZED;
+            if (l->pageCtl) l->pageCtl->put_IsVisible(shown);
+            if (l->stripCtl) l->stripCtl->put_IsVisible(shown);
+        }
+        return 0;
+    case WM_MOVE:
+        if (l && l->pageCtl) l->pageCtl->NotifyParentWindowPositionChanged();
+        if (l && l->stripCtl) l->stripCtl->NotifyParentWindowPositionChanged();
+        break;
+    case WM_DPICHANGED: {
+        RECT* r = (RECT*)lp;
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+    case WM_ACTIVATE:
+        if (l && LOWORD(wp) != WA_INACTIVE && l->pageCtl) l->pageCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        break;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(g.page);
+        FillRect((HDC)wp, &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    case WM_DESTROY: {
+        auto it = std::find_if(g_littles.begin(), g_littles.end(), [hwnd](auto& x) { return x->hwnd == hwnd; });
+        if (it != g_littles.end()) {
+            if ((*it)->pageCtl) (*it)->pageCtl->Close();
+            if ((*it)->stripCtl) (*it)->stripCtl->Close();
+            g_littles.erase(it);
+        }
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenLittle(const std::wstring& url) {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = LittleProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = kLittleClass;
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    // In the middle of the screen the pointer is on; each one more a step down and right.
+    POINT pt;
+    GetCursorPos(&pt);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT wa = mi.rcWork;
+    int w = std::min<int>(MulDiv(780, g.dpi, 96), wa.right - wa.left), h = std::min<int>(MulDiv(640, g.dpi, 96), wa.bottom - wa.top);
+    int step = MulDiv(28, g.dpi, 96) * (int)(g_littles.size() % 5);
+    HWND hwnd = CreateWindowExW(0, kLittleClass, L"Little Exo", WS_OVERLAPPEDWINDOW, wa.left + (wa.right - wa.left - w) / 2 + step,
+                                wa.top + (wa.bottom - wa.top - h) / 2 + step, w, h, nullptr, nullptr, inst, nullptr);
+    if (!hwnd) return;
+    auto little = std::make_unique<Little>();
+    little->hwnd = hwnd;
+    little->url = url;
+    g_littles.push_back(std::move(little));
+    LittleTell(g_littles.back().get());
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    SetForegroundWindow(hwnd);
+
+    ComPtr<ICoreWebView2ControllerOptions> opts;
+    g.env->CreateCoreWebView2ControllerOptions(&opts);
+    opts->put_ProfileName(L"Default");
+    // The strip, in Exo's look (ui/little.html).
+    g.env->CreateCoreWebView2ControllerWithOptions(hwnd, opts.Get(), Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+        [hwnd](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
+            Little* l = LittleOf(hwnd);
+            if (!l || FAILED(hr) || !c) {
+                if (c) c->Close();
+                return S_OK;
+            }
+            l->stripCtl = c;
+            c->get_CoreWebView2(&l->strip);
+            if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c2)))) c2->put_DefaultBackgroundColor(NewTabColor());
+            ComPtr<ICoreWebView2Settings> s;
+            l->strip->get_Settings(&s);
+            s->put_IsStatusBarEnabled(FALSE);
+            s->put_IsZoomControlEnabled(FALSE);
+            s->put_AreDefaultContextMenusEnabled(FALSE);
+            s->put_AreDevToolsEnabled(FALSE);
+            if (ComPtr<ICoreWebView2_3> c3; SUCCEEDED(l->strip.As(&c3)))
+                c3->SetVirtualHostNameToFolderMapping(L"exo.browser", (g.exeDir + L"\\ui").c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+            EventRegistrationToken tok;
+            if (ComPtr<ICoreWebView2Controller4> c4; SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c4)))) c4->put_AllowExternalDrop(FALSE);
+            l->strip->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                [hwnd](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+                    LPWSTR m = nullptr, source = nullptr;
+                    a->get_Source(&source);
+                    Little* l = LittleOf(hwnd);
+                    if (!l || Take(source) != L"https://exo.browser/little.html" || FAILED(a->TryGetWebMessageAsString(&m))) return S_OK;
+                    std::wstring msg = Take(m);
+                    if (msg == L"ready") LittleTell(l);
+                    else if (msg == L"open") LittleToTab(l);
+                    else if (msg == L"copy") LittleCopy(l);
+                    return S_OK;
+                }).Get(), &tok);
+            LittleKeys(c, hwnd);
+            LittleLayout(l);
+            l->strip->Navigate(L"https://exo.browser/little.html");
+            return S_OK;
+        }).Get());
+    // The page, on your profile like your tabs, with your boosts; a link it opens in a new window becomes a tab.
+    g.env->CreateCoreWebView2ControllerWithOptions(hwnd, opts.Get(), Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+        [hwnd](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
+            Little* l = LittleOf(hwnd);
+            if (!l || FAILED(hr) || !c) {
+                if (c) c->Close();
+                return S_OK;
+            }
+            l->pageCtl = c;
+            c->get_CoreWebView2(&l->page);
+            // White under a page that paints no background of its own, as in a tab.
+            if (ComPtr<ICoreWebView2Controller2> c2; SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c2)))) c2->put_DefaultBackgroundColor({255, 255, 255, 255});
+            l->page->AddScriptToExecuteOnDocumentCreated(BoostScript().c_str(), nullptr);
+            EventRegistrationToken tok;
+            l->page->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
+                [hwnd](ICoreWebView2* core, ICoreWebView2SourceChangedEventArgs*) -> HRESULT {
+                    if (Little* l = LittleOf(hwnd)) {
+                        LPWSTR u = nullptr;
+                        core->get_Source(&u);
+                        l->url = Take(u);
+                        LittleTell(l);
+                    }
+                    return S_OK;
+                }).Get(), &tok);
+            l->page->add_DocumentTitleChanged(Callback<ICoreWebView2DocumentTitleChangedEventHandler>(
+                [hwnd](ICoreWebView2* core, IUnknown*) -> HRESULT {
+                    if (Little* l = LittleOf(hwnd)) {
+                        LPWSTR t = nullptr;
+                        core->get_DocumentTitle(&t);
+                        l->title = Take(t);
+                        LittleTell(l);
+                    }
+                    return S_OK;
+                }).Get(), &tok);
+            l->page->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+                [hwnd](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs*) -> HRESULT {
+                    if (Little* l = LittleOf(hwnd)) { l->loading = true; LittleTell(l); }
+                    return S_OK;
+                }).Get(), &tok);
+            l->page->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                [hwnd](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
+                    if (Little* l = LittleOf(hwnd)) {
+                        l->loading = false;
+                        LittleTell(l);
+                        RecordVisit(l->url, l->title);
+                    }
+                    return S_OK;
+                }).Get(), &tok);
+            l->page->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a) -> HRESULT {
+                    // A popup the page sized or placed (a sign-in) opens as a window of its own and can answer the page;
+                    // a link in a new window becomes a tab.
+                    ComPtr<ICoreWebView2WindowFeatures> features;
+                    BOOL sized = FALSE, placed = FALSE;
+                    if (SUCCEEDED(a->get_WindowFeatures(&features)) && features) { features->get_HasSize(&sized); features->get_HasPosition(&placed); }
+                    if (sized || placed) return S_OK;
+                    LPWSTR u = nullptr;
+                    a->get_Uri(&u);
+                    std::wstring url = Take(u);
+                    a->put_Handled(TRUE);
+                    if (url.rfind(L"http", 0) == 0) {
+                        AddTab(url, true, NextPlace());
+                        if (IsIconic(g.hwnd)) ShowWindow(g.hwnd, SW_RESTORE);
+                        SetForegroundWindow(g.hwnd);
+                    }
+                    return S_OK;
+                }).Get(), &tok);
+            l->page->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+                [hwnd](ICoreWebView2*, IUnknown*) -> HRESULT {
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return S_OK;
+                }).Get(), &tok);
+            if (ComPtr<ICoreWebView2_4> c4; SUCCEEDED(l->page.As(&c4)))
+                c4->add_DownloadStarting(Callback<ICoreWebView2DownloadStartingEventHandler>(
+                    [hwnd](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* a) -> HRESULT {
+                        TrackDownload(a, 0);
+                        if (Little* l = LittleOf(hwnd)) { l->downloading = true; LittleDownload(hwnd); }
+                        return S_OK;
+                    }).Get(), &tok);
+            LittleKeys(c, hwnd);
+            LittleLayout(l);
+            l->page->Navigate(l->url.c_str());
+            if (GetForegroundWindow() == hwnd) c->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            return S_OK;
+        }).Get());
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3254,7 +4765,8 @@ static const UINT kTimerUpdate = 12;
 static const UINT kUpdateEveryMs = 12 * 60 * 60 * 1000;
 
 // What the page shows: idle, checking, current, available, downloading, installing or error.
-struct UpdateNews { std::wstring state, latest, message, file; int percent = -1; bool quiet = false; };
+// notes: the newer release's whats-new.json (its What's New items, which the page checks before showing).
+struct UpdateNews { std::wstring state, latest, message, file; int percent = -1; bool quiet = false; std::wstring notes; };
 static UpdateNews g_update{L"idle"};
 static bool g_updateBusy = false;
 
@@ -3277,14 +4789,14 @@ static void SendUpdate() {
     UiPost(L"{\"t\":\"update\",\"state\":" + Json(g_update.state) + L",\"version\":" + Json(EXO_VERSION_W) + L",\"latest\":" +
            Json(g_update.latest) + L",\"message\":" + Json(g_update.message) + L",\"percent\":" + std::to_wstring(g_update.percent) +
            L",\"checked\":" + std::to_wstring(_wtoi64(Setting(L"updateChecked", L"0").c_str())) + L",\"installable\":" +
-           (InstalledCopy() ? L"true" : L"false") + L"}");
+           (InstalledCopy() ? L"true" : L"false") + L",\"notes\":" + Json(g_update.notes) + L"}");
 }
 
 static void PostUpdate(HWND hwnd, UpdateNews news) { PostMessageW(hwnd, WM_APP_UPDATE, 0, (LPARAM)new UpdateNews(std::move(news))); }
 
 // One HTTPS GET, off the UI thread: the body, or into a file with progress, or (follow off) a redirect's Location.
 static bool HttpGet(const std::wstring& url, std::string* body, std::wstring* location = nullptr, HANDLE file = nullptr,
-                    const std::function<void(int)>& progress = nullptr) {
+                    const std::function<void(int)>& progress = nullptr, size_t limit = 1024 * 1024) {
     wchar_t host[256] = {}, path[2048] = {};
     URL_COMPONENTS u{sizeof u};
     u.lpszHostName = host;
@@ -3329,7 +4841,7 @@ static bool HttpGet(const std::wstring& url, std::string* body, std::wstring* lo
                         if (!WriteFile(file, buffer.data(), read, &written, nullptr) || written != read) { ok = false; break; }
                     } else if (body) {
                         body->append(buffer.data(), read);
-                        if (body->size() > 1024 * 1024) { ok = false; break; }  // a page, not a release note: not what was asked
+                        if (body->size() > limit) { ok = false; break; }  // a page, not what was asked (a release note, a feed)
                     }
                     got += read;
                     if (progress && total) {
@@ -3394,6 +4906,10 @@ static void UpdateCheck(bool quiet) {
             } else {
                 news.latest = tag;
                 news.state = Newer(tag) ? L"available" : L"current";
+                // Its What's New, from beside its Setup (none on a release without one).
+                std::string notes;
+                if (news.state == L"available" && HttpGet(std::wstring(kReleases) + L"/download/v" + tag + L"/whats-new.json", &notes) && notes.size() <= 64 * 1024)
+                    news.notes = Wide(notes);
             }
         }
         PostUpdate(hwnd, std::move(news));
@@ -3410,8 +4926,9 @@ static void UpdateInstall() {
         return;
     }
     g_updateBusy = true;
-    std::wstring version = g_update.latest;
+    std::wstring version = g_update.latest, notes = g_update.notes;
     g_update = {L"downloading", version};
+    g_update.notes = notes;
     g_update.percent = 0;
     SendUpdate();
     std::wstring dir = g.dataDir + L"\\Updates";
@@ -3471,6 +4988,8 @@ static void OnUpdateNews(UpdateNews* raw) {
         SaveSettings();
         Toast(L"Exo Browser " + news->latest + L" is ready to install. Settings \x203A About");
     }
+    // The install's own news keeps the notes its check brought.
+    if (news->notes.empty() && !news->latest.empty() && news->latest == g_update.latest) news->notes = g_update.notes;
     g_update = *news;
     // EXO_UPDATE_DRYRUN: a test build stops here, with Setup downloaded and checked but not run.
     if (news->state == L"installing" && GetEnvironmentVariableW(L"EXO_UPDATE_DRYRUN", nullptr, 0) > 0) {
@@ -3508,6 +5027,87 @@ static void CleanUpdates() {
         if (!(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((dir + L"\\" + d.cFileName).c_str());
     } while (FindNextFileW(find, &d));
     FindClose(find);
+}
+
+// ---------------------------------------------------------------------------------------
+// Live folders: each one's feed, asked for when it's made, a moment after start and every 30 minutes, only for the
+// feeds you follow (the site sees the address it's asked from and "ExoBrowser/<version>"). The page reads the posts
+// out of it; the newest copy of each is kept for a page that loads again.
+
+static const UINT WM_APP_FEED = WM_APP + 8;  // wParam: the folder's id; lParam: new std::string* (the feed, or empty)
+static const UINT kTimerFeeds = 15;
+static std::unordered_map<int, std::string> g_feeds;
+
+static void SendFeed(int id) {
+    auto it = g_feeds.find(id);
+    if (it == g_feeds.end()) return;
+    // UTF-8 unless its declaration says Latin-1 (ISO-8859-1, or Windows-1252, which browsers read it as).
+    std::string head = it->second.substr(0, 200);
+    for (auto& c : head) c = (char)tolower((unsigned char)c);
+    std::wstring xml;
+    if (head.find("iso-8859-1") != std::string::npos || head.find("windows-1252") != std::string::npos) {
+        xml.resize(MultiByteToWideChar(1252, 0, it->second.data(), (int)it->second.size(), nullptr, 0));
+        MultiByteToWideChar(1252, 0, it->second.data(), (int)it->second.size(), xml.data(), (int)xml.size());
+    } else xml = Wide(it->second);
+    UiPost(L"{\"t\":\"feed\",\"id\":" + std::to_wstring(id) + L",\"xml\":" + Json(xml) + L"}");
+}
+
+// A feed cut to its newest few posts, all the page reads: some feeds carry whole articles, megabytes of them.
+static std::string FeedHead(std::string xml) {
+    bool atom = xml.find("<rss") == std::string::npos && xml.find("<feed") != std::string::npos;
+    const char* tag = atom ? "<entry" : "<item";
+    size_t at = std::string::npos;
+    for (int n = 0; n < 9; n++) {
+        at = xml.find(tag, at == std::string::npos ? 0 : at + 1);
+        if (at == std::string::npos) return xml;
+    }
+    xml.resize(at);
+    return xml + (atom ? "</feed>" : "</channel></rss>");
+}
+
+static void FetchFeed(const TabFolder& f) {
+    if (f.feed.rfind(L"https://", 0) != 0) return;
+    HWND hwnd = g.hwnd;
+    int id = f.id;
+    std::wstring url = f.feed;
+    std::thread([hwnd, id, url] {
+        auto body = new std::string;
+        if (!HttpGet(url, body, nullptr, nullptr, nullptr, 8 * 1024 * 1024)) body->clear();
+        else *body = FeedHead(std::move(*body));
+        PostMessageW(hwnd, WM_APP_FEED, (WPARAM)id, (LPARAM)body);
+    }).detach();
+}
+
+static void FeedsTick() {
+    SetTimer(g.hwnd, kTimerFeeds, 30 * 60 * 1000, nullptr);
+    for (auto& f : g.folders) if (!f.feed.empty()) FetchFeed(f);
+}
+
+// A tab's site into a live folder: the feed its page names (<link rel="alternate">), a folder named after the site.
+static void FollowSite(Tab* t) {
+    if (!t || !t->core || !t->space || (t->url.rfind(L"https://", 0) != 0 && t->url.rfind(L"http://", 0) != 0)) return;
+    int id = t->id;
+    t->core->ExecuteScript(LR"js((() => {
+  const l = document.querySelector('link[rel~="alternate"][type*="rss"], link[rel~="alternate"][type*="atom"], link[rel~="alternate"][type*="feed"]');
+  return l ? new URL(l.getAttribute('href'), location.href).href : '';
+})())js", Callback<ICoreWebView2ExecuteScriptCompletedHandler>([id](HRESULT hr, LPCWSTR json) -> HRESULT {
+        Tab* t = FindTab(id);
+        std::wstring feed = SUCCEEDED(hr) && json ? std::wstring(json) : L"";
+        if (feed.size() >= 2 && feed.front() == L'"') feed = feed.substr(1, feed.size() - 2);
+        if (!t || feed.rfind(L"https://", 0) != 0) {
+            Toast(L"This site has no feed to follow");
+            return S_OK;
+        }
+        for (auto& f : g.folders)
+            if (f.feed == feed && f.space == t->space) { Toast(L"Already in " + f.name); return S_OK; }
+        std::wstring name = SiteOf(t->url);
+        g.folders.push_back({g.nextFolder++, t->space, 0, name.empty() ? L"Live folder" : name, true, feed});
+        SaveSpaces();
+        QueueState();
+        FetchFeed(g.folders.back());
+        SetTimer(g.hwnd, kTimerFeeds, 30 * 60 * 1000, nullptr);
+        return S_OK;
+    }).Get());
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3580,6 +5180,7 @@ static void VaultOpened(vault::Opened& o) {
     vault::Adopt(o.key);
     vault::Wipe(o.key);
     g_vaultActive = GetTickCount64();
+    SetTimer(g.hwnd, kTimerVault, 20 * 1000, nullptr);  // its auto-lock, only while it's open
     VaultPost(L"opened", L",\"json\":" + Json(Wide(o.json)));
     vault::Wipe(o.json);
     VaultState();
@@ -3612,6 +5213,7 @@ static void OnVaultJob(VaultJob* job) {
 
 static void VaultLock() {
     g_vaultEpoch++;
+    KillTimer(g.hwnd, kTimerVault);
     if (!vault::Unlocked()) return;
     vault::Lock();
     VaultPost(L"locked");
@@ -4007,9 +5609,9 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
             return job;
         });
     } else if (v == L"vaultSources") {
-        VaultSources();
+        WhenBrowsersKnown(VaultSources);
     } else if (v == L"vaultImportBrowser") {
-        if (vault::Unlocked()) VaultImportBrowser(arg(1));
+        if (vault::Unlocked()) WhenBrowsersKnown([key = arg(1)] { VaultImportBrowser(key); });
     } else if (v == L"vaultCopy") {
         std::string text = FromB64(arg(1));
         VaultCopy(text);
@@ -4028,8 +5630,8 @@ static void OnVaultMessage(const std::vector<std::wstring>& p) {
     } else if (v == L"vaultFocusTab") {
         // Back to the page after the fill menu (a click there gave the chrome page the keyboard).
         if (FindTab(_wtoi(arg(1).c_str()))) FocusTarget(_wtoi(arg(1).c_str()));
-    } else if (v == L"vaultHot") {
-        // The fill menu's and the save prompt's places, "x,y,w,h;..." in the chrome page's pixels; none when closed.
+    } else if (v == L"hot") {
+        // The fill menu's, the save prompt's and Peek's buttons' places, "x,y,w,h;..." in the chrome page's pixels; none when closed.
         float k = Scale();
         g_uiHot.clear();
         for (auto& item : Split(arg(1), L';')) {
@@ -4073,6 +5675,8 @@ static void OnUiMessage(const std::wstring& msg) {
         SendState();
         for (auto& t : g.tabs) if (!t->favicon.empty()) SendFavicon(t.get());
         SendHistory();
+        SendArchive();
+        for (auto& [id, xml] : g_feeds) SendFeed(id);
         UiPost(L"{\"t\":\"bookmarks\",\"items\":" + BookmarksJson() + L"}");
         SendExtensions();
         SendUpdate();
@@ -4125,30 +5729,244 @@ static void OnUiMessage(const std::wstring& msg) {
             }
         }
     } else if (v == L"pin") {
-        if (Tab* t = FindTab(argId(1))) {
+        // Pinned, a tab keeps the page it's on as its own; unpinned, a favorite leaves the favorites too.
+        if (Tab* t = FindTab(argId(1)); t && !t->priv) {
             t->pinned = !t->pinned;
-            // Pinned tabs lead the strip.
-            std::stable_partition(g.tabs.begin(), g.tabs.end(), [](auto& x) { return x->pinned; });
+            t->home = t->pinned ? t->url : L"";
+            if (!t->pinned) t->folder = 0;
+            if (!t->pinned && t->space == 0) t->space = g.space;
+            Order();
             MarkSessionDirty();
             QueueState();
         }
+    } else if (v == L"favorite") {
+        // A favorite is in every space, pinned to its page; taken out, it stays pinned in the space on screen.
+        if (Tab* t = FindTab(argId(1)); t && !t->priv) {
+            if (t->space == 0) t->space = g.space;
+            else { t->space = 0; t->folder = 0; if (!t->pinned) { t->pinned = true; t->home = t->url; } }
+            Order();
+            MarkSessionDirty();
+            QueueState();
+        }
+    } else if (v == L"home") {
+        // Back to the pinned tab's own page.
+        if (Tab* t = FindTab(argId(1)); t && !t->home.empty()) {
+            if (t->core) t->core->Navigate(t->home.c_str());
+            else t->url = t->pendingNav = t->home;
+            Activate(t->id);
+        }
+    } else if (v == L"rehome") {
+        // The page it's on becomes the pinned tab's own.
+        if (Tab* t = FindTab(argId(1)); t && t->pinned && !t->url.empty()) { t->home = t->url; MarkSessionDirty(); QueueState(); }
     } else if (v == L"move") {
+        // To a place among its space's tabs.
         size_t from = IndexOf(argId(1)), to = (size_t)argId(2);
-        if (from < g.tabs.size() && to < g.tabs.size() && from != to) {
+        if (from < g.tabs.size()) {
             auto t = std::move(g.tabs[from]);
             g.tabs.erase(g.tabs.begin() + from);
-            g.tabs.insert(g.tabs.begin() + to, std::move(t));
+            // Places count the way the strip shows them: the favorites first, then the space's tabs.
+            std::vector<size_t> at;
+            for (size_t i = 0; i < g.tabs.size(); i++)
+                if (g.tabs[i]->space == t->space || (t->space != 0 && g.tabs[i]->space == 0)) at.push_back(i);
+            size_t i = to < at.size() ? at[to] : at.empty() ? g.tabs.size() : at.back() + 1;
+            g.tabs.insert(g.tabs.begin() + i, std::move(t));
+            Order();
             MarkSessionDirty();
             QueueState();
         }
+    } else if (v == L"space") {
+        SwitchSpace(argId(1));
+    } else if (v == L"spaceNew") {
+        // A new space, on screen at once: with the tab given (Move to › New space), else a new tab page.
+        if (g.spaces.size() < 32) {
+            Space s{g.nextSpace++, arg(1).empty() ? L"Space " + std::to_wstring(g.spaces.size() + 1) : arg(1), arg(2), arg(3)};
+            g.spaces.push_back(s);
+            SaveSpaces();
+            if (Tab* t = FindTab(argId(4))) MoveToSpace(t, s.id, true);
+            else SwitchSpace(s.id);
+            QueueState();
+        }
+    } else if (v == L"spaceEdit") {
+        if (Space* s = FindSpace(argId(1))) {
+            const std::wstring& field = arg(2);
+            if (field == L"name" && !arg(3).empty()) s->name = arg(3);
+            else if (field == L"icon") s->icon = arg(3);
+            else if (field == L"color") s->color = arg(3);
+            else if (field == L"theme") s->theme = arg(3);
+            SaveSpaces();
+            if (field == L"theme") ThemeChanged();
+            QueueState();
+        }
+    } else if (v == L"spaceMove") {
+        size_t from = (size_t)argId(1), to = (size_t)argId(2);
+        if (from < g.spaces.size() && to < g.spaces.size() && from != to) {
+            Space s = g.spaces[from];
+            g.spaces.erase(g.spaces.begin() + from);
+            g.spaces.insert(g.spaces.begin() + to, s);
+            SaveSpaces();
+            QueueState();
+        }
+    } else if (v == L"importArc") {
+        // Arc's sidebar, as the page read it: each space (one of the same name is reused), then its tabs, all asleep
+        // until opened. Favorites come first and go in every space. Arc's own habit comes too: tabs archive after 12 hours,
+        // unless you've chosen otherwise.
+        int space = g.space, spacesMade = 0, made = 0;
+        long long now = _time64(nullptr);
+        std::unordered_map<std::wstring, int> folderOf;  // Arc's folders, as Exo's
+        for (size_t i = 1; i < p.size(); i++) {
+            auto f = Split(p[i], L'\x1f');
+            if (f[0] == L"F" && f.size() >= 4 && !f[1].empty()) {
+                // A pinned folder (one of the same name in the same place is reused).
+                auto up = folderOf.find(f[2]);
+                int parent = up == folderOf.end() ? 0 : up->second;
+                std::wstring name = f[3].empty() ? L"Folder" : f[3].substr(0, 60);
+                auto same = std::find_if(g.folders.begin(), g.folders.end(), [&](auto& x) { return x.space == space && x.parent == parent && x.name == name; });
+                if (same != g.folders.end()) folderOf[f[1]] = same->id;
+                else { g.folders.push_back({g.nextFolder++, space, parent, name, true}); folderOf[f[1]] = g.folders.back().id; }
+                continue;
+            }
+            if (f[0] == L"S" && f.size() >= 4 && !f[1].empty()) {
+                auto same = std::find_if(g.spaces.begin(), g.spaces.end(), [&](auto& x) { return _wcsicmp(x.name.c_str(), f[1].c_str()) == 0; });
+                if (same != g.spaces.end()) space = same->id;
+                else if (g.spaces.size() < 32) { g.spaces.push_back({g.nextSpace++, f[1].substr(0, 40), f[2], f[3]}); space = g.spaces.back().id; spacesMade++; }
+            } else if (f[0] == L"T" && f.size() >= 4 && (f[2].rfind(L"https://", 0) == 0 || f[2].rfind(L"http://", 0) == 0)) {
+                int in = f[1] == L"f" ? 0 : space;
+                bool pinned = f[1] != L"t";
+                if (std::any_of(g.tabs.begin(), g.tabs.end(), [&](auto& t) { return t->space == in && (t->url == f[2] || t->home == f[2]); })) continue;
+                auto t = std::make_unique<Tab>();
+                t->id = g.nextId++;
+                t->url = t->pendingNav = f[2];
+                t->title = f[3];
+                t->pinned = pinned;
+                if (pinned) t->home = f[2];
+                t->space = in;
+                if (auto it = folderOf.find(f.size() >= 5 ? f[4] : L""); pinned && in && it != folderOf.end()) t->folder = it->second;
+                t->seen = now;
+                t->lastActive = GetTickCount64();
+                if (auto it = g.favicons.find(SiteOf(t->url)); it != g.favicons.end()) t->favicon = it->second;
+                g.tabs.push_back(std::move(t));
+                made++;
+            }
+        }
+        Order();
+        SaveSpaces();
+        if (Setting(L"archive", L"").empty()) { g.settings[L"archive"] = L"12h"; SaveSettings(); SendSettings(); }
+        MarkSessionDirty();
+        QueueState();
+        UiPost(L"{\"t\":\"arcImported\",\"spaces\":" + std::to_wstring(spacesMade) + L",\"tabs\":" + std::to_wstring(made) + L"}");
+    } else if (v == L"split") {
+        // The tab given (none: a new tab page) joins the split of the tab on screen, beside it, at most 4.
+        Tab* a2 = Active();
+        if (a2 && !a2->peek) {
+            if (!a2->split) a2->split = g.nextSplit++;
+            int group = a2->split;
+            if (std::count_if(g.tabs.begin(), g.tabs.end(), [group](auto& x) { return x->split == group; }) < 4) {
+                Tab* t = FindTab(argId(1));
+                if (!t) t = AddTab(kNewTab, false, IndexOf(a2->id) + 1);
+                if (t != a2 && !t->peek) {
+                    if (t->split && t->split != group)
+                        if (int old = t->split; std::count_if(g.tabs.begin(), g.tabs.end(), [old](auto& x) { return x->split == old; }) <= 2)
+                            for (auto& x : g.tabs) if (x->split == old) x->split = 0;
+                    t->split = group;
+                    t->space = a2->space ? a2->space : g.space;
+                    // Beside the last pane, so the split reads left to right as it shows.
+                    size_t from = IndexOf(t->id), after = IndexOf(a2->id);
+                    for (size_t j = 0; j < g.tabs.size(); j++) if (g.tabs[j]->split == group && j != from) after = j;
+                    auto up = std::move(g.tabs[from]);
+                    g.tabs.erase(g.tabs.begin() + from);
+                    if (from < after) after--;
+                    g.tabs.insert(g.tabs.begin() + std::min(after + 1, g.tabs.size()), std::move(up));
+                    g.activeId = t->id;
+                }
+            }
+            if (std::count_if(g.tabs.begin(), g.tabs.end(), [group](auto& x) { return x->split == group; }) < 2) a2->split = 0;
+            ShowActive();
+            if (Tab* now = Active(); now && now->ctl) FocusTarget(now->id);
+        }
+    } else if (v == L"unsplit") {
+        if (Tab* t = FindTab(argId(1)); t && t->split) {
+            int group = t->split;
+            for (auto& x : g.tabs) if (x->split == group) x->split = 0;
+            ShowActive();
+        }
+    } else if (v == L"peekOpen") {
+        ExpandPeek();
+    } else if (v == L"peekClose") {
+        ClosePeek();
+    } else if (v == L"spaceDelete") {
+        DeleteSpace(argId(1));
+    } else if (v == L"toSpace") {
+        if (Tab* t = FindTab(argId(1))) MoveToSpace(t, argId(2), false);
+    } else if (v == L"folderNew") {
+        // A folder among the space's pinned tabs (inside another, when given), with the tab given in it.
+        Tab* t = FindTab(argId(3));
+        int space = t && t->space ? t->space : g.space;
+        TabFolder* up = FindFolder(argId(1));
+        TabFolder f{g.nextFolder++, space, up && up->space == space ? up->id : 0, arg(2).empty() ? L"New folder" : arg(2).substr(0, 60), true};
+        g.folders.push_back(f);
+        if (t && t->space) {
+            t->folder = f.id;
+            if (!t->pinned) { t->pinned = true; t->home = t->url; }
+        }
+        Order();
+        SaveSpaces();
+        MarkSessionDirty();
+        QueueState();
+    } else if (v == L"folderEdit") {
+        if (TabFolder* f = FindFolder(argId(1))) {
+            if (arg(2) == L"name" && !arg(3).empty()) f->name = arg(3).substr(0, 60);
+            else if (arg(2) == L"open") f->open = arg(3) == L"1";
+            SaveSpaces();
+            QueueState();
+        }
+    } else if (v == L"folderDelete") {
+        // What it held moves up to where it was.
+        if (TabFolder* f = FindFolder(argId(1))) {
+            int id = f->id, parent = f->parent;
+            for (auto& x : g.folders) if (x.parent == id) x.parent = parent;
+            for (auto& t : g.tabs) if (t->folder == id) t->folder = parent;
+            g.folders.erase(std::remove_if(g.folders.begin(), g.folders.end(), [id](const TabFolder& x) { return x.id == id; }), g.folders.end());
+            Order();
+            SaveSpaces();
+            MarkSessionDirty();
+            QueueState();
+        }
+    } else if (v == L"follow") {
+        FollowSite(FindTab(argId(1)));
+    } else if (v == L"feedRefresh") {
+        if (TabFolder* f = FindFolder(argId(1)); f && !f->feed.empty()) FetchFeed(*f);
+    } else if (v == L"toFolder") {
+        // Into a folder of its own space (pinned, as everything there is), or out of folders with 0.
+        if (Tab* t = FindTab(argId(1)); t && t->space && !t->priv) {
+            TabFolder* f = FindFolder(argId(2));
+            if (!f || (f->space == t->space && f->feed.empty())) {
+                t->folder = f ? f->id : 0;
+                if (f && !t->pinned) { t->pinned = true; t->home = t->url; }
+                Order();
+                MarkSessionDirty();
+                QueueState();
+            }
+        }
+    } else if (v == L"zap") {
+        StartZap(FindTab(argId(1)));
+    } else if (v == L"zapEnd") {
+        EndZap();
+    } else if (v == L"privateTab") {
+        AddTab(kNewTab, true, NextPlace(), true);
+    } else if (v == L"copyLink") {
+        CopyLink(FindTab(argId(1)));
+    } else if (v == L"switchTo") {
+        SwitcherEnd(false);
+        Activate(argId(1));
     } else if (v == L"duplicate") {
-        if (Tab* t = FindTab(argId(1)); t && !t->url.empty()) AddTab(t->url, true, IndexOf(t->id) + 1);
+        if (Tab* t = FindTab(argId(1)); t && !t->url.empty()) AddTab(t->url, true, IndexOf(t->id) + 1, t->priv);
     } else if (v == L"sleep") {
         if (Tab* t = FindTab(argId(1)); t && t->id != g.activeId) { Discard(t); QueueState(); }
     } else if (v == L"closeOthers") {
         int keep = argId(1);
+        Tab* kept = FindTab(keep);
         std::vector<int> ids;
-        for (auto& t : g.tabs) if (t->id != keep && !t->pinned) ids.push_back(t->id);
+        for (auto& t : g.tabs) if (kept && t->id != keep && !t->pinned && t->space == kept->space) ids.push_back(t->id);
         for (int id : ids) CloseTab(id);
     } else if (v == L"reopen") {
         ReopenClosed();
@@ -4177,7 +5995,7 @@ static void OnUiMessage(const std::wstring& msg) {
     } else if (v == L"bookmarksImport") {
         ImportBookmarksFile();
     } else if (v == L"importSources") {
-        SendImportSources();
+        WhenBrowsersKnown(SendImportSources);
     } else if (v == L"chrome") {
         // The page's chrome: top px, sidebar px, auto-hide.
         g.chromeTopDip = std::max(0, argId(1));
@@ -4272,7 +6090,7 @@ static void OnUiMessage(const std::wstring& msg) {
         g.sidebarDip = std::max(0, argId(1));
         Layout();
     } else if (v == L"import") {
-        Import(arg(1));
+        WhenBrowsersKnown([key = arg(1)] { Import(key); });
     } else if (v == L"extensions") {
         SendExtensions();
     } else if (v == L"extInstall") {
@@ -4306,6 +6124,9 @@ static void OnUiMessage(const std::wstring& msg) {
     } else if (v == L"set") {
         g.settings[arg(1)] = arg(2);
         SaveSettings();
+        if (arg(1) == L"boosts") ApplyBoosts();
+        if (arg(1) == L"material") ApplyBackdrop();
+        ArmSleep();  // the archive may have been turned on
         if (arg(1) == L"appearance") {
             ApplyTheme();
             g.profileReady = false;
@@ -4340,9 +6161,11 @@ static std::wstring BrowserArguments() {
 
 static void RestoreSession() {
     size_t active = 0;
+    std::vector<std::pair<int, size_t>> last;
     bool fresh = Setting(L"startup", L"restore") == L"fresh";
     for (auto& row : fresh ? std::vector<std::vector<std::wstring>>{} : ReadTable(L"session.tsv")) {
         if (row[0] == L"active" && row.size() > 1) active = (size_t)_wtoi(row[1].c_str());
+        if (row[0] == L"last" && row.size() > 2) last.push_back({_wtoi(row[1].c_str()), (size_t)_wtoi(row[2].c_str())});
         if (row[0] != L"tab" || row.size() < 3) continue;
         auto t = std::make_unique<Tab>();
         t->id = g.nextId++;
@@ -4350,15 +6173,53 @@ static void RestoreSession() {
         t->pendingNav = row[1];
         t->title = row[2];
         t->pinned = row.size() > 3 && row[3] == L"1";
+        // A space that's gone (or a session from before spaces): the space on screen. 0 is a favorite.
+        int space = row.size() > 4 ? _wtoi(row[4].c_str()) : -1;
+        t->space = (space == 0 && t->pinned) || FindSpace(space) ? space : g.space;
+        if (t->pinned) t->home = row.size() > 5 && !row[5].empty() ? row[5] : t->url;
+        t->seen = row.size() > 6 ? _wtoi64(row[6].c_str()) : 0;
+        if (t->seen <= 0) t->seen = _time64(nullptr);
+        t->split = row.size() > 7 ? _wtoi(row[7].c_str()) : 0;
+        if (TabFolder* f = row.size() > 8 && t->pinned ? FindFolder(_wtoi(row[8].c_str())) : nullptr; f && f->space == t->space) t->folder = f->id;
+        g.nextSplit = std::max(g.nextSplit, t->split + 1);
         // An asleep tab shows its site's icon from last time, not a blank globe, until it loads.
         if (auto it = g.favicons.find(SiteOf(t->url)); it != g.favicons.end()) t->favicon = it->second;
         g.tabs.push_back(std::move(t));
     }
-    // Only the tab on screen loads; the rest wait, asleep, until they are opened.
-    for (auto& u : g.startupUrls) AddTab(u, false, g.tabs.size());
-    if (!g.startupUrls.empty()) active = g.tabs.size() - 1;
-    if (!g.tabs.empty()) Activate(g.tabs[std::min(active, g.tabs.size() - 1)]->id);
+    for (auto& [id, i] : last)
+        if (Space* s = FindSpace(id); s && i < g.tabs.size() && (g.tabs[i]->space == id || g.tabs[i]->space == 0)) s->last = g.tabs[i]->id;
+    // Only the tab on screen loads; the rest wait, asleep, until they are opened. It's the one last on screen in the
+    // space last on screen (an address another app opened goes there too).
+    // An address another app opened Exo Browser with goes to its route's space, if it has one.
+    for (auto& u : g.startupUrls) {
+        if (int space = RouteFor(u)) g.space = space;
+        AddTab(u, false, g.tabs.size());
+    }
+    Tab* show = g.startupUrls.empty() ? nullptr : g.tabs.back().get();
+    if (Space* s = FindSpace(g.space); !show && s && FindTab(s->last)) show = FindTab(s->last);
+    if (!show && active < g.tabs.size() && (g.tabs[active]->space == g.space || g.tabs[active]->space == 0)) show = g.tabs[active].get();
+    if (!show) if (auto tabs = SpaceTabs(g.space); !tabs.empty()) show = tabs[0];
+    if (show) Activate(show->id);
     else NewTabPage();
+}
+
+static void InitBrowser();
+
+// The engine turns a window away while the last one on this profile is still closing: its engine keeps the profile to
+// itself until it has gone, a moment after its window (an update's restart, a quick reopen). Instead of staying an
+// empty window, Exo Browser asks again every quarter second for 15 seconds, and only then says why.
+static void EngineFailed(HRESULT hr) {
+    static int tries = 0;
+    g.env.Reset();
+    bool missing = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == E_NOINTERFACE;  // none, or too old
+    if (!missing && ++tries < 60) {
+        SetTimer(nullptr, 0, 250, [](HWND, UINT, UINT_PTR id, DWORD) { KillTimer(nullptr, id); InitBrowser(); });
+        return;
+    }
+    wchar_t why[160] = L"Exo Browser needs the Microsoft Edge WebView2 Runtime.";
+    if (!missing) swprintf_s(why, L"Exo Browser's engine didn't start (error 0x%08X). Open it again in a moment.", (unsigned)hr);
+    MessageBoxW(g.hwnd, why, L"Exo Browser", MB_ICONERROR);
+    PostQuitMessage(1);
 }
 
 static void CreateUi() {
@@ -4370,7 +6231,7 @@ static void CreateUi() {
     g.env->CreateCoreWebView2CompositionControllerWithOptions(g.hwnd, opts.Get(),
         Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
             [](HRESULT hr, ICoreWebView2CompositionController* comp) -> HRESULT {
-                if (FAILED(hr) || !comp) return S_OK;
+                if (FAILED(hr) || !comp) { EngineFailed(hr); return S_OK; }
                 g.uiComp = comp;
                 comp->QueryInterface(IID_PPV_ARGS(&g.uiCtl));
                 g.uiCtl->get_CoreWebView2(&g.ui);
@@ -4437,7 +6298,6 @@ static void CreateUi() {
             }).Get());
 }
 
-
 static void InitBrowser() {
     BuiltinFolder(L"exo-shield");
     auto options = Make<CoreWebView2EnvironmentOptions>();
@@ -4452,18 +6312,16 @@ static void InitBrowser() {
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(hr) || !env || FAILED(env->QueryInterface(IID_PPV_ARGS(&g.env)))) {
-                    MessageBoxW(g.hwnd, L"Exo Browser needs the Microsoft Edge WebView2 Runtime.", L"Exo Browser", MB_ICONERROR);
-                    PostQuitMessage(1);
+                    EngineFailed(FAILED(hr) ? hr : E_NOINTERFACE);
                     return S_OK;
                 }
                 CreateUi();
-                RestoreSession();
+                // A second try finds the session restored already, only without its pages' views.
+                if (g.tabs.empty()) RestoreSession();
+                else ShowActive();
                 return S_OK;
             }).Get());
-    if (FAILED(hr)) {
-        MessageBoxW(g.hwnd, L"Exo Browser needs the Microsoft Edge WebView2 Runtime.", L"Exo Browser", MB_ICONERROR);
-        PostQuitMessage(1);
-    }
+    if (FAILED(hr)) EngineFailed(hr);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4490,6 +6348,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDBLCLK;
         bool up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP || msg == WM_XBUTTONUP;
         int target = g.capture ? g.capture : HitTarget(pt);
+        if (target == kPeekAround) {
+            if (down) ClosePeek();
+            return 0;
+        }
         if (msg == WM_MOUSEMOVE && !g.capture) AutoHideTrack(pt, false);
         if (msg == WM_MOUSEMOVE) {
             if (!g.tracking) {
@@ -4506,6 +6368,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_captureUp = msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK ? WM_RBUTTONUP : msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK ? WM_MBUTTONUP
                         : msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK ? WM_XBUTTONUP : WM_LBUTTONUP;
             if (g.focus != target) FocusTarget(target);
+            if (target > 0 && target != g.activeId && target != g.peekId && FindTab(target)) { g.activeId = target; QueueState(); }
         }
         if (g.capture) g_capturePt = pt;
         if (msg == WM_MBUTTONUP) g_middleUpAt = GetTickCount64();
@@ -4658,6 +6521,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_UPDATE:
         OnUpdateNews((UpdateNews*)lp);
         return 0;
+    case WM_APP_FEED: {
+        std::unique_ptr<std::string> body((std::string*)lp);
+        if (!body->empty() && FindFolder((int)wp)) {
+            g_feeds[(int)wp] = std::move(*body);
+            SendFeed((int)wp);
+        }
+        return 0;
+    }
+    case WM_APP_SCANNED: {
+        std::unique_ptr<std::vector<Browser>> found((std::vector<Browser>*)lp);
+        g_browsers = std::move(*found);
+        g_browsersAt = GetTickCount64();
+        auto waiting = std::move(g_scanWaiters);
+        g_scanWaiters.clear();
+        for (auto& then : waiting) then();
+        return 0;
+    }
     case WM_APP_ICON: {
         std::unique_ptr<std::pair<std::wstring, std::wstring>> icon((std::pair<std::wstring, std::wstring>*)lp);
         if (icon->second.empty()) g_iconMiss[icon->first] = NowSeconds();
@@ -4683,6 +6563,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;
     }
     case WM_SETTINGCHANGE:
+        if (lp && wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") == 0) ApplyBackdrop();  // Transparency effects on or off
         if (Setting(L"appearance", L"void") == L"match" && lp && wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
             ApplyTheme();
             SendSettings();
@@ -4695,9 +6576,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COPYDATA: {
         auto* cd = (COPYDATASTRUCT*)lp;
         std::wstring url = OpenArgument(std::wstring((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t)));
+        if (url.rfind(L"http", 0) == 0 && Setting(L"little", L"off") == L"on" && !RouteFor(url) && g.env) {
+            OpenLittle(url);
+            return TRUE;
+        }
         if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
-        if (!url.empty()) { CloseOverlay(); Navigate(url, true); }
+        if (!url.empty()) {
+            CloseOverlay();
+            if (int space = RouteFor(url)) EnterSpace(space);
+            AddTab(url, true, NextPlace());
+        }
         return TRUE;
     }
     case WM_TIMER:
@@ -4714,10 +6603,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!in && !(top && (g.overlay || g.pinned))) Reveal(top, false);
             return 0;
         }
+        if (wp == kTimerDownloads) { DownloadTick(); return 0; }
+        if (wp == kTimerSwitcher) { SwitcherTick(); return 0; }
+        if (wp == kTimerFeeds) { FeedsTick(); return 0; }
         if (wp == kTimerSleep) {
             SleepTick();
             if (g.historyDirty) SaveHistory();
             if (g.faviconsDirty) SaveFavicons();
+            if (!SleepWork()) { KillTimer(hwnd, kTimerSleep); g_sleepArmed = false; }
         } else if (wp == WM_APP_DOWNLOADS) {
             KillTimer(hwnd, WM_APP_DOWNLOADS);
             SendDownloads();
@@ -4801,6 +6694,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.dataDir = DataDir();
     for (auto& row : ReadTable(L"settings.tsv"))
         if (row.size() >= 2) g.settings[row[0]] = row[1];
+    LoadSpaces();
+    for (auto& row : ReadTable(L"archive.tsv"))
+        if (row.size() >= 3 && !row[0].empty()) g.archive.push_back({row[0], row[1], _wtoi64(row[2].c_str())});
     LoadHistory();
     for (auto& row : ReadTable(L"bookmarks.tsv"))
         if (row.size() >= 2) g.bookmarks.push_back({row[0], row[1]});
@@ -4869,15 +6765,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.dpi = GetDpiForWindow(g.hwnd);
     ApplyTheme();
     InitComposition();
+    ApplyBackdrop();
     RegisterDragDrop(g.hwnd, new DropTarget());
     SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     ShowWindow(g.hwnd, maximized ? SW_SHOWMAXIMIZED : show);
     Layout();
+    // Its answer can come at once, inside this call (the window has to be there by then).
     InitBrowser();
-    SetTimer(g.hwnd, kTimerSleep, 30 * 1000, nullptr);
     SetTimer(g.hwnd, kTimerUpdate, 20 * 1000, nullptr);  // the first update check, once startup has settled
+    if (std::any_of(g.folders.begin(), g.folders.end(), [](auto& f) { return !f.feed.empty(); })) SetTimer(g.hwnd, kTimerFeeds, 15 * 1000, nullptr);
     CleanUpdates();
-    SetTimer(g.hwnd, kTimerVault, 20 * 1000, nullptr);
     WTSRegisterSessionNotification(g.hwnd, NOTIFY_FOR_THIS_SESSION);
     vault::HelloAvailable([](bool yes) { g_helloReady = yes; if (g.uiReady) VaultState(); });
 

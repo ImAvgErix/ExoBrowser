@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
 import { Button } from '../../components/ui/Button'
 import * as I from '../icons'
-import { onHost, send, useBrowser } from '../host'
+import { onHost, send, useBrowserValue } from '../host'
 import { b64, helloUnlock, loginsFor, neverSave, openVault, saveItem, newItem, setVault, useVault, vaultNow, type FillTarget, type Item, type Prompt } from './store'
 import { Avatar, summary, useOtp } from './parts'
 import { generate } from './generate'
 import { useRecipe } from './Editor'
+import { pageEdges } from '../menus'
 import { sameSite, siteName, siteOfUrl } from './sites'
 
 /*
@@ -29,18 +30,18 @@ function hideFill() {
   if (vaultNow().fill) setVault({ fill: null })
 }
 
-// The fill menu and the save prompt sit over the page: their places take the pointer while the page keeps the
-// keyboard. Measured a frame after they render (where they rest), sent again when they move or go.
+// The fill menu, the save prompt, Peek's buttons and Ctrl+Tab's switcher sit over the page: their places take the pointer while the page
+// keeps the keyboard. Measured a frame after they render (where they rest), sent again when they move or go.
 let hotFrame = 0
 let hotSent = ''
 export function reportHot() {
   cancelAnimationFrame(hotFrame)
   hotFrame = requestAnimationFrame(() => {
-    const spec = [...document.querySelectorAll('.exb-vault-fill, .exb-vault-prompt')].map(el => {
+    const spec = [...document.querySelectorAll('.exb-vault-fill, .exb-vault-prompt, .exb-peek-bar, .exb-switcher, .exb-zap-bar')].map(el => {
       const r = el.getBoundingClientRect()
       return [r.left, r.top, r.width, r.height].map(Math.round).join(',')
     }).join(';')
-    if (spec !== hotSent) { hotSent = spec; send('vaultHot', spec) }
+    if (spec !== hotSent) { hotSent = spec; send('hot', spec) }
   })
 }
 
@@ -134,7 +135,8 @@ function FillMenu({ target }: { target: FillTarget }) {
   const offers = v.state !== 'unlocked' ? target.kind === 'password' || target.pw : target.signup || target.kind === 'new-password' ||
     (target.kind === 'otp' ? logins.some(i => i.totp) : target.kind === 'card' ? (v.data?.items ?? []).some(i => i.type === 'card' && !i.trashed) : logins.length > 0)
   const width = Math.max(280, Math.min(target.w, 420))
-  const left = Math.max(8, Math.min(target.x, innerWidth - 8 - width))
+  const side = pageEdges().left
+  const left = Math.max(side ? side + 6 : 8, Math.min(target.x, innerWidth - 8 - width))
   const style = (above ? { left, bottom: innerHeight - target.y + 6, width } : { left, top: target.y + target.h + 6, width }) as CSSProperties
   // Placed here, not by the window's menu fitting: it would flip the menu over the field it belongs under.
   useLayoutEffect(() => {
@@ -187,10 +189,10 @@ function SavePrompt({ prompt }: { prompt: Prompt }) {
 
 export function VaultFill() {
   const v = useVault()
-  const b = useBrowser()
-  const url = b.tabs.find(t => t.id === b.active)?.url ?? ''
+  const active = useBrowserValue(b => b.active)
+  const url = useBrowserValue(b => b.tabs.find(t => t.id === b.active)?.url ?? '')
   // Another tab, or the page moving on, puts the menu away.
-  useEffect(() => { hideFill() }, [b.active, url])
+  useEffect(() => { hideFill() }, [active, url])
   // A sign-in waiting on the vault: once it opens, offer it again, now as save or update.
   useEffect(() => {
     if (v.state !== 'unlocked' || !pending) return
@@ -200,7 +202,7 @@ export function VaultFill() {
     if (p.username && same.some(i => i.password === p.password)) return
     setVault({ prompt: { ...p, update: p.username ? same[0]?.id : undefined } })
   }, [v.state])
-  const target = v.fill && v.fill.tab === b.active && sameSite(url, v.fill.origin) ? v.fill : null
+  const target = v.fill && v.fill.tab === active && sameSite(url, v.fill.origin) ? v.fill : null
   return (
     <>
       {target && !v.open ? <FillMenu target={target} /> : null}

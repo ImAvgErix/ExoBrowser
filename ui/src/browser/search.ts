@@ -14,6 +14,43 @@ export type EngineKey = keyof typeof ENGINES
 
 export const engineOf = (key: string | undefined) => ENGINES[(key ?? 'brave') as EngineKey] ?? ENGINES.brave
 
+/** A site search: its keyword (two or three letters no search starts with) and a space ("yt cats"), "@" and its name ("@youtube cats"), or its keyword or site and
+ *  Tab search that site, %s standing for what's typed. Settings › Search keeps the list. */
+export type SiteSearch = { name: string; key: string; url: string }
+export const SITE_SEARCHES: SiteSearch[] = [
+  { name: 'YouTube', key: 'yt', url: 'https://www.youtube.com/results?search_query=%s' },
+  { name: 'Wikipedia', key: 'wp', url: 'https://en.wikipedia.org/wiki/Special:Search?search=%s' },
+  { name: 'GitHub', key: 'gh', url: 'https://github.com/search?q=%s' },
+  { name: 'Reddit', key: 'rd', url: 'https://www.reddit.com/search/?q=%s' },
+  { name: 'Google Maps', key: 'gm', url: 'https://www.google.com/maps/search/%s' },
+  { name: 'Amazon', key: 'az', url: 'https://www.amazon.com/s?k=%s' },
+  { name: 'Twitch', key: 'tw', url: 'https://www.twitch.tv/search?term=%s' },
+  { name: 'Steam', key: 'stm', url: 'https://store.steampowered.com/search/?term=%s' },
+  { name: 'Google', key: 'gg', url: 'https://www.google.com/search?q=%s' },
+  { name: 'DuckDuckGo', key: 'ddg', url: 'https://duckduckgo.com/?q=%s' },
+]
+
+/** The site searches in Settings, or the built-in ones until they're changed. */
+export function siteSearches(json: string | undefined): SiteSearch[] {
+  if (!json) return SITE_SEARCHES
+  try {
+    const list = JSON.parse(json) as SiteSearch[]
+    return Array.isArray(list) ? list.filter(s => s && s.name && s.key && /^https?:\/\/.*%s/.test(s.url)) : SITE_SEARCHES
+  } catch { return SITE_SEARCHES }
+}
+
+/** The site search a word names: its keyword, "@" and its name without spaces, or its site ("youtube.com"). */
+export function siteSearchOf(word: string, list: SiteSearch[]) {
+  const w = word.toLowerCase()
+  if (!w) return null
+  return list.find(s => s.key.toLowerCase() === w)
+    ?? (w.startsWith('@') && w.length > 1 ? list.find(s => s.name.toLowerCase().replace(/\s+/g, '').startsWith(w.slice(1))) : undefined)
+    ?? list.filter(s => hostOf(s.url) === w.replace(/^www\./, '')).sort((a, z) => a.url.length - z.url.length)[0]
+    ?? null
+}
+
+export const siteSearchUrl = (s: SiteSearch, query: string) => s.url.replace('%s', enc(query))
+
 export function looksLikeUrl(text: string) {
   if (/\s/.test(text)) return false
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text) || /^(about|data|file|edge|view-source|chrome-extension):/i.test(text)) return true
@@ -22,9 +59,13 @@ export function looksLikeUrl(text: string) {
   return /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#].*)?$/i.test(text)
 }
 
-export function toUrl(text: string, engine: string | undefined) {
+export function toUrl(text: string, engine: string | undefined, sites: SiteSearch[] = []) {
   const t = text.trim()
   if (!t) return null
+  // "yt cats", "@youtube cats": that site's search.
+  const at = t.indexOf(' ')
+  const site = at > 0 ? siteSearchOf(t.slice(0, at), sites) : null
+  if (site && t.slice(at + 1).trim()) return siteSearchUrl(site, t.slice(at + 1).trim())
   if (looksLikeUrl(t)) {
     if (/^[a-z][a-z0-9+.-]*:/i.test(t)) return t
     return (/^(localhost|\d{1,3}(\.\d{1,3}){3})/.test(t) ? 'http://' : 'https://') + t

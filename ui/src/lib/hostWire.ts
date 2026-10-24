@@ -9,4 +9,14 @@ export type AppUpdateResponse = {
   latest?: string
   current?: string
   message?: string
+  upcoming?: WhatsNewWire
+}
+export type WhatsNewWire = {
+  version: string
+  items: WhatsNewItemWire[]
+}
+export type WhatsNewItemWire = {
+  icon: string
+  title: string
+  detail: string
 }

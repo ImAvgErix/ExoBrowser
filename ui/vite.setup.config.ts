@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+import pruneCss from './scripts/prune-css.mjs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
@@ -8,7 +9,7 @@ const root = dirname(fileURLToPath(import.meta.url))
 
 // Exo Browser Setup's screens (setup/src/main.cpp): built into setup/build/ui, then packed into ExoSetup.exe.
 export default defineConfig({
-  plugins: [react({ compiler: { target: '19' } }), tailwindcss()],
+  plugins: [react({ compiler: { target: '19' } }), tailwindcss(), pruneCss()],
   base: './',
   publicDir: false,
   build: {

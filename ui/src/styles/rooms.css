@@ -260,11 +260,12 @@
   color: var(--color-muted);
 }
 
-/* The app's slider at its compact size, a line under the title. */
+/* The app's slider at its compact size, a line under the title, wholly inside the song's button so the two never
+   share an edge: the seek takes presses on its line, the button the rest. */
 .exo-music-mini input.exo-mini-seek {
   position: absolute;
   left: 32px;
-  bottom: -3px;
+  bottom: 0;
   width: calc(100% - 40px);
 }
 

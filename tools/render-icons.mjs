@@ -43,8 +43,26 @@ function ico(pngs, sizes) {
 const browserSvg = readFileSync(new URL("brand/exo-browser.svg", root), "utf8");
 const shieldSvg = readFileSync(new URL("brand/exo-shield.svg", root), "utf8");
 
+// 16 to 24 px: the Horizon drawn on whole pixels (a heavier ring, the bar 2 px tall in a 1 px dark keyline, without
+// the slant), so the title bar and a 100% taskbar show it crisp; the tile and its rim are the drawing's own.
+// [ring radius, ring width, the keyline's left and right]
+const SMALL = { 16: [4, 2, 1, 15], 20: [5, 2, 2, 18], 24: [6.25, 2, 2, 22] };
+function small(svg, n) {
+  const defs = svg.slice(svg.indexOf("<defs>"), svg.indexOf("</defs>") + 7);
+  const tile = [...svg.matchAll(/<path d="[^"]+" fill="url\(#[ps]\)"\/>/g)].map((m) => m[0]).join("");
+  const rim = svg.match(/<path d="[^"]+" fill="none" stroke="url\(#r\)"[^>]*\/>/)[0];
+  const [r, width, x0, x1] = SMALL[n], c = n / 2;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n} ${n}">${defs}<g transform="scale(${n / 64})">${tile}${rim}</g>` +
+    `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="url(#w)" stroke-width="${width}"/>` +
+    `<rect x="${x0}" y="${c - 2}" width="${x1 - x0}" height="4" fill="#0a0a0c"/><rect x="${x0 + 1}" y="${c - 1}" width="${x1 - x0 - 2}" height="2" fill="#fff"/></svg>`;
+}
+
 const icoSizes = [16, 20, 24, 32, 40, 48, 64, 128, 256];
-const browserPngs = (await render(browserSvg, icoSizes)).map((b) => Buffer.from(b, "base64"));
+const browserPngs = [];
+for (const s of icoSizes) {
+  const [png] = await render(SMALL[s] ? small(browserSvg, s) : browserSvg, [s]);
+  browserPngs.push(Buffer.from(png, "base64"));
+}
 writeFileSync(new URL("src/app.ico", root), ico(browserPngs, icoSizes));
 writeFileSync(new URL("brand/exo-browser-256.png", root), browserPngs.at(-1));
 

@@ -3,7 +3,7 @@ import type { AppUpdateResponse } from './hostWire'
 import { report } from './report'
 import type { MusicPlayback, MusicService, MusicAction } from './music'
 import type { PlayerAction, PlayerActOptions, PlayerRoomState, PlayerView, PlayerViewData, PlayerViewOptions } from './player'
-import type { DiscordChannels, DiscordPlace, DiscordEvent, DiscordGuide, DiscordInvite, DiscordMemberSearch, DiscordResource, DiscordRole, DiscordUser, DiscordEmojis, DiscordFriend, DiscordGif, DiscordFavoriteGif, DiscordMemberList, DiscordProfile, DiscordProfileExtras, DiscordStickerGroup, DiscordThread, DiscordPresence, DiscordHome, DiscordReactionEvent, DiscordVoice, DiscordMessage, DiscordMessageEvent, DiscordSignInStep, DiscordState, DiscordStatus, DiscordUnread, DiscordNotice, DiscordForumTag, DiscordForYouItem, DiscordUnreadChannel, DiscordSearchFilters, DiscordShopCatalog, DiscordShopProduct, DiscordPaymentChoice, DiscordShopPrice, DiscordRailItem } from './discord'
+import type { DiscordChannels, DiscordPlace, DiscordEvent, DiscordGuide, DiscordInvite, DiscordMemberSearch, DiscordResource, DiscordRole, DiscordUser, DiscordEmojis, DiscordFriend, DiscordGif, DiscordFavoriteGif, DiscordMemberList, DiscordProfile, DiscordProfileExtras, DiscordGuildProfile, DiscordStickerGroup, DiscordThread, DiscordPresence, DiscordHome, DiscordReactionEvent, DiscordVoice, DiscordMessage, DiscordMessageEvent, DiscordSignInStep, DiscordState, DiscordStatus, DiscordUnread, DiscordNotice, DiscordForumTag, DiscordForYouItem, DiscordUnreadChannel, DiscordSearchFilters, DiscordShopCatalog, DiscordShopProduct, DiscordPaymentChoice, DiscordShopPrice, DiscordRailItem } from './discord'
 import type { CaptureExport, CaptureItem, CaptureSettings, CaptureState } from './capture'
 import type { AccountSettings, DiscordAccount, DiscordAccountAction, DiscordClientSettings } from './discordPrefs'
 import type { AppCommand, AppInfo, InteractionEvent } from './discordApps'
@@ -1071,6 +1071,19 @@ export function onHostEvent(event: string, handler: (data: unknown) => void) {
 
 const inflightReads = new Map<string, Promise<unknown>>()
 
+/** Hardware reads a room makes as it is built out of sight and again as it shows: an answer under 2 s old is still the
+ *  truth, so the second asks nothing. A change through the same method (any action but "state") reads fresh after it. */
+const RECENT_READS = new Set(['gpu.profile', 'gpu.display', 'hdr.state', 'system.health', 'gpu.driver'])
+const RECENT_MS = 2000
+const recentReads = new Map<string, { at: number; value: Promise<unknown> }>()
+/** A recent read's key ('' when the call isn't one); a change forgets that method's answers. */
+function recentRead(method: string, params?: Record<string, unknown>) {
+  if (!RECENT_READS.has(method)) return ''
+  if (params?.action === undefined || params.action === 'state') return `${method}:${JSON.stringify(params ?? {})}`
+  for (const k of recentReads.keys()) if (k.startsWith(`${method}:`)) recentReads.delete(k)
+  return ''
+}
+
 /** Reads that are safe to share while an identical call is already on the wire. */
 const COALESCE_READS = new Set([
   'library.get',
@@ -1084,19 +1097,23 @@ const COALESCE_READS = new Set([
   'shell.windowState',
 ])
 
-// Calls on their way to the host, so a room opened the first time can show once what it asked for has come back
-// (hostQuiet); a room never waits past its cap for a slow one. The Shaders engine's reads take seconds while it scans
-// and fill a page below System's first screen, so they never hold a room back.
-let inflight = 0
+// Calls on their way to the host (each with when it was made), so a room opened the first time can show once what it
+// asked for has come back (hostQuiet); a room never waits past its cap for a slow one, nor for calls made before it
+// opened (another room's slow read). The Shaders engine's reads take seconds while it scans and fill a page below
+// System's first screen, so they never hold a room back.
+const outstanding = new Map<number, number>()
+let nextCall = 0
 const UNGATED = new Set(['shaders.call'])
 const quietWaiters = new Set<() => void>()
-function settled() {
-  if (--inflight > 0) return
+function settled(call: number) {
+  outstanding.delete(call)
   for (const wake of quietWaiters) wake()
 }
 
-/** Resolves once no host call has been on its way for `quietMs`, or at `until` (a performance.now() time) at the latest. */
-export function hostQuiet(quietMs: number, until: number): Promise<void> {
+/** Resolves once no host call made at or after `since` has been on its way for `quietMs`, or at `until` at the latest
+ *  (both performance.now() times). */
+export function hostQuiet(quietMs: number, since: number, until: number): Promise<void> {
+  const busy = () => { for (const born of outstanding.values()) if (born >= since) return true; return false }
   return new Promise(resolve => {
     let timer = 0
     const finish = () => { window.clearTimeout(timer); quietWaiters.delete(check); resolve() }
@@ -1106,7 +1123,7 @@ export function hostQuiet(quietMs: number, until: number): Promise<void> {
       window.clearTimeout(timer)
       const left = until - performance.now()
       if (left <= 0) { finish(); return }
-      timer = window.setTimeout(() => { if (inflight === 0 || performance.now() >= until) finish(); else check() }, inflight > 0 ? left : Math.min(quietMs, left))
+      timer = window.setTimeout(() => { if (!busy() || performance.now() >= until) finish(); else check() }, busy() ? left : Math.min(quietMs, left))
     }
     quietWaiters.add(check)
     check()
@@ -1119,6 +1136,9 @@ async function rawCall<T>(method: string, params?: Record<string, unknown>, time
     const { mockCall } = await import('./hostMock');
     return mockCall<T>(method, params)
   }
+  const recentKey = recentRead(method, params)
+  const recent = recentReads.get(recentKey)
+  if (recent && performance.now() - recent.at < RECENT_MS) return recent.value as Promise<T>
   const coalesce = COALESCE_READS.has(method)
   const key = coalesce ? `${method}:${JSON.stringify(params ?? {})}` : ''
   if (coalesce) {
@@ -1153,8 +1173,10 @@ async function rawCall<T>(method: string, params?: Record<string, unknown>, time
     catch (error) { clear(); pending.delete(id); reject(error) }
   })
   if (!UNGATED.has(method)) {
-    inflight++
-    void work.then(settled, settled)
+    const call = nextCall++
+    outstanding.set(call, performance.now())
+    const done = () => settled(call)
+    void work.then(done, done)
   }
   if (coalesce) {
     inflightReads.set(key, work)
@@ -1162,6 +1184,10 @@ async function rawCall<T>(method: string, params?: Record<string, unknown>, time
       if (inflightReads.get(key) === work) inflightReads.delete(key)
     }
     void work.then(clearInflight, clearInflight)
+  }
+  if (recentKey) {
+    recentReads.set(recentKey, { at: performance.now(), value: work })
+    work.catch(() => { if (recentReads.get(recentKey)?.value === work) recentReads.delete(recentKey) })
   }
   return work
 }
@@ -1566,14 +1592,14 @@ export const host = {
     rawCall<{ ok: boolean; favorites?: string[] | null; frequent?: string[] | null; reactions?: string[] | null }>('discord.emojiFavorites', { action, ...(emoji ? { emoji } : {}), ...(reaction ? { reaction } : {}) }, 30_000),
   discordGifs: (query?: string) => rawCall<{ ok: boolean; gifs?: DiscordGif[] | null }>('discord.gifs', query ? { query } : {}, 30_000),
   /** Join or leave a server, read an invite (a message's invite card), its Server Guide or events, or create a channel. */
-  discordServer: (action: 'join' | 'invite' | 'leave' | 'guide' | 'events' | 'members' | 'createChannel' | 'prune' | 'createEvent' | 'eventStatus' | 'ics' | 'rsvp' | 'showAll' | 'mute' | 'notify', params: { muted?: boolean; minutes?: number; level?: number; suppressEveryone?: boolean; suppressRoles?: boolean; invite?: string; guildId?: string; parentId?: string; name?: string; kind?: 'text' | 'voice'; sort?: number; days?: number; countOnly?: boolean; eventId?: string; interested?: boolean; on?: boolean; status?: 2 | 3 | 4; description?: string; start?: string; channelId?: string; location?: string; end?: string; query?: string; afterJoined?: number; afterUser?: string }) =>
-    rawCall<{ ok: boolean; message?: string | null; guildId?: string | null; channelId?: string | null; invite?: DiscordInvite | null; invalid?: boolean; guide?: DiscordGuide | null; events?: { event: DiscordEvent; interested: boolean }[] | null; members?: DiscordMemberSearch | null; roles?: Record<string, DiscordRole>; online?: number | null; total?: number | null; resources?: DiscordResource[]; pruned?: number | null }>('discord.server', { action, ...params }, 30_000),
+  discordServer: (action: 'join' | 'invite' | 'leave' | 'profile' | 'guide' | 'events' | 'members' | 'createChannel' | 'prune' | 'createEvent' | 'eventStatus' | 'ics' | 'rsvp' | 'showAll' | 'mute' | 'notify', params: { muted?: boolean; minutes?: number; level?: number; suppressEveryone?: boolean; suppressRoles?: boolean; invite?: string; guildId?: string; parentId?: string; name?: string; kind?: 'text' | 'voice'; sort?: number; days?: number; countOnly?: boolean; eventId?: string; interested?: boolean; on?: boolean; status?: 2 | 3 | 4; description?: string; start?: string; channelId?: string; location?: string; end?: string; query?: string; afterJoined?: number; afterUser?: string }) =>
+    rawCall<{ ok: boolean; message?: string | null; guildId?: string | null; channelId?: string | null; invite?: DiscordInvite | null; invalid?: boolean; guide?: DiscordGuide | null; events?: { event: DiscordEvent; interested: boolean }[] | null; members?: DiscordMemberSearch | null; roles?: Record<string, DiscordRole>; online?: number | null; total?: number | null; resources?: DiscordResource[]; pruned?: number | null; indexing?: boolean; profile?: DiscordGuildProfile | null }>('discord.server', { action, ...params }, 30_000),
   /**
    * Server Settings, Edit Channel and the person menu: a server's (guildId) or channel's (channelId) settings and the
    * changes to them, each checked by the host against the user's permissions. data is Discord's own reply.
    */
   discordAdmin: (action: string, params: Record<string, unknown> = {}) =>
-    rawCall<{ ok: boolean; message?: string | null; data?: unknown }>('discord.admin', { action, ...params }, 60_000),
+    rawCall<{ ok: boolean; message?: string | null; data?: unknown; mfa?: { id: string; methods: string[] } | null }>('discord.admin', { action, ...params }, 60_000),
   discordProfile: (userId: string, guildId: string | null) =>
     rawCall<{ ok: boolean; message?: string | null; profile?: DiscordProfile | null; extras?: DiscordProfileExtras | null; note?: string | null }>('discord.profile', { userId, ...(guildId ? { guildId } : {}) }, 30_000),
   /** A profile's Note (only visible to you), saved on Discord. */

@@ -40,6 +40,44 @@ const DESIGN_RULES = [
     'Off the type scale: use text-[length:calc(12|13|20px*var(--exo-scale,1))].'),
 ]
 
+// One control per job (DESIGN.md › Controls): Exo's Switch is the only on/off control, and buttons come from one set.
+const inClassNames = (pattern, message) => [
+  { selector: `JSXAttribute[name.name=/[cC]lassName$/] Literal[value=${pattern}]`, message },
+  { selector: `JSXAttribute[name.name=/[cC]lassName$/] TemplateElement[value.raw=${pattern}]`, message },
+]
+const SWITCH_RULES = [
+  { selector: "JSXOpeningElement[name.name='input'] > JSXAttribute[name.name='type'][value.value=/^(checkbox|radio)$/]",
+    message: 'No native checkbox or radio: an on/off is components/Switch.tsx, one of a few is a segmented pill (.exo-shelf-chips) or a menu.' },
+  { selector: "JSXAttribute[name.name='role'][value.value=/^(switch|checkbox)$/]",
+    message: 'An on/off is components/Switch.tsx, never a hand-made role="switch" or role="checkbox".' },
+]
+const BUTTON_RULES = inClassNames(String.raw`/(^|\s)(button(--[a-z-]*)?|exo-ghost-btn|exo-cta|exo-capture-chip|exo-set-chip)(\s|$)/`,
+  'Buttons come from one set: .exo-set-btn (.is-primary, .is-danger, .is-compact) for every button, <Button variant="primary"> for a page\'s lone primary and <Button variant="ghost"> for a quiet one (DESIGN.md › Controls).')
+// Discord client: being fixed by the Discord pass (its native checkboxes and raw .button classes).
+const DISCORD_PENDING = [
+  'src/components/discord/AppModal.tsx',
+  'src/components/discord/DiscordSignIn.tsx',
+  'src/components/discord/DmProfile.tsx',
+  'src/components/discord/Forum.tsx',
+  'src/components/discord/FriendsPage.tsx',
+  'src/components/discord/Message.tsx',
+  'src/components/discord/MessageTools.tsx',
+  'src/components/discord/MfaDialog.tsx',
+  'src/components/discord/NativeDiscordRoom.tsx',
+  'src/components/discord/PollCreator.tsx',
+  'src/components/discord/ShopPage.tsx',
+  'src/components/discord/admin.tsx',
+  'src/components/discord/events.tsx',
+  'src/components/discord/extras.tsx',
+  'src/components/discord/guildTag.tsx',
+  'src/components/discord/payFrame.tsx',
+  'src/components/discord/serverPages.tsx',
+  'src/components/discord/settingsAutomod.tsx',
+  'src/components/discord/settingsExpressions.tsx',
+  'src/components/discord/settingsModeration.tsx',
+  'src/components/discord/settingsRoles.tsx',
+]
+
 export default tseslint.config(
   {
     ignores: ['dist/**', 'node_modules/**', '../ExoLauncher/wwwroot/**', 'vite.chunks.ts'],
@@ -60,7 +98,7 @@ export default tseslint.config(
       'max-depth': ['error', 4],
       'no-empty': ['error', { allowEmptyCatch: true }],
       'prefer-const': 'error',
-      'no-restricted-syntax': ['error', ...DESIGN_RULES, BIGINT_RULE],
+      'no-restricted-syntax': ['error', ...DESIGN_RULES, ...SWITCH_RULES, ...BUTTON_RULES, BIGINT_RULE],
       'no-useless-escape': 'off',
       '@typescript-eslint/no-unused-vars': [
         'error',
@@ -72,5 +110,9 @@ export default tseslint.config(
   },
   // lib/discord.ts holds the snowflake math (BigInt), which compiles right there.
   { files: ['src/lib/discord.ts'], rules: { 'no-restricted-syntax': ['error', ...DESIGN_RULES] } },
+  // The two components that own what the control rules keep everywhere else.
+  { files: ['src/components/Switch.tsx'], rules: { 'no-restricted-syntax': ['error', ...DESIGN_RULES, ...BUTTON_RULES, BIGINT_RULE] } },
+  { files: ['src/components/ui/Button.tsx'], rules: { 'no-restricted-syntax': ['error', ...DESIGN_RULES, ...SWITCH_RULES, BIGINT_RULE] } },
+  { files: DISCORD_PENDING, rules: { 'no-restricted-syntax': ['error', ...DESIGN_RULES, BIGINT_RULE] } },
 )
 

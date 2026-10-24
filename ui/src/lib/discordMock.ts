@@ -2,7 +2,7 @@ import type { DiscordChannels, DiscordFriend, DiscordHome, DiscordMemberList, Di
 
 /** Made-up people and servers for the dev preview of Exo's own Discord client (never real accounts). */
 const me = { id: '100000000000000001', username: 'you', global_name: 'You' }
-const ada = { id: '100000000000000002', username: 'ada', global_name: 'Ada' }
+const ada = { id: '100000000000000002', username: 'ada', global_name: 'Ada', primary_guild: { identity_guild_id: '200000000000000001', identity_enabled: true, tag: 'EXO', badge: null } }
 const kai = { id: '100000000000000003', username: 'kai', global_name: 'Kai' }
 const bot = { id: '100000000000000004', username: 'scrim-bot', global_name: 'Scrim Bot', bot: true }
 
@@ -38,7 +38,7 @@ export const mockChannels: DiscordChannels = {
     { id: '400000000000000006', name: 'Scrims', type: 2, kind: 'voice', canConnect: true, locked: true },
   ],
   canManage: true,
-  moderation: { kick: true, ban: true, manageGuild: true, auditLog: true, manageRoles: true, timeout: true, manageChannels: true, manageExpressions: true, manageWebhooks: true, manageNicknames: true, prune: true, owner: true },
+  moderation: { kick: true, ban: true, manageGuild: true, auditLog: true, manageRoles: true, timeout: true, manageChannels: true, manageExpressions: true, manageWebhooks: true, manageNicknames: true, prune: true, owner: true, mfa: true },
 }
 
 const at = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString()
@@ -192,8 +192,18 @@ const people: Record<string, { name: string; username: string; roles: string[] }
   [kai.id]: { name: 'Kai', username: kai.username, roles: [] },
 }
 
+// Discord's step-up: the owner's 2FA switch and Delete Server wait for a code (123456 passes in the mock).
+const mockAsk = { id: '0123456789abcdef0123456789abcdef', methods: ['totp', 'sms', 'backup', 'password'] }
+function mockStepUp(params: Record<string, unknown>): unknown {
+  if (params.action !== 'mfa') return { ok: false, message: 'Discord wants to check it’s really you.', mfa: mockAsk }
+  if (params.step === 'cancel') return { ok: true }
+  if (params.step === 'sms') return { ok: true, data: { phone: '*******1234' } }
+  return params.code === '123456' ? { ok: true, data: { level: 0 } } : { ok: false, message: 'Discord: Invalid two-factor code', mfa: mockAsk }
+}
+
 export function mockAdmin(params?: Record<string, unknown>): unknown {
   const ok = (data: unknown) => ({ ok: true, data })
+  if (params && ['mfa', 'guildMfa', 'deleteGuild', 'transfer'].includes(String(params.action))) return mockStepUp(params)
   switch (params?.action) {
     case 'guild': return ok({ id: guildId, name: 'Night Raid', icon: null, banner: null, description: 'Ranked nights and scrims.', owner_id: me.id, afk_channel_id: null, afk_timeout: 300,
       system_channel_id: '400000000000000002', system_channel_flags: 4, verification_level: 1, default_message_notifications: 1, explicit_content_filter: 2, mfa_level: 1, premium_tier: 1, features: ['COMMUNITY'] })
@@ -216,6 +226,7 @@ export function mockAdmin(params?: Record<string, unknown>): unknown {
       canManage: true, canPermissions: true, maxBitrate: 128000,
       overwrites: [{ id: guildId, type: 0, allow: '0', deny: '0' }, { id: '900000000000000002', type: 0, allow: '8192', deny: '0' }],
       roles: roles.map(r => ({ id: r.id, name: r.name, color: r.color ? `#${r.color.toString(16).padStart(6, '0')}` : null })), members: [] })
+    case 'createWebhook': return ok({ id: '610000000000000009', type: 1, name: 'Captain Hook', channel_id: '400000000000000002', user: me })
     case 'createRole': return ok({ ...roles[2], id: '900000000000000099', name: 'new role', position: 1 })
     default: return ok(null)
   }
@@ -228,7 +239,8 @@ function mockPerson(userId: string) {
     ok: true, known: true, me: mine, owner: mine, outranks: !mine, timedOut: userId === ada.id, nick: null, name: person.name, username: person.username, roles: person.roles,
     choices: roles.filter(r => r.id !== guildId).sort((a, b) => b.position - a.position)
       .map(r => ({ id: r.id, name: r.name, color: r.color ? `#${r.color.toString(16).padStart(6, '0')}` : null, assignable: !r.managed })),
-    can: { roles: true, nick: true, timeout: !mine, kick: !mine, ban: !mine, mute: userId === ada.id, deafen: userId === ada.id, move: userId === ada.id },
+    mfa: true,
+    can: { roles: true, nick: true, timeout: !mine, kick: !mine, ban: !mine, transfer: !mine, mute: userId === ada.id, deafen: userId === ada.id, move: userId === ada.id },
     voice: userId === ada.id ? { channelId: '400000000000000005', mute: false, deaf: false } : null,
     moveTo: [{ id: '400000000000000006', name: 'Scrims' }],
   }

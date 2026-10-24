@@ -133,13 +133,16 @@
   grid-template-columns: minmax(0, 1fr) minmax(220px, 300px);
   gap: 16px;
   padding: 0 var(--exo-gutter);
+  container-type: inline-size;
 }
 
+/* 96:31 of its column (the hero's width less the 300px list and the gap), never under 260px tall. As an
+   aspect-ratio with a min-height, a narrow window widened it to 805px, under the list. */
 .exo-store-hero-stage {
   position: relative;
   display: block;
-  aspect-ratio: 96 / 31;
-  min-height: 260px;
+  height: max(260px, calc((100cqw - 316px) * 31 / 96));
+  min-width: 0;
   overflow: hidden;
   padding: 0;
   border: 1px solid var(--exo-float-line);
@@ -313,16 +316,9 @@
   gap: 4px;
 }
 
-.exo-store-arrows .exo-ghost-btn {
+.exo-store-arrows .exo-set-btn {
   width: 32px;
-  min-width: 32px;
-  height: 32px;
-  min-height: 32px;
   padding: 0;
-}
-
-.exo-store-arrows .exo-ghost-btn:disabled {
-  opacity: 0.3;
 }
 
 /* A shelf that fits whole has nothing to page: no arrows, rather than two dead ones. */

@@ -3,7 +3,7 @@ import { Button } from '../../components/ui/Button'
 import { Switch } from '../../components/Switch'
 import { Row, State } from '../../components/settings/parts'
 import * as I from '../icons'
-import { api, send, setSetting, useBrowser } from '../host'
+import { api, send, setSetting, useBrowserValue } from '../host'
 import { Choice } from '../Settings'
 import { WindowButtons } from '../Chrome'
 import { CreateVault } from '../vault/Gate'
@@ -62,14 +62,14 @@ function BringStep() {
 }
 
 function LookStep() {
-  const b = useBrowser()
+  const settings = useBrowserValue(b => b.settings)
   return (
     <>
       <Row label="Tabs">
-        <Choice label="Tabs" value={b.settings.tabs || 'horizontal'} choices={[{ value: 'horizontal', label: 'Across the top' }, { value: 'vertical', label: 'Down the side' }]} onChange={value => setSetting('tabs', value)} />
+        <Choice label="Tabs" value={settings.tabs || 'horizontal'} choices={[{ value: 'horizontal', label: 'Across the top' }, { value: 'vertical', label: 'Down the side' }]} onChange={value => setSetting('tabs', value)} />
       </Row>
       <Row label="Appearance" detail="Void is pure black, for OLED screens">
-        <Choice label="Appearance" value={b.settings.appearance || 'void'} choices={[{ value: 'void', label: 'Void' }, { value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'match', label: 'Match Windows' }]}
+        <Choice label="Appearance" value={settings.appearance || 'void'} choices={[{ value: 'void', label: 'Void' }, { value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'match', label: 'Match Windows' }]}
           onChange={value => setSetting('appearance', value)} />
       </Row>
     </>

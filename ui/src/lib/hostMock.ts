@@ -156,16 +156,18 @@ let mockFrameGen = 'game'
 /** `?cpu=intel` in browser dev: This PC and Settings' chipset switch for an Intel processor instead of a Ryzen. */
 const mockIntelCpu = typeof location !== 'undefined' && new URLSearchParams(location.search).get('cpu') === 'intel'
 
-// ?whatsnew: a user just updated to 3.14.0 from before What's New, so its sheet opens over the Library.
+// ?whatsnew: a user just updated to 3.14.1 from 3.13.2, so the sheet opens over the Library with 3.14.1 and the 3.14.0 they skipped.
 const mockWhatsNew = typeof location !== 'undefined' && new URLSearchParams(location.search).has('whatsnew')
+// ?update: 3.15.0 is offered, with its What's New.
+const mockUpdate = typeof location !== 'undefined' && new URLSearchParams(location.search).has('update')
 
 // ?folders: two Library folders to start with, Hades in both, one sorted by time played.
 const mockFolders = typeof location !== 'undefined' && new URLSearchParams(location.search).has('folders')
 
 const mockSettings: LauncherSettings = {
   onboardingComplete: !mockFirstRun,
-  appVersion: mockWhatsNew ? '3.14.0' : '1.0.0-dev',
-  whatsNewSeen: mockWhatsNew ? null : '1.0.0-dev',
+  appVersion: mockWhatsNew ? '3.14.1' : '1.0.0-dev',
+  whatsNewSeen: mockWhatsNew ? '3.13.2' : '1.0.0-dev',
   reduceMotion: false,
   framelessPinTop: false,
   framelessPinSide: false,
@@ -705,7 +707,9 @@ const MOCK_HANDLERS: Record<string, MockHandler> = {
   'discord.voiceTune': () => ({ ok: false, message: 'Voice Tune needs Exo.' }),
   'discord.voiceCheck': () => ({ ok: false, message: 'Voice Check needs Exo.' }),
   'discord.sound': mockOk,
-  'discord.server': (p?: { action?: string; invite?: string }) => p?.action === 'invite'
+  'discord.server': (p?: { action?: string; invite?: string }) => p?.action === 'profile'
+    ? { ok: true, profile: { id: '200000000000000001', name: 'Exo Lab', icon_hash: null, description: 'Where Exo gets built.', member_count: 1204, online_count: 312, tag: 'EXO', traits: [{ label: 'Gaming', emoji_name: '🎮', position: 0 }] } }
+    : p?.action === 'invite'
     ? p.invite === 'expired' ? { ok: false, invalid: true, message: 'Discord: Unknown Invite' }
       : { ok: true, invite: p.invite === 'exo'
         ? { guildId: '300000000000000001', channelId: '400000000000000002', name: 'Exo Squad', icon: null, verified: false, partnered: false, online: 12, members: 48, joined: true }
@@ -715,7 +719,7 @@ const MOCK_HANDLERS: Record<string, MockHandler> = {
     : p?.action === 'events'
     ? { ok: true, events: [{ interested: false, event: { id: '700000000000000001', name: 'Ranked night', scheduled_start_time: '2026-10-20T01:00:00Z', status: 1, user_count: 6, entity_metadata: { location: 'Voice' } } }] }
     : p?.action === 'guide'
-      ? { ok: true, guide: { welcome_message: { message: 'Read the rules, grab a role, say hi.' }, new_member_actions: [{ channel_id: '400000000000000001', title: 'Say hi', description: 'Introduce yourself', emoji: { name: '👋' } }], resource_channels: [] } }
+      ? { ok: true, guide: { welcome_message: { message: 'Read the rules, grab a role, say hi.' }, new_member_actions: [{ channel_id: '400000000000000001', title: 'Say hi', description: 'Introduce yourself', emoji: { name: '👋' } }], resource_channels: [] }, resources: [{ channelId: '400000000000000002', title: 'Rules', description: 'Read before posting' }] }
       : { ok: true },
   'discord.profile': (p?: { mutualFriends?: boolean; note?: string }) => p?.mutualFriends ? { ok: true, friends: [{ id: '100000000000000003', username: 'kai', global_name: 'Kai' }] } : p?.note !== undefined ? mockOk() : mockProfile,
   'discord.threads': () => ({ ok: true, threads: [{ id: '600000000000000001', name: 'Best crosshair codes?', parent_id: '400000000000000007', message_count: 42 }, { id: '600000000000000002', name: 'Patch 9.2 tier list', parent_id: '400000000000000007', message_count: 7 }] }),
@@ -804,7 +808,12 @@ const MOCK_HANDLERS: Record<string, MockHandler> = {
   'music.warm': mockOk,
   'music.reload': mockOk,
   'app.version': () => ({ version: '1.0.0-dev' }),
-  'app.checkUpdate': () => ({ ok: true, alreadyLatest: true, updateAvailable: false, message: 'Up to date.', current: '1.0.0-dev' }),
+  'app.checkUpdate': () => mockUpdate
+    ? { ok: true, updateAvailable: true, latest: '3.15.0', message: 'Version 3.15.0 is available.', current: '1.0.0-dev', upcoming: { version: '3.15.0', items: [
+        { icon: 'Download', title: "See what's coming", detail: "What's New shows the next version's changes before you install it." },
+        { icon: 'Sparkle', title: 'Catch up on what you missed', detail: "Skip a few versions and What's New shows every one you missed." },
+      ] } }
+    : { ok: true, alreadyLatest: true, updateAvailable: false, message: 'Up to date.', current: '1.0.0-dev' },
   'app.log': mockOk,
   'app.openLogs': () => ({ ok: false, message: 'No logs folder in the browser mock.' }),
   'app.installUpdate': () => ({

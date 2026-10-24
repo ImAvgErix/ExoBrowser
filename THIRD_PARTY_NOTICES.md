@@ -24,7 +24,6 @@ uBlock Origin Lite carries the filter lists it was built with (EasyList, EasyPri
 | clsx, by Luke Edwards | MIT | <https://github.com/lukeed/clsx> |
 | Tabler Icons, by Paweł Kuna | MIT | <https://github.com/tabler/tabler-icons> |
 | Inter, by Rasmus Andersson | SIL Open Font License 1.1 (`ui\fonts\LICENSE-Inter.txt`) | <https://github.com/rsms/inter> |
-| Josefin Sans, by The Josefin Sans Project Authors | SIL Open Font License 1.1 (`ui\fonts\LICENSE-JosefinSans.txt`) | <https://github.com/ThomasJockin/JosefinSansFont-master> |
 
 The installer is made with NSIS (zlib/libpng license, <https://nsis.sourceforge.io>).
 

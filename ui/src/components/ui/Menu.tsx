@@ -32,8 +32,9 @@ export function Menu({ label, anchor, offset, triggerClassName, trigger, items, 
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const entries = () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]') ?? [])
-  // The name carries the current choice too, as the trigger shows it ("Sort library, Recent").
-  const current = checked === undefined ? undefined : items.find(item => item.id === checked)?.label
+  // The name carries the current choice too, as the trigger shows it ("Sort library, Recent"): the checked id, or a
+  // menu of ticked items' first one (the Library's sort leads its Show section).
+  const current = checked === undefined ? items.find(item => item.on)?.label : items.find(item => item.id === checked)?.label
   function hide(returnFocus: boolean) {
     if (menuRef.current?.matches(':popover-open')) menuRef.current.hidePopover()
     if (returnFocus) triggerRef.current?.focus()

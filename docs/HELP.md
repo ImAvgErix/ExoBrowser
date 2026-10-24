@@ -19,10 +19,30 @@ To uninstall, open **Windows Settings > Apps > Installed apps**, choose **Exo Br
 ## The Bar
 
 - **Search or go:** click the address, or press **Ctrl+L** or **F6**, and type. An address opens; anything else is searched with your search engine (**Settings > General > Search engine**). Suggestions come from your open tabs, bookmarks and history.
+- **Search one site:** type its keyword and a space ("yt cats" searches YouTube, "wp" Wikipedia, "gh" GitHub), "@" and its name, or its address and **Tab**. It shows as a chip in the field, with that site's pages from your history under it; **Backspace** in the empty field takes it off. **Settings > Search** keeps the list and adds your own with a %s address.
 - **Everything at once:** **Ctrl+K** finds a tab, bookmark, page from your history or action.
-- **Tabs:** across the top or down the side (**Settings > General > Tabs**). Drag a tab to move it; right-click it to pin, mute, duplicate or close others. **Ctrl+T** opens a new tab, **Ctrl+Shift+T** reopens the last one you closed, **Ctrl+W** closes one, and **Ctrl+Tab** moves between them.
+- **Tabs:** across the top or down the side (**Settings > Look > Tabs**). Drag a tab to move it; right-click it to pin, mute, duplicate, copy its link or close others. **Ctrl+T** opens a new tab, **Ctrl+Shift+T** reopens the last one you closed, **Ctrl+W** closes one, and **Ctrl+1** to **9** go to the first nine.
+- **Ctrl+Tab** goes back through the tabs in the order you used them, as Alt+Tab does with windows: a quick press returns to the tab before, and held, it lists the space's tabs. **Settings > General > Ctrl+Tab in recent order** makes it follow the strip instead.
+- **Copy link:** **Ctrl+Shift+C** copies the address without the tracking parts that share buttons add.
 - **Hide the toolbar** gives the page the whole window; the Bar slides in when the pointer touches the top edge (side tabs at the left edge).
 - **More keys:** **Ctrl+D** bookmarks the page, **Ctrl+F** finds on it, **Ctrl+H** opens History, **Ctrl+J** Downloads, **Ctrl+Shift+E** your extensions, **F11** full screen, **Alt+Left** and **Alt+Right** back and forward.
+
+## Spaces, favorites and folders
+
+- **Spaces:** keep work, school and play apart. **Settings > Spaces** adds one and gives it an icon, a color (the accent while it's on screen) and its own appearance. **Alt+1** to **9** switch them; drag a tab onto one to move it there. A site's links from your other apps can open in the space you pick for it: right-click its tab in that space and choose, for example, **Open github.com links in Work**, or add it under **Settings > Spaces > Links from other apps**.
+- **Favorites** show in every space; right-click a tab and choose **Add to Favorites**. A **pinned tab** remembers its page: its icon takes it back when it wanders, and closing it only puts it to sleep.
+- **Folders:** with tabs down the side, pinned tabs can sit in folders, folders inside folders too. Drop a tab on a folder, or right-click it and choose one; a folder's row opens and closes it, and right-click renames it.
+- **Live folders:** right-click a site's tab and choose **Follow this site in a live folder**. Its newest posts show in the folder, checked every 30 minutes, and open in a new tab. Delete the folder to stop following.
+- **Archive tabs** (**Settings > General**, off by default) closes tabs you haven't opened in a while into an archive; Search still finds them.
+- **From Arc:** **Settings > Import** brings Arc's spaces, colors, favorites, pinned tabs with their folders and Today tabs from its files, even after Arc stops opening.
+
+## Split view, Peek and private tabs
+
+- **Split view:** up to four tabs side by side, from a tab's menu, **Ctrl+K** or **Ctrl+Shift+=**.
+- **Peek:** right-click a link and choose **Open link in Peek**, or **Shift+click** it, to read it in a card over the page. **Ctrl+O** keeps it as a tab; **Esc** or a click around it closes it.
+- **Private tabs:** **Ctrl+Shift+N** opens a tab whose cookies and sign-ins stay apart from your other tabs and go when the last private tab closes. Nothing it visits reaches your history or saved tabs, and Exo Shield runs in it too.
+- **Little Exo:** with **Settings > General > Links from other apps > In Little Exo**, a link from another app opens in a small window of its own; **Ctrl+O** (or **Open in Exo Browser**) moves it into your tabs.
+- **Picture in picture:** a video playing with sound floats over everything when you leave its tab, and goes back when you return (**Settings > General**).
 
 ## The new tab page
 
@@ -47,7 +67,7 @@ Twitch: a stream can take a second longer to start, since its playlist comes thr
 
 ## Bringing your things from another browser
 
-**Settings > Import** lists the browsers on this PC. **Import** brings bookmarks, history, sign-ins (so you stay signed in), site icons, the search engine and Chrome Web Store extensions; Firefox brings bookmarks, history and sign-ins. Close that browser first so its sign-ins can be read. Nothing is removed from it. Passwords go into Exo Vault from its own **Import and export**.
+**Settings > Import** lists the browsers on this PC. **Import** brings bookmarks, history, sign-ins (so you stay signed in), site icons, the search engine and Chrome Web Store extensions; Arc brings its spaces, favorites and folders too; Firefox, Zen, Floorp, LibreWolf and Waterfox bring bookmarks, history and sign-ins. Close that browser first so its sign-ins can be read. Nothing is removed from it. Passwords go into Exo Vault from its own **Import and export**.
 
 Bookmarks from any browser: export them as an HTML file there, then **Settings > Bookmarks > Import file**.
 
@@ -59,7 +79,9 @@ Open the [Chrome Web Store](https://chromewebstore.google.com) from **Settings >
 
 ## Look and feel
 
-**Settings > General**: **Appearance** (Match Windows, Light, Dark or Void, pure black for OLED screens) and **Material** (Liquid Glass, or solid surfaces with nothing showing through).
+- **Settings > Look:** **Appearance** (Match Windows, Light, Dark or Void, pure black for OLED screens), **Material** (Liquid Glass, See-through or solid), tabs across the top or down the side, the accent color, a compact Bar, tab size, text size and reduced motion.
+- **Settings > Mods:** eight themes that set the look in one click, small tweaks (tab numbers, calm icons, no new tab button, square corners, the accent on the Bar) and your own CSS for Exo Browser itself. Your CSS never reaches Settings, so you can always undo it there.
+- **Boosts:** right-click a tab and choose **Zap things on this page** to click away things on a site's pages for good, or **Boost this site** to give it a style of your own. **Settings > Boosts** lists them, each with a switch.
 
 ## Privacy
 

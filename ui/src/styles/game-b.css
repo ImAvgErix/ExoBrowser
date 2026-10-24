@@ -51,6 +51,7 @@
 .exo-shelf-chip {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   /* Exo's tab: 28px inside a 32px group, as every room's tab bar. */
   height: 28px;
   padding: 0 14px;

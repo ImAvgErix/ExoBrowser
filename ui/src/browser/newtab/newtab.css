@@ -4,6 +4,8 @@
 
 html, body, #root { min-height: 100%; margin: 0; background: var(--color-bg); color: var(--color-fg); font-family: var(--font-sans); }
 body { overflow-x: hidden; scrollbar-width: none; }
+/* Exo's keyboard focus ring (tokens.css draws it inside .exo-app; this page's root is its own). */
+:where(.exb-ntp) :where(a[href], button, [tabindex]):focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
 
 /* From 1%, not 0: WebView2 holds a new page's first frames until something on it is visible, and with everything at 0
    it showed nothing for about 300 ms, then the page almost done arriving. */
@@ -24,34 +26,21 @@ body { overflow-x: hidden; scrollbar-width: none; }
 .exb-ntp-mark { width: 72px; height: 72px; margin-bottom: 18px; animation: exb-arrive 280ms var(--ease-out) backwards; }
 
 .exb-ntp-quote { margin: 0; max-width: 760px; text-align: center; animation: exb-arrive 280ms var(--ease-out) 24ms backwards; }
-/* The line to read is set apart from Exo's Inter: Josefin Sans Light (SIL OFL, unmodified in the browser's fonts
-   folder, as its reserved name asks), geometric and airy, a little letter space to breathe. */
-@font-face {
-  font-family: "Josefin Sans";
-  font-style: normal;
-  font-weight: 100 700;
-  font-display: block;
-  src: url("/fonts/JosefinSans%5Bwght%5D.ttf") format("truetype");
-}
+/* The line to read is Exo's title type: Inter's Display cut at 650, the page's one large line. */
 .exb-ntp-quote blockquote {
   margin: 0;
-  font-family: "Josefin Sans", var(--font-sans);
   /* design-disable-next-line exo/type-scale -- the new tab page's quote is display type, the page's one large line */
   font-size: calc(40px * var(--exo-scale, 1));
-  font-weight: 300;
-  letter-spacing: 0.02em;
-  line-height: 1.25;
+  font-weight: 650;
+  line-height: 1.2;
   text-wrap: balance;
 }
-/* Who said it, in the quote's own voice: the same face, small, in spaced capitals, quieter than the line above. */
+/* Who said it: small and muted under the line. */
 .exb-ntp-quote figcaption {
   margin-top: 14px;
   color: var(--color-muted);
-  font-family: "Josefin Sans", var(--font-sans);
   font-size: calc(13px * var(--exo-scale, 1));
-  font-weight: 400;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 .exb-ntp-quote figcaption::before { content: "\2014\2002"; letter-spacing: 0; }
 
@@ -106,9 +95,11 @@ body { overflow-x: hidden; scrollbar-width: none; }
   background: var(--exo-fill);
   box-shadow: var(--glassy-ring), var(--glassy-rim);
   font-size: calc(20px * var(--exo-scale, 1));
-  font-weight: 700;
+  font-weight: 650;
 }
 .exb-card-face img { width: 30px; height: 30px; border-radius: 7px; object-fit: contain; }
+/* A site's icon that would vanish into its face (look.ts › markInk): drawn inverted, its hues kept. */
+:root:not([data-exo-theme="light"]) img[data-ink="dark"], :root[data-exo-theme="light"] img[data-ink="light"] { filter: invert(1) hue-rotate(180deg); }
 .exb-card-name { max-width: 100%; box-sizing: border-box; overflow: hidden; padding: 5px 11px; border-radius: 999px; white-space: nowrap; text-overflow: ellipsis; font-size: calc(12px * var(--exo-scale, 1)); font-weight: 600; }
 .exb-card-x {
   position: absolute;
@@ -158,3 +149,7 @@ body { overflow-x: hidden; scrollbar-width: none; }
 .is-icons .exb-chip span { display: none; }
 
 .exb-ntp-menu.exo-shelf-sort-menu { position: fixed; display: flex; inset: auto; margin: 0; min-width: 210px; }
+
+/* Reduce motion: a press and a hover change only light, as Exo's own controls do (system.css). */
+html[data-exo-motion="reduce"] :is(.exb-card, .exb-chip):is(:hover, :active),
+html[data-exo-motion="reduce"] .exb-card:hover .exb-card-wash { translate: none; scale: none; }

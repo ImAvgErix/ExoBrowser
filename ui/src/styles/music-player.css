@@ -459,10 +459,6 @@
   margin-top: 12px;
 }
 
-.exo-music-header-actions .button {
-  gap: 8px;
-}
-
 .exo-music-tracks {
   margin: 0;
   padding: 0;
@@ -599,7 +595,7 @@
 }
 
 .exo-music-track-time.is-done,
-.button.is-done {
+.exo-set-btn.is-done {
   color: var(--color-good);
   font-family: inherit;
 }
@@ -699,10 +695,6 @@
   margin-top: 12px;
 }
 
-.exo-music-jam-actions .button {
-  gap: 8px;
-}
-
 .exo-music-toggle {
   width: 32px;
   height: 32px;
@@ -782,7 +774,8 @@
 .exo-music-bar {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  /* The panel buttons keep their width (a narrow window ran them under Next and Repeat); the song gives way. */
+  grid-template-columns: minmax(0, 1fr) auto minmax(max-content, 1fr);
   align-items: center;
   gap: 16px;
   padding: 0 16px;
@@ -833,10 +826,6 @@
 .exo-music-songs-head h2 {
   flex: 1;
   margin: 0;
-}
-
-.exo-music-songs-head .button {
-  gap: 8px;
 }
 
 .exo-music-songs-filter {

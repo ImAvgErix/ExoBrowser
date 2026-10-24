@@ -222,8 +222,84 @@ textarea.exo-dc-field {
   transform: rotate(180deg);
 }
 
+/* The roles table, Discord's columns in Exo's hairline rows: grip, the role's color and name, its members, Edit. */
+.exo-dc-role-head,
+.exo-dc-role-open {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 96px;
+  align-items: center;
+  gap: 10px;
+}
+
+.exo-dc-role-head {
+  margin: 16px 0 4px;
+  padding: 0 52px 0 38px;
+  grid-template-columns: minmax(0, 1fr) 96px;
+  color: var(--color-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+
+.exo-dc-role-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
 .exo-dc-role-list li {
-  border-top: 2px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 8px;
+  border-top: 1px solid var(--exo-float-line);
+  border-radius: 0;
+}
+
+.exo-dc-role-list li:hover {
+  border-radius: var(--exo-row-radius);
+  background: var(--hover-fill);
+}
+
+.exo-dc-role-open {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.exo-dc-role-open .exo-dc-role-dot {
+  width: 14px;
+  height: 14px;
+}
+
+.exo-dc-role-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exo-dc-role-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-muted);
+}
+
+/* Edit shows with the row, as Discord's does. */
+.exo-dc-role-edit {
+  opacity: 0;
+}
+
+.exo-dc-role-list li:hover .exo-dc-role-edit,
+.exo-dc-role-edit:focus-visible {
+  opacity: 1;
 }
 
 .exo-dc-role-list li[draggable="true"] {
@@ -231,7 +307,7 @@ textarea.exo-dc-field {
 }
 
 .exo-dc-role-list li.is-over {
-  border-top-color: var(--color-fg);
+  box-shadow: inset 0 2px 0 var(--color-fg);
 }
 
 .exo-dc-grip {
@@ -777,4 +853,170 @@ button.exo-dc-member {
 .exo-dc .exo-dc-menu > button.is-danger,
 .exo-dc .exo-dc-ctx-parent > button.is-danger {
   color: var(--dc-bad);
+}
+
+/* Discord's Multi-Factor Authentication dialog: its title and close, then one way to verify at a time. */
+.exo-dc-mfa {
+  position: relative;
+  gap: 16px;
+}
+
+.exo-dc-mfa > header {
+  display: grid;
+  gap: 8px;
+  padding-right: 40px;
+}
+
+.exo-dc-mfa > header > strong {
+  color: var(--dc-text);
+  font-size: calc(20px * var(--exo-scale, 1));
+}
+
+.exo-dc-mfa > header > span,
+.exo-dc-mfa-warning > p,
+.exo-dc-mfa-sms {
+  margin: 0;
+  color: var(--dc-muted);
+}
+
+.exo-dc-mfa > header > .exo-game-close {
+  top: 20px;
+  right: 20px;
+}
+
+.exo-dc-mfa form,
+.exo-dc-mfa-warning {
+  display: grid;
+  gap: 12px;
+}
+
+.exo-dc-mfa form > p.is-bad {
+  margin: 0;
+  color: var(--dc-bad);
+}
+
+.exo-dc-mfa-warning > strong {
+  color: var(--dc-text);
+}
+
+.exo-dc-mfa-field {
+  display: grid;
+  gap: 8px;
+  color: var(--dc-text);
+  font-weight: 600;
+}
+
+.exo-dc-mfa-ways {
+  display: grid;
+  gap: 8px;
+}
+
+.exo-dc-mfa-way {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--dc-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dc-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.exo-dc-mfa-way:hover {
+  background: var(--hover-fill);
+}
+
+.exo-dc-mfa .exo-dc-modal-row {
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 0;
+}
+
+.exo-dc-role-list li.has-error {
+  flex-wrap: wrap;
+}
+
+/* A dialog's fields (Invite Link Settings, Security Actions): each label over its control, switches with their why. */
+.exo-dc-form-rows {
+  display: grid;
+  gap: 14px;
+  text-align: left;
+}
+
+.exo-dc-form-rows > label {
+  display: grid;
+  gap: 6px;
+  color: var(--dc-text);
+  font-weight: 600;
+}
+
+.exo-dc-form-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.exo-dc-form-switch > span:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.exo-dc-form-switch > span:first-child > span {
+  color: var(--dc-muted);
+  font-size: calc(12px * var(--exo-scale, 1));
+}
+
+/* Webhooks: each row opens to its editor under it. */
+.exo-dc-hook-list > li {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.exo-dc-hook-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.exo-dc-hook-editor {
+  display: grid;
+  gap: 12px;
+  padding: 12px 0 8px 44px;
+}
+
+.exo-dc-hook-editor > label {
+  display: grid;
+  gap: 6px;
+  max-width: 360px;
+  font-weight: 600;
+}
+
+/* A dialog's acknowledgement: the box beside what you agree to. */
+.exo-dc-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.exo-dc-check-row > input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--color-fg);
 }

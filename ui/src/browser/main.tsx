@@ -10,9 +10,14 @@ import '../styles/rooms.css'
 import './browser.css'
 import { installMenuFit } from '../lib/menuFit'
 import { installInputModality } from '../lib/motionPreference'
-import { holdInput, inputReleased, isFirstRun, onHost, send, setSetting, startHost, useBrowser } from './host'
+import { holdInput, inputReleased, isFirstRun, onHost, send, setSetting, startHost, useBrowserValue } from './host'
 import { engineOf, hostOf } from './search'
 import { Chrome, isAutohide, isVertical, useLayoutReport, widthOf } from './Chrome'
+import { accentOf, density, isCompact } from './look'
+import { importArc } from './arc'
+import { WhatsNew } from './WhatsNew'
+import { Switcher } from './Switcher'
+import { useMods } from './Mods'
 import { MenuLayer, MenuScrim, closeMenu, downloadsMenu, extensionsMenu, menuKind } from './menus'
 import { Settings } from './Settings'
 import { VaultSheet } from './vault/VaultSheet'
@@ -90,22 +95,54 @@ function importFrom(m: Record<string, unknown>) {
   const prefs = parse<Prefs>(m.prefs)
   const engine = importEngine(prefs)
   const exts = importExtensions(prefs, parse<Prefs>(m.secure))
-  return `Imported ${marks} bookmarks, ${m.visits} pages, ${m.cookies ?? 0} sign-ins${exts ? `, ${exts} extensions` : ''}${engine} from ${m.name}${m.note ? `. ${m.note}` : ''}`
+  // Arc: its spaces, favorites, pinned and Today tabs too.
+  const spaces = m.arc ? importArc(m.arc) : 0
+  return `Imported ${spaces ? `${spaces} spaces with their tabs, ` : ''}${marks} bookmarks, ${m.visits} pages, ${m.cookies ?? 0} sign-ins${exts ? `, ${exts} extensions` : ''}${engine} from ${m.name}${m.note ? `. ${m.note}` : ''}`
 }
 
 function App() {
-  const b = useBrowser()
+  // What this frame shows of the store, each read alone: a tab's title or a download's progress draws only what shows it.
+  const prefs = useBrowserValue(b => b.settings)
+  const theme = useBrowserValue(b => b.theme)
+  const spaces = useBrowserValue(b => b.spaces)
+  const space = useBrowserValue(b => b.space)
+  const settingsLoaded = useBrowserValue(b => b.settingsLoaded)
+  const revealTop = useBrowserValue(b => b.revealTop), revealSide = useBrowserValue(b => b.revealSide)
+  const version = useBrowserValue(b => b.update?.version ?? '')
   const [settings, setSettings] = useState<{ open: boolean; section: string }>({ open: false, section: '' })
   const toast = useToasts()
   useLayoutReport()
+  useMods(prefs)
 
   // Exo's Appearance and material, as Exo draws them: <html data-exo-theme> and data-exo-glass.
   useEffect(() => {
     const root = document.documentElement
-    root.dataset.exoTheme = b.theme
-    if (b.settings.material === 'solid') root.dataset.exoGlass = 'solid'
+    root.dataset.exoTheme = theme
+    if (prefs.material === 'solid') root.dataset.exoGlass = 'solid'
     else delete root.dataset.exoGlass
-  }, [b.theme, b.settings.material])
+  }, [theme, prefs.material])
+  // The accent (the space's color, else Settings'), made safe for this appearance; none is Exo's own black and white.
+  const { accent: tint = '', rgb = '', ink = '' } = accentOf({ settings: prefs, spaces, space, theme }) ?? {}
+  useEffect(() => {
+    const root = document.documentElement
+    if (!tint) { delete root.dataset.exbAccent; for (const p of ['--exb-accent', '--exb-accent-rgb', '--exb-accent-ink']) root.style.removeProperty(p); return }
+    root.dataset.exbAccent = ''
+    root.style.setProperty('--exb-accent', tint)
+    root.style.setProperty('--exb-accent-rgb', rgb)
+    root.style.setProperty('--exb-accent-ink', ink)
+  }, [tint, rgb, ink])
+  // Exo's Text size (small 0.9, standard 1, large 1.14) and Reduce motion (on, or as Windows asks).
+  const textSize = prefs.textSize
+  const calm = prefs.reduceMotion === 'on'
+  useEffect(() => {
+    const root = document.documentElement
+    root.style.setProperty('--exo-scale', String({ small: 0.9, large: 1.14 }[textSize] ?? 1))
+    const windows = matchMedia('(prefers-reduced-motion: reduce)')
+    const apply = () => { if (calm || windows.matches) root.dataset.exoMotion = 'reduce'; else delete root.dataset.exoMotion }
+    apply()
+    windows.addEventListener('change', apply)
+    return () => windows.removeEventListener('change', apply)
+  }, [textSize, calm])
 
   // Settings, as Ctrl+H or a page asks; not over first run.
   useEffect(() => onHost('settings.open', m => { if (isFirstRun()) return; closeMenu(); setSettings({ open: true, section: (m.section as string) || '' }) }), [])
@@ -116,7 +153,7 @@ function App() {
   useEffect(() => { const offs = [startVault(), startFill()]; return () => offs.forEach(off => off()) }, [])
   const closeSettings = () => setSettings(s => ({ ...s, open: false }))
   // First run: once, until it's finished, over the whole window.
-  const firstRun = b.settingsLoaded && b.settings.onboarded !== '1'
+  const firstRun = settingsLoaded && prefs.onboarded !== '1'
   // The host let go of the window's input (a page opened from Settings or another app): close with it. First run
   // keeps it, so it asks again.
   useEffect(() => onHost('overlay.closed', () => {
@@ -133,17 +170,20 @@ function App() {
     return () => removeEventListener('keydown', onKey)
   }, [settings.open])
 
-  const classes = ['exb', isVertical(b.settings) ? 'is-vertical' : 'is-horizontal', isAutohide(b.settings) ? 'is-autohide' : '', b.revealTop ? 'reveal-top' : '', b.revealSide ? 'reveal-side' : ''].filter(Boolean).join(' ')
+  const classes = ['exb', isVertical(prefs) ? 'is-vertical' : 'is-horizontal', isAutohide(prefs) ? 'is-autohide' : '', revealTop ? 'reveal-top' : '',
+    revealSide ? 'reveal-side' : '', isCompact(prefs) ? 'is-compact' : '', `is-${density(prefs)}`].filter(Boolean).join(' ')
   return (
     // The sidebar's width, shared by the side tabs and the pill above them (and moved live while its edge is dragged).
-    <div className={classes} style={{ '--exb-side-w': `${widthOf(b.settings)}px` } as CSSProperties} onContextMenu={e => { if (!(e.target as Element).closest('input')) e.preventDefault() }}>
+    <div className={classes} style={{ '--exb-side-w': `${widthOf(prefs)}px` } as CSSProperties} onContextMenu={e => { if (!(e.target as Element).closest('input')) e.preventDefault() }}>
       <Chrome settingsOpen={settings.open} onSettings={() => (settings.open ? closeSettings() : send('openSettings', ''))} />
       <MenuScrim />
       <MenuLayer />
+      <Switcher />
       <Settings open={settings.open} section={settings.section} onClose={closeSettings} />
       <VaultSheet />
       <VaultFill />
-      {firstRun ? <Onboarding onDone={() => setSetting('onboarded', '1')} /> : null}
+      {firstRun ? <Onboarding onDone={() => { setSetting('onboarded', '1'); if (version) setSetting('whatsNewSeen', version) }} /> : null}
+      <WhatsNew blocked={firstRun || settings.open} />
       {toast ? <div className="exo-toast-stack exb-toasts"><div key={toast.key} className="exo-toast" role="status"><p className="min-w-0 flex-1 text-fg">{toast.text}</p></div></div> : null}
     </div>
   )

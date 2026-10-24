@@ -1105,7 +1105,8 @@
 }
 
 /* What's New (WhatsNewSheet): a narrow sheet of large glass, centered, its items in one column (about eight before the
-   list scrolls inside it), Continue across its foot. The sheet settles by its size and the rows rise in; neither fades. */
+   list scrolls inside it), each earlier release under a small heading, Continue (and Install update while one is
+   offered) across its foot. The sheet settles by its size and the rows rise in; neither fades. */
 .exo-whats-new-back {
   position: fixed;
   inset: var(--exo-titlebar-h, 52px) 0 0;
@@ -1120,7 +1121,7 @@
 
 .exo-whats-new {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 24px;
   width: min(100%, 540px);
   max-height: min(100%, 760px);
@@ -1140,13 +1141,11 @@
 .exo-whats-new-list {
   display: grid;
   align-content: start;
-  gap: 18px;
+  gap: 28px;
   min-height: 0;
-  margin: 0;
   padding: 0 4px;
   overflow-y: auto;
   overscroll-behavior: contain;
-  list-style: none;
   /* The rest fades in under the sheet's edges as it scrolls, as Discord's lists do (exo-shell.css › Infinity pool). */
   mask-image: linear-gradient(to bottom, transparent, #000 var(--exo-pool-top), #000 calc(100% - var(--exo-pool-bottom)), transparent);
   animation: exo-pool-top linear both, exo-pool-bottom linear both;
@@ -1154,7 +1153,27 @@
   animation-range: 0 32px, calc(100% - 32px) 100%;
 }
 
-.exo-whats-new-list > li {
+.exo-whats-new-list > section {
+  display: grid;
+  gap: 14px;
+}
+
+.exo-whats-new-list h3 {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: calc(13px * var(--exo-scale, 1));
+  font-weight: 600;
+}
+
+.exo-whats-new-list ul {
+  display: grid;
+  gap: 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exo-whats-new-list li {
   display: grid;
   grid-template-columns: 40px minmax(0, 1fr);
   align-items: center;
@@ -1187,9 +1206,20 @@
   color: var(--color-muted);
 }
 
-.exo-whats-new-continue.exo-ghost-btn {
-  justify-self: stretch;
-  justify-content: center;
-  height: 40px;
+.exo-whats-new-error {
+  margin: 0;
+  color: var(--color-bad);
   font-size: calc(13px * var(--exo-scale, 1));
+  text-align: center;
+}
+
+.exo-whats-new-foot {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 10px;
+}
+
+.exo-whats-new-foot > .exo-set-btn {
+  justify-content: center;
 }

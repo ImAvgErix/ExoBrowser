@@ -65,9 +65,9 @@ kbd,
   /* White ink on AMOLED black, neutral grays under it, each matched in contrast to the step it replaces. */
   --color-fg: #ffffff;
   --color-muted: #9d9d9d;
-  --color-faint: #757575;
+  --color-faint: #868686;
   --color-fg-muted: #9d9d9d;
-  --color-fg-subtle: #757575;
+  --color-fg-subtle: #868686;
   --color-primary: #ffffff;
   --color-primary-fg: #000000;
   --color-good: #3dd68c;
@@ -233,14 +233,16 @@ body,
   --color-card: #121212;
   --color-raised: #272727;
   --exo-ink-rgb: 224 224 224;
-  --exo-panel-ink: #e0e0e0;
+  /* Words on large glass: brighter than the page's #e0e0e0, since the glass can sit over bright art (#e0e0e0 on a
+     selected row over red art read 4.5:1, measured). */
+  --exo-panel-ink: #f0f0f0;
   --exo-float: #1e1e1e;
   --exo-float-line: #2c2c2c;
   --exo-tile: #1e1e1e;
   --exo-control-line: #3a3a3a;
   --exo-glass-secondary: #c8c8c8;
-  /* As Void's: the same large glass, and at #b0b0b0 its gray read 4.1:1 over white art (measured). */
-  --exo-glass-panel-secondary: #bdbdbd;
+  /* As Void's: the same large glass; #b0b0b0 read 4.1:1 over white art and #bdbdbd 4.1:1 over red (measured). */
+  --exo-glass-panel-secondary: #c8c8c8;
   --exo-primary-hover: #cfcfcf;
   /* Glass dims what is behind it as on Void (lighter, words over bright art fell under 4:1) and lifts off the gray
      page by its own tint. */
@@ -298,9 +300,9 @@ body,
   --color-fg-subtle: #666666;
   --color-primary: #1e1e1e;
   --color-primary-fg: #ffffff;
-  /* Green and red dark enough for 4.5:1 on the light page. */
+  /* Green and red dark enough for 4.5:1 on the light page and on light glass over art (#d12f2f read 4.2:1 there). */
   --color-good: #0f6b3a;
-  --color-bad: #d12f2f;
+  --color-bad: #c42020;
   --color-card: #ffffff;
   --color-raised: #ffffff;
   --hover-fill: rgb(0 0 0 / 0.05);

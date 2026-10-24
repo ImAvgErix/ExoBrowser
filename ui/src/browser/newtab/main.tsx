@@ -11,6 +11,7 @@ import '../../exo-shell.css'
 import './newtab.css'
 import { hostOf } from '../search'
 import * as I from '../icons'
+import { markInk } from '../look'
 
 type Data = {
   bookmarks: [string, string, string, boolean?][]
@@ -20,6 +21,8 @@ type Data = {
   material: string
   bookmarkStyle: string
   tiles: string
+  /** Settings › Look › Reduce motion: on, or off (then Windows' own choice decides). */
+  motion?: string
   /** How far the Bar and side tabs push this page in: it shifts back by half, so it sits in the window's middle. */
   insetTop?: number
   insetLeft?: number
@@ -80,7 +83,7 @@ function Card({ url, title, icon, sharp, index, onRemove }: { url: string; title
     <a className="exb-card" href={url} data-url={url} draggable={false} style={{ '--i': index, '--tint': tint } as CSSProperties}>
       <span className="exb-card-wash" />
       {/* The site's large icon; else its small one, drawn at its own size (not blown up); else its letter. */}
-      <span className="exb-card-face">{icon ? <img className={sharp ? undefined : 'is-small'} src={icon} alt="" draggable={false} /> : siteName(url).charAt(0)}</span>
+      <span className="exb-card-face">{icon ? <img className={sharp ? undefined : 'is-small'} src={icon} alt="" draggable={false} onLoad={e => markInk(e.currentTarget)} /> : siteName(url).charAt(0)}</span>
       <span className="exb-card-name exo-glass">{title || siteName(url)}</span>
       <button type="button" className="exb-card-x exo-glass" aria-label="Remove" onClick={e => { e.preventDefault(); onRemove() }}><I.Close size={12} /></button>
     </a>
@@ -148,7 +151,7 @@ function Marks({ data, onMove }: { data: Data; onMove: (from: number, to: number
         ? data.bookmarks.map(([url, title, icon, sharp], i) => <Card key={url} url={url} title={title} icon={icon} sharp={sharp} index={i} onRemove={() => send('unbookmark', url)} />)
         : data.bookmarks.map(([url, title, icon, sharp], i) => (
           <a key={url} className="exb-chip exo-glass" href={url} data-url={url} draggable={false} style={{ '--i': i } as CSSProperties}>
-            {icon ? <img className={sharp ? 'is-sharp' : undefined} src={icon} alt="" draggable={false} /> : <I.Globe size={16} />}
+            {icon ? <img className={sharp ? 'is-sharp' : undefined} src={icon} alt="" draggable={false} onLoad={e => markInk(e.currentTarget)} /> : <I.Globe size={16} />}
             <span>{title || hostOf(url)}</span>
           </a>
         ))}
@@ -178,13 +181,21 @@ function Page() {
     document.addEventListener('visibilitychange', onShow)
     return () => { webview?.removeEventListener('message', onMessage); document.removeEventListener('visibilitychange', onShow) }
   }, [])
-  const theme = data?.theme, material = data?.material
+  const theme = data?.theme, material = data?.material, motion = data?.motion
   useEffect(() => {
     if (!theme) return
     const root = document.documentElement
     root.dataset.exoTheme = theme
     if (material === 'solid') root.dataset.exoGlass = 'solid'; else delete root.dataset.exoGlass
   }, [theme, material])
+  // Reduce motion, as the Bar has it (Exo's setting, or Windows asking for less): the cards arrive and lift without moving.
+  useEffect(() => {
+    const windows = matchMedia('(prefers-reduced-motion: reduce)')
+    const apply = () => { document.documentElement.dataset.exoMotion = motion === 'on' || windows.matches ? 'reduce' : 'full' }
+    apply()
+    windows.addEventListener('change', apply)
+    return () => windows.removeEventListener('change', apply)
+  }, [motion])
   useEffect(() => {
     const close = (e: PointerEvent) => { if (!(e.target as Element).closest('.exb-ntp-menu')) setMenu(null) }
     const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(null) }

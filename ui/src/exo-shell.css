@@ -93,10 +93,7 @@
 
 /* Gear and window controls: shape lives with the room tabs in styles/shelf.css. */
 
-/* Primary CTA — the 44px white pill. Only the game sheet's primary action
-   and the Settings update button use it; smaller primaries are
-   .exo-ghost-btn.is-primary. */
-.exo-cta,
+/* The game sheet's primary action: the 44px white pill. Smaller primaries are .exo-set-btn.is-primary. */
 .exo-play {
   position: relative;
   overflow: hidden;
@@ -120,25 +117,22 @@
 /* Hover on a white primary: a touch brighter, never see-through, never a halo (DESIGN.md › Hover). */
 @media (hover: hover) and (pointer: fine) {
 
-  .exo-cta:hover:not(:disabled):not(:active),
   .exo-play:hover:not(:disabled):not(:active) {
     background-color: var(--exo-primary-hover);
   }
 }
 
-.exo-cta:disabled,
 .exo-play:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 
 /* One control: a 32px filled capsule (Apple's gray fill, on black: #121212 with a faint white
-   rim on top), no outline. Hover lifts it a shade, never a scale. Modifiers: .is-compact (28px)
+   rim on top), no outline. Hover lifts it a shade, never a scale. Modifiers: .is-primary, .is-compact (28px)
    and .is-danger. Icon-only controls are square. Feedback is 120ms on the
    shared easing. */
 .exo-set-btn,
 .exo-game-tool,
-.exo-ghost-btn,
 .exo-shelf-sort-trigger,
 .exo-add-game-btn,
 .exo-game-close {
@@ -156,7 +150,7 @@
   background: var(--exo-fill);
   color: var(--color-fg);
   box-shadow: var(--exo-rim);
-  font-size: calc(12px * var(--exo-scale, 1));
+  font-size: var(--exo-type-control);
   font-weight: 500;
   white-space: nowrap;
   transform: none;
@@ -187,20 +181,19 @@
   padding: 0 22px 0 14px;
 }
 
-.exo-ghost-btn.is-compact {
+.exo-set-btn.is-compact {
   height: 28px;
   min-height: 28px;
   padding: 0 10px;
 }
 
-/* The 32px primary for toasts, popovers and empty states: white on black. */
-.exo-ghost-btn.is-primary {
+/* The 32px primary for rows, toasts, popovers and empty states: the ink's color with the page's words. */
+.exo-set-btn.is-primary {
   position: relative;
   overflow: hidden;
   border-color: var(--color-fg);
   background: var(--color-fg);
-  color: var(--color-bg);
-  font-weight: 600;
+  color: var(--color-primary-fg);
 }
 
 /* Danger: the same filled capsule with its words in Bad; no red hairline. On a dark theme the capsule's lift takes
@@ -213,16 +206,16 @@
   color: color-mix(in srgb, var(--color-bad) 82%, white);
 }
 
-:is(.exo-set-btn, .exo-game-tool, .exo-ghost-btn, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-game-close):disabled {
+:is(.exo-set-btn, .exo-game-tool, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-game-close):disabled {
   opacity: 0.4;
 }
 
 @media (hover: hover) and (pointer: fine) {
-  :is(.exo-set-btn, .exo-game-tool, .exo-ghost-btn, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-game-close):hover:not(:disabled) {
+  :is(.exo-set-btn, .exo-game-tool, .exo-shelf-sort-trigger, .exo-add-game-btn, .exo-game-close):hover:not(:disabled) {
     background-color: var(--hover-fill);
   }
 
-  .exo-ghost-btn.is-primary:hover:not(:disabled) {
+  .exo-set-btn.is-primary:hover:not(:disabled) {
     background-color: var(--exo-primary-hover);
   }
 }
